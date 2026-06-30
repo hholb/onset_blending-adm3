@@ -4,21 +4,76 @@ import glob
 import numpy as np
 import pandas as pd
 import xarray as xr
+from scipy import sparse
+
+
+def _coord_key(lat, lon, precision=10):
+    return (round(float(lat), precision), round(float(lon), precision))
+
+
+def _build_sparse_weights(mapping, lat_values, lon_values):
+    pixel_lookup = {
+        _coord_key(lat, lon): idx
+        for idx, (lat, lon) in enumerate(
+            (lat, lon) for lat in lat_values for lon in lon_values
+        )
+    }
+
+    adm3_names = pd.Index(mapping["adm3_name"].astype(str).drop_duplicates())
+    adm3_lookup = {name: idx for idx, name in enumerate(adm3_names)}
+
+    rows = []
+    cols = []
+    data = []
+    missing_pixels = 0
+    for rec in mapping.itertuples(index=False):
+        pixel_idx = pixel_lookup.get(_coord_key(rec.lat, rec.lon))
+        if pixel_idx is None:
+            missing_pixels += 1
+            continue
+        rows.append(pixel_idx)
+        cols.append(adm3_lookup[str(rec.adm3_name)])
+        data.append(float(rec.weight))
+
+    if not data:
+        raise ValueError("No mapping rows matched the input NetCDF lat/lon coordinates.")
+    if missing_pixels:
+        print(f"  Skipped {missing_pixels} mapping rows with no matching input pixel.")
+
+    weights = sparse.csr_matrix(
+        (data, (rows, cols)),
+        shape=(len(lat_values) * len(lon_values), len(adm3_names)),
+    )
+    return weights, adm3_names.to_numpy()
+
+
+def _aggregate_data_array_to_adm3(da, weights, adm3_names):
+    spatial_dims = ["lat", "lon"]
+    other_dims = [dim for dim in da.dims if dim not in spatial_dims]
+    ordered = da.transpose(*other_dims, *spatial_dims)
+
+    other_shape = tuple(ordered.sizes[dim] for dim in other_dims)
+    values = np.asarray(ordered.values)
+    flat = values.reshape((-1, ordered.sizes["lat"] * ordered.sizes["lon"]))
+
+    valid = np.isfinite(flat)
+    weighted_sum = weights.T.dot(np.nan_to_num(flat, nan=0.0).T).T
+    effective_weight = weights.T.dot(valid.astype(float).T).T
+
+    with np.errstate(invalid="ignore", divide="ignore"):
+        out = weighted_sum / effective_weight
+    out[effective_weight <= 0] = np.nan
+    out = np.asarray(out).reshape(other_shape + (len(adm3_names),))
+
+    coords = {dim: da.coords[dim] for dim in other_dims if dim in da.coords}
+    coords["adm3_name"] = adm3_names
+    return xr.DataArray(out, dims=other_dims + ["adm3_name"], coords=coords, name=da.name)
 
 
 def batch_aggregate_to_adm3_matrix(input_dir, mapping_csv_path, input_file=None):
     # 1. Load mapping
     mapping = pd.read_csv(mapping_csv_path)
     mapping = mapping.rename(columns={'latitude': 'lat', 'longitude': 'lon'})
-
-    # 2. Prepare Weights Matrix
-    weights_xr = mapping.set_index(['lat', 'lon', 'adm3_name'])['weight'].to_xarray().fillna(0)
-    weights_matrix = weights_xr.stack(pixel=['lat', 'lon'])
-
-    # Per-adm3 weight sum (shape: adm3_name) — used for normalization.
-    # Must be computed per-adm3, NOT summed over everything (old bug: summed
-    # over pixel AND adm3_name together, giving a scalar that made all results NaN).
-    weight_sum_per_adm3 = weights_matrix.sum(dim='pixel')  # shape: (adm3_name,)
 
     # 3. Process Files
     if input_file is not None:
@@ -38,6 +93,7 @@ def batch_aggregate_to_adm3_matrix(input_dir, mapping_csv_path, input_file=None)
         # -99 fill values were being included in the weighted sum.
         with xr.open_dataset(file_path, mask_and_scale=True) as ds:
             processed_vars = {}
+            weights_cache = {}
 
             for var_name in ds.data_vars:
                 if 'lat' in ds[var_name].dims and 'lon' in ds[var_name].dims:
@@ -50,45 +106,15 @@ def batch_aggregate_to_adm3_matrix(input_dir, mapping_csv_path, input_file=None)
                     if fill_val is not None:
                         da = da.where(da != fill_val)
 
-                    # Stack spatial dims
-                    da_stacked = da.stack(pixel=['lat', 'lon'])  # (time, pixel)
-
-                    # For each pixel/adm3 pair, set weight to 0 where data is NaN
-                    # so NaN pixels don't contribute to either the sum or the
-                    # effective weight denominator.
-                    valid_mask = da_stacked.notnull()  # (time, pixel)
-
-#                    # Weighted sum of valid data: (time, adm3_name)
-#                    da_filled = da_stacked.fillna(0.0)
-#                    dist_sum = xr.dot(da_filled, weights_matrix, dims='pixel')
-#
-#                    # Effective weight sum per (time, adm3_name) — excludes NaN pixels
-#                    # Broadcast weights_matrix to (time, pixel) by multiplying with valid_mask
-#                    effective_weights = weights_matrix * valid_mask  # (time, pixel, adm3_name)
-#                    effective_weight_sum = effective_weights.sum(dim='pixel')  # (time, adm3_name)
-#
-#                    # Weighted average; NaN where no valid pixels contributed
-#                    result = xr.where(effective_weight_sum > 0,
-#                                      dist_sum / effective_weight_sum,
-#                                      np.nan)
-
-                    # 1. Weighted sum of valid data (You already do this efficiently)
-                    da_filled = da_stacked.fillna(0.0)
-                    dist_sum = xr.dot(da_filled, weights_matrix, dims='pixel')
-                    
-                    # 2. OPTIMIZED: Effective weight sum using xr.dot
-                    # We treat the boolean mask as 1s and 0s and dot it with the weights
-                    effective_weight_sum = xr.dot(valid_mask.astype(float), weights_matrix, dims='pixel')
-                    
-                    # 3. Weighted average
-                    result = xr.where(effective_weight_sum > 0,
-                                      dist_sum / effective_weight_sum,
-                                      np.nan)
-
-
-                    # Restore adm3_name coordinate (xr.where can drop it)
-                    result['adm3_name'] = weight_sum_per_adm3['adm3_name']
-                    processed_vars[var_name] = result
+                    grid_key = (tuple(da["lat"].values), tuple(da["lon"].values))
+                    if grid_key not in weights_cache:
+                        weights_cache[grid_key] = _build_sparse_weights(
+                            mapping, da["lat"].values, da["lon"].values
+                        )
+                    weights, adm3_names = weights_cache[grid_key]
+                    processed_vars[var_name] = _aggregate_data_array_to_adm3(
+                        da, weights, adm3_names
+                    )
 
             # 4. Reconstruct Dataset and save
             adm3_ds = xr.Dataset(processed_vars)
