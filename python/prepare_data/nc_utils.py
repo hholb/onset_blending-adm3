@@ -17,6 +17,7 @@ import re
 import pickle
 import numpy as np
 import pandas as pd
+from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime, date, timedelta
 from itertools import product
 
@@ -871,6 +872,80 @@ def process_ground_truth_rainfall_id(df, spec, mok_dt=None, thr_dt=None, value_c
 # Pipeline entrypoint
 # ---------------------------------------------------------------------------
 
+def _process_single_nc_file(row, spec, var_name, dim_rename_map, mok_dt, thr_dt, weights_df):
+    nc_path = row["nc_path"]
+    yr = int(row["year"])
+    print(f"Processing year {yr}: {nc_path}")
+
+    if spec["type"] == "rainfall_forecast":
+        wide_prefix = spec["input"].get("wide_prefix") or var_name.lower()
+        day_dim = spec["input"].get("wide_day_dim", "day")
+        dt = nc_read_forecast_wide(nc_path, var_name, dim_rename_map, spec,
+                                   day_dim=day_dim, prefix=wide_prefix)
+        if dt is None:
+            return {
+                "year": yr,
+                "wide": None,
+                "long": None,
+                "message": f"  Skipping {nc_path}: variable '{var_name}' not found.",
+            }
+        dt["year"] = yr
+        dt = filter_by_dissemination_cells(dt, spec)
+        if weights_df is not None:
+            dt = transform_forecast_wide(dt, weights_df)
+        result = process_rainfall_forecast_id(dt, spec, mok_dt=mok_dt, thr_dt=thr_dt)
+        return {"year": yr, "wide": result["wide"], "long": None, "message": None}
+
+    if spec["type"] == "ground_truth_rainfall":
+        dt = nc_read_groundtruth_long(nc_path, var_name, dim_rename_map)
+        if dt is None:
+            return {
+                "year": yr,
+                "wide": None,
+                "long": None,
+                "message": f"  Skipping {nc_path}: variable '{var_name}' not found.",
+            }
+        dt["year"] = yr
+        dt = filter_by_dissemination_cells(dt, spec)
+        if weights_df is not None:
+            dt = transform_groundtruth_long(dt, weights_df, var_name.lower())
+        result = process_ground_truth_rainfall_id(dt, spec, mok_dt=mok_dt, thr_dt=thr_dt,
+                                                  value_col=var_name.lower())
+        return {"year": yr, "wide": result["wide"], "long": result["long"], "message": None}
+
+    raise ValueError(f"Unsupported raw data type: {spec['type']}")
+
+
+def _process_nc_files(files_df, spec, var_name, dim_rename_map, mok_dt, thr_dt, weights_df):
+    rows = files_df.to_dict("records")
+    parallel = bool(spec.get("input", {}).get("parallel", False))
+    workers = int(spec.get("input", {}).get("workers") or 5)
+
+    if not parallel or workers <= 1 or len(rows) <= 1:
+        return [
+            _process_single_nc_file(row, spec, var_name, dim_rename_map, mok_dt, thr_dt, weights_df)
+            for row in rows
+        ]
+
+    worker_count = min(workers, len(rows))
+    print(f"Processing {len(rows)} NetCDF files with {worker_count} workers.")
+    with ProcessPoolExecutor(max_workers=worker_count) as executor:
+        futures = [
+            executor.submit(
+                _process_single_nc_file,
+                row,
+                spec,
+                var_name,
+                dim_rename_map,
+                mok_dt,
+                thr_dt,
+                weights_df,
+            )
+            for row in rows
+        ]
+        return [future.result() for future in futures]
+
+
 def run_single_pipeline(spec_id):
     """
     Main driver: load spec, process all NetCDF years, write outputs.
@@ -896,44 +971,23 @@ def run_single_pipeline(spec_id):
 
     files_df = list_nc_files_with_year(spec)
 
-    wide_all = []
-    long_all = []
+    results = _process_nc_files(
+        files_df,
+        spec,
+        var_name,
+        dim_rename_map,
+        mok_dt,
+        thr_dt,
+        weights_df,
+    )
+    results = sorted(results, key=lambda result: result["year"])
 
-    for _, row in files_df.iterrows():
-        nc_path = row["nc_path"]
-        yr = row["year"]
-        print(f"Processing year {yr}: {nc_path}")
+    for result in results:
+        if result["message"]:
+            print(result["message"])
 
-        if spec["type"] == "rainfall_forecast":
-            wide_prefix = spec["input"].get("wide_prefix") or var_name.lower()
-            day_dim = spec["input"].get("wide_day_dim", "day")
-            dt = nc_read_forecast_wide(nc_path, var_name, dim_rename_map, spec,
-                                       day_dim=day_dim, prefix=wide_prefix)
-            if dt is None:
-                print(f"  Skipping {nc_path}: variable '{var_name}' not found.")
-                continue
-            dt["year"] = yr
-            # filter_by_dissemination_cells and transform_forecast_wide sequence need swapped !!!!
-            dt = filter_by_dissemination_cells(dt, spec)
-            if weights_df is not None: # in spec yml if cell_transform_enabled: false, it does nothing
-                dt = transform_forecast_wide(dt, weights_df)
-            result = process_rainfall_forecast_id(dt, spec, mok_dt=mok_dt, thr_dt=thr_dt)
-            wide_all.append(result["wide"])
-
-        elif spec["type"] == "ground_truth_rainfall":
-            dt = nc_read_groundtruth_long(nc_path, var_name, dim_rename_map)
-            if dt is None:
-                print(f"  Skipping {nc_path}: variable '{var_name}' not found.")
-                continue
-            dt["year"] = yr
-            # filter_by_dissemination_cells and transform_forecast_wide sequence need swapped !!!!
-            dt = filter_by_dissemination_cells(dt, spec)
-            if weights_df is not None: # in spec yml if cell_transform_enabled: false, it does nothing
-                dt = transform_groundtruth_long(dt, weights_df, var_name.lower())
-            result = process_ground_truth_rainfall_id(dt, spec, mok_dt=mok_dt, thr_dt=thr_dt,
-                                                       value_col=var_name.lower())
-            wide_all.append(result["wide"])
-            long_all.append(result["long"])
+    wide_all = [result["wide"] for result in results if result["wide"] is not None]
+    long_all = [result["long"] for result in results if result["long"] is not None]
 
     if wide_all:
         wide_out = pd.concat(wide_all, ignore_index=True)
