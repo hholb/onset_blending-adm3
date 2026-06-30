@@ -26,6 +26,7 @@ from .onset_utils import (
     read_mok_dates, read_thresholds,
     read_onset_params,
     roll_sum_na_rm_left, roll_sum_na_propagate_left,
+    precompute_onset, find_onset_from_precomputed,
     find_onset_precomp,
 )
 
@@ -618,8 +619,6 @@ def calc_onsets_rowwise(df, day_cols, day_ints, win, params=None):
     need_clim = np.where(need_clim > len(day_ints_arr), 9999, need_clim).astype(int)
 
     mok_dates = pd.to_datetime(df["mok_date"]).values if "mok_date" in df.columns else np.array([pd.NaT] * len(df))
-    start_mok = np.ones(len(df), dtype=int)
-
     n = len(df)
     onset_raw = []
     onset_clim_mok_date = []
@@ -627,20 +626,16 @@ def calc_onsets_rowwise(df, day_cols, day_ints, win, params=None):
 
     for i in range(n):
         s = X[i]
-        wsum_all = roll_sum_na_rm_left(s, win)
+        wsum, aux1, aux2 = precompute_onset(s, params)
 
-        if len(s) >= 10:
-            sum10 = roll_sum_na_propagate_left(s, 10)
-            bad10 = (~np.isnan(sum10)) & (sum10 < 5)
-            pre_bad = np.concatenate([[0], np.cumsum(bad10.astype(int))])
-            last10start = len(s) - 10 + 1
-        else:
-            pre_bad = np.array([0])
-            last10start = 0
-
-        onset_raw.append(find_onset_precomp(s, win, th[i], wsum_all, pre_bad, last10start, start_day=0, params=params))
-        onset_clim_mok_date.append(find_onset_precomp(s, win, th[i], wsum_all, pre_bad, last10start,
-                                                       start_day=int(need_clim[i]), params=params))
+        onset_raw.append(
+            find_onset_from_precomputed(s, th[i], wsum, aux1, aux2, params, start_day=0)
+        )
+        onset_clim_mok_date.append(
+            find_onset_from_precomputed(
+                s, th[i], wsum, aux1, aux2, params, start_day=int(need_clim[i])
+            )
+        )
 
         mk = mok_dates[i]
         if pd.isnull(mk):
@@ -650,7 +645,9 @@ def calc_onsets_rowwise(df, day_cols, day_ints, win, params=None):
             sd_mok = int(np.searchsorted(day_ints_arr, offset - 1, side='right')) + 1
             if sd_mok > len(day_ints_arr):
                 sd_mok = 9999
-        onset_mok.append(find_onset_precomp(s, win, th[i], wsum_all, pre_bad, last10start, start_day=sd_mok, params=params))
+        onset_mok.append(
+            find_onset_from_precomputed(s, th[i], wsum, aux1, aux2, params, start_day=sd_mok)
+        )
 
     return {"onset_raw": onset_raw, "onset_clim_mok_date": onset_clim_mok_date, "onset_mok": onset_mok}
 
@@ -726,32 +723,47 @@ def process_rainfall_forecast_id(df, spec, mok_dt=None, thr_dt=None):
 
     D = len(keep_ints)
 
-    def prob_from_idx(idxs):
-        valid = [x for x in idxs if x is not None and 1 <= x <= D]
-        if not valid:
-            return [0.0] * D
-        counts = np.zeros(D)
-        for x in valid:
-            counts[int(x) - 1] += 1
-        return list(counts / len(idxs))
+    grouped = df.groupby(key_base)
+    group_sizes = grouped.size()
 
-    stats_agg = df.groupby(key_base).apply(
-        lambda g: pd.Series({
-            **{f"forecast_rain_day_{day_ints[j]}": g[keep_days[j]].mean() for j in range(len(keep_days))},
-            **{f"forecast_rain_sd_day_{day_ints[j]}": g[keep_days[j]].std() for j in range(len(keep_days))},
-            **{f"frac_raining_day_{day_ints[j]}": (g[keep_days[j]] > 1).mean() for j in range(len(keep_days))},
-        })
-    ).reset_index()
+    # Preserve the legacy stats column labels, which used day_ints positions.
+    stats_day_labels = day_ints[:len(keep_days)]
+    mean_agg = grouped[keep_days].mean()
+    mean_agg.columns = [f"forecast_rain_day_{d}" for d in stats_day_labels]
 
-    prob_agg = df.groupby(key_base).apply(
-        lambda g: pd.Series({
-            **{f"predicted_prob_day_{keep_ints[j]}": p
-               for j, p in enumerate(prob_from_idx(list(g["onset_raw"])))},
-            **{f"predicted_prob_clim_mok_date_day_{keep_ints[j]}": p
-               for j, p in enumerate(prob_from_idx(list(g["onset_clim_mok_date"])))},
-            **{f"predicted_prob_mok_day_{keep_ints[j]}": p
-               for j, p in enumerate(prob_from_idx(list(g["onset_mok"])))},
-        })
+    sd_agg = grouped[keep_days].std()
+    sd_agg.columns = [f"forecast_rain_sd_day_{d}" for d in stats_day_labels]
+
+    rain_binary = df[keep_days].gt(1)
+    rain_binary[key_base] = df[key_base]
+    frac_agg = rain_binary.groupby(key_base)[keep_days].mean()
+    frac_agg.columns = [f"frac_raining_day_{d}" for d in stats_day_labels]
+
+    stats_agg = pd.concat([mean_agg, sd_agg, frac_agg], axis=1).reset_index()
+
+    def _prob_agg(onset_col, out_prefix):
+        valid = df[onset_col].notna() & df[onset_col].between(1, D)
+        if valid.any():
+            counts = (
+                df.loc[valid, key_base + [onset_col]]
+                  .groupby(key_base + [onset_col])
+                  .size()
+                  .unstack(fill_value=0)
+            )
+            counts = counts.reindex(columns=range(1, D + 1), fill_value=0)
+        else:
+            counts = pd.DataFrame(0, index=group_sizes.index, columns=range(1, D + 1))
+        probs = counts.reindex(group_sizes.index, fill_value=0).div(group_sizes, axis=0)
+        probs.columns = [f"{out_prefix}_day_{keep_ints[j]}" for j in range(D)]
+        return probs
+
+    prob_agg = pd.concat(
+        [
+            _prob_agg("onset_raw", "predicted_prob"),
+            _prob_agg("onset_clim_mok_date", "predicted_prob_clim_mok_date"),
+            _prob_agg("onset_mok", "predicted_prob_mok"),
+        ],
+        axis=1,
     ).reset_index()
 
     wide = stats_agg.merge(prob_agg, on=key_base)

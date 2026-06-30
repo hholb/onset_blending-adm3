@@ -302,6 +302,11 @@ def _precompute_onset(series, params):
         return wsum, pre_bad, last_win_start
 
 
+def precompute_onset(series, params):
+    """Precompute onset trigger and veto arrays for repeated onset searches."""
+    return _precompute_onset(series, params)
+
+
 # ---------------------------------------------------------------------------
 # Unified onset finder
 # ---------------------------------------------------------------------------
@@ -397,6 +402,22 @@ def find_onset_precomp(series, win, thresh, wsum_all, pre_bad, last10start,
         return None
 
     wsum, aux1, aux2 = _precompute_onset(series, params)
+    return _find_onset_core(series, n, wsum, aux1, aux2, thresh,
+                            params, start_day, reject_if_short_followup)
+
+
+def find_onset_from_precomputed(series, thresh, wsum, aux1, aux2, params,
+                                reject_if_short_followup=False, start_day=0):
+    """
+    Find onset using arrays returned by _precompute_onset().
+
+    This is intended for call sites that need to evaluate the same rainfall
+    series under several start-day restrictions.
+    """
+    series = np.asarray(series, dtype=float)
+    n = len(series)
+    if n < params.win or thresh is None or np.isnan(thresh):
+        return None
     return _find_onset_core(series, n, wsum, aux1, aux2, thresh,
                             params, start_day, reject_if_short_followup)
 
