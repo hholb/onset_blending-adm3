@@ -608,6 +608,9 @@ def calc_onsets_rowwise(df, day_cols, day_ints, win, params=None):
     Compute per-row onset indices under three restriction rules:
       raw, clim_mok_date (after June 2), mok (after MOK date).
     """
+    if params is not None and params.mode == "consecutive_dry":
+        return calc_onsets_matrix_consecutive_dry(df, day_cols, day_ints, params)
+
     X = df[day_cols].values.astype(float)
     t0 = pd.to_datetime(df["time"]).values
     th = df["onset_thresh"].values.astype(float)
@@ -651,6 +654,114 @@ def calc_onsets_rowwise(df, day_cols, day_ints, win, params=None):
         )
 
     return {"onset_raw": onset_raw, "onset_clim_mok_date": onset_clim_mok_date, "onset_mok": onset_mok}
+
+
+def _rolling_sum_na_rm_matrix(X, window):
+    X0 = np.nan_to_num(X, nan=0.0)
+    csum = np.concatenate(
+        [np.zeros((X.shape[0], 1), dtype=float), np.cumsum(X0, axis=1)],
+        axis=1,
+    )
+    return csum[:, window:] - csum[:, :-window]
+
+
+def _rolling_count_matrix(mask, window):
+    counts = mask.astype(np.int16)
+    csum = np.concatenate(
+        [np.zeros((mask.shape[0], 1), dtype=np.int32), np.cumsum(counts, axis=1)],
+        axis=1,
+    )
+    return csum[:, window:] - csum[:, :-window]
+
+
+def _dry_spell_prefix_matrix(X, params):
+    dry = (~np.isnan(X)) & (X < params.dry_day_min_mm)
+    dry_starts = np.zeros(X.shape, dtype=np.int8)
+    min_dry_days = params.min_dry_days
+
+    if X.shape[1] >= min_dry_days:
+        run = np.zeros(X.shape[0], dtype=np.int16)
+        for day_idx in range(X.shape[1]):
+            run = (run + 1) * dry[:, day_idx]
+            start_idx = day_idx - min_dry_days + 1
+            if start_idx >= 0:
+                dry_starts[:, start_idx] = run == min_dry_days
+
+    return np.concatenate(
+        [np.zeros((X.shape[0], 1), dtype=np.int32), np.cumsum(dry_starts, axis=1)],
+        axis=1,
+    )
+
+
+def _first_onset_from_matrices(base_ok, pre_dry, start_days, win, follow_days, series_len):
+    n_rows, max_candidate = base_ok.shape
+    candidate_days = np.arange(1, max_candidate + 1, dtype=np.int16)
+    min_days = np.maximum(1, np.ceil(start_days).astype(np.int32))
+    start_ok = candidate_days[None, :] >= min_days[:, None]
+
+    lower = candidate_days - 1 + win
+    upper = np.minimum(series_len, candidate_days - 1 + win + follow_days)
+    row_idx = np.arange(n_rows)[:, None]
+    has_dry_spell = (pre_dry[row_idx, upper[None, :]] - pre_dry[row_idx, lower[None, :]]) > 0
+
+    valid = base_ok & start_ok & ~has_dry_spell
+    has_onset = valid.any(axis=1)
+    onset = np.full(n_rows, np.nan)
+    onset[has_onset] = candidate_days[valid.argmax(axis=1)[has_onset]]
+    return onset
+
+
+def calc_onsets_matrix_consecutive_dry(df, day_cols, day_ints, params):
+    X = df[day_cols].values.astype(float)
+    t0 = pd.to_datetime(df["time"]).values
+    th = df["onset_thresh"].values.astype(float)
+    yr = df["year"].values.astype(int)
+
+    win = params.win
+    series_len = X.shape[1]
+    max_candidate = series_len - win + 1
+    if max_candidate < 1:
+        empty = [None] * len(df)
+        return {"onset_raw": empty, "onset_clim_mok_date": empty, "onset_mok": empty}
+
+    wsum = _rolling_sum_na_rm_matrix(X, win)
+    wet_count = _rolling_count_matrix(X >= params.wet_day_min_mm, win)
+    all_wet = wet_count == win
+    acc_ok = wsum > th[:, None]
+    first_day_present = ~np.isnan(X[:, :max_candidate])
+    base_ok = all_wet & acc_ok & first_day_present & ~np.isnan(th[:, None])
+
+    pre_dry = _dry_spell_prefix_matrix(X, params)
+
+    day_ints_arr = np.array(day_ints)
+    june2 = np.array([np.datetime64(f"{y}-06-02") for y in yr])
+    need_clim_offset = (june2 - t0).astype("timedelta64[D]").astype(int)
+    need_clim = np.searchsorted(day_ints_arr, need_clim_offset - 1, side="right") + 1
+    need_clim = np.where(need_clim > len(day_ints_arr), 9999, need_clim).astype(int)
+
+    mok_dates = pd.to_datetime(df["mok_date"]).values if "mok_date" in df.columns else np.array([pd.NaT] * len(df))
+    need_mok = np.ones(len(df), dtype=np.int32)
+    has_mok = ~pd.isnull(mok_dates)
+    if np.any(has_mok):
+        offsets = (mok_dates[has_mok] - t0[has_mok]).astype("timedelta64[D]").astype(int)
+        need_mok[has_mok] = np.searchsorted(day_ints_arr, offsets - 1, side="right") + 1
+        need_mok = np.where(need_mok > len(day_ints_arr), 9999, need_mok).astype(int)
+
+    onset_raw = _first_onset_from_matrices(
+        base_ok, pre_dry, np.zeros(len(df)), win, params.follow_days, series_len
+    )
+    onset_clim_mok_date = _first_onset_from_matrices(
+        base_ok, pre_dry, need_clim, win, params.follow_days, series_len
+    )
+    onset_mok = _first_onset_from_matrices(
+        base_ok, pre_dry, need_mok, win, params.follow_days, series_len
+    )
+
+    return {
+        "onset_raw": onset_raw,
+        "onset_clim_mok_date": onset_clim_mok_date,
+        "onset_mok": onset_mok,
+    }
 
 
 def process_rainfall_forecast_id(df, spec, mok_dt=None, thr_dt=None):
