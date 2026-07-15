@@ -13,14 +13,14 @@ Sources
 -------
 Blended model  : cv_preds_<model>_global_*.pkl  (from 1_blend_evaluation.py)
 Climatology    : the weekly-bin wide pickle      (from 0_connect_...py)
-                 columns prob_clim_mr_week1..4 are logit-scale → converted back
+                 columns prob_clim_week1..4 are logit-scale → converted back
 
 Usage (run from repo root)
 --------------------------
 Standard mode (two input files derived from spec):
     python predict/export_blend_output.py \\
         --issue_date  2021-06-15 \\
-        --spec_id     cv_models_clim_mok_date \\
+        --spec_id     cv_models_fixed_cutoff \\
         --model       blended_model \\
         [--method     global] \\
         [--coef_dir   Monsoon_Data/results/2025_model_evaluation/] \\
@@ -29,10 +29,10 @@ Standard mode (two input files derived from spec):
         [--input_path Monsoon_Data/Processed_Data/2026_pipeline_input/cv_data_clim_mok_date_new_pipeline.pkl] \\
         [--out_dir    Monsoon_Data/results/2025_model_evaluation/exports/]
 
-Operational mode (single combined preds pkl containing both cv_* and prob_clim_mr_* columns):
+Operational mode (single combined preds pkl containing both cv_* and prob_clim_* columns):
     python predict/export_blend_output.py \\
         --issue_date  2026-06-09 \\
-        --spec_id     cv_models_clim_mok_date_2026 \\
+        --spec_id     cv_models_fixed_cutoff_2026 \\
         --preds_file  Monsoon_Data/results/2026/blended_model_global_year2026_preds.pkl \\
         [--out_dir    Monsoon_Data/results/2026/exports/]
 
@@ -41,7 +41,7 @@ Notes
 --cv_preds_file   overrides --coef_dir for locating the cv_preds pickle.
 --input_path  overrides --pipeline_input_dir for locating the wide pipeline pickle.
 --preds_file  activates operational mode: skips loading two separate files and reads
-              everything (cv_* and prob_clim_mr_* columns) from a single combined pkl.
+              everything (cv_* and prob_clim_* columns) from a single combined pkl.
 """
 
 import os
@@ -49,9 +49,17 @@ import sys
 import pickle
 import argparse
 import warnings
+import re
 import numpy as np
 import pandas as pd
 from scipy.special import expit
+
+
+def _week_nums(df, prefix):
+    """Sorted week numbers present as `<prefix>week<n>` columns (bin count is
+    inferred from the data, so any n_bins flows through)."""
+    pat = re.compile(rf"^{re.escape(prefix)}week(\d+)$")
+    return sorted(int(m.group(1)) for c in df.columns for m in [pat.match(c)] if m)
 
 #sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 #
@@ -133,7 +141,7 @@ def main():
     parser.add_argument("--issue_date",  required=True,
                         help="Issue date to export, e.g. 2021-06-15")
     parser.add_argument("--spec_id",     required=True,
-                        help="CV spec ID, e.g. cv_models_clim_mok_date")
+                        help="CV spec ID, e.g. cv_models_fixed_cutoff")
     parser.add_argument("--model",       default="blended_model",
                         help="Blended model name (default: blended_model)")
     parser.add_argument("--method",      default="global",
@@ -156,7 +164,7 @@ def main():
     parser.add_argument("--preds_file", default=None,
                         help="Optional: Operational mode. Direct path to a combined preds pkl "
                              "(e.g. blended_model_global_year2026_preds.pkl) that contains both "
-                             "cv_* and prob_clim_mr_* columns. When provided, --cv_preds_file, "
+                             "cv_* and prob_clim_* columns. When provided, --cv_preds_file, "
                              "--coef_dir, --input_path, and --pipeline_input_dir are all ignored.")
     args = parser.parse_args()
 
@@ -196,7 +204,7 @@ def main():
                 f"Available dates: {available}"
             )
         print(f"  Rows for {issue_date}: {len(clim_day)}")
-        bins = ["week1", "week2", "week3", "week4", "later"]
+        bins = [f"week{w}" for w in _week_nums(clim_day, "cv_")] + ["later"]
         cv_col_map = {f"cv_{b}": b for b in bins}
         blend_day = clim_day.rename(columns=cv_col_map)
     else:
@@ -221,8 +229,8 @@ def main():
             )
         print(f"  Blended rows for {issue_date}: {len(blend_day)}")
 
-        # Rename cv_* columns to week*, later
-        bins = ["week1", "week2", "week3", "week4", "later"]
+        # Rename cv_* columns to week*, later (bin count inferred from the data)
+        bins = [f"week{w}" for w in _week_nums(cv_preds, "cv_")] + ["later"]
         cv_col_map = {f"cv_{b}": b for b in bins}
         blend_day = blend_day.rename(columns=cv_col_map)
 
@@ -253,9 +261,9 @@ def main():
         print(f"  Climatology rows for {issue_date}: {len(clim_day)}")
 
     # ── Extract climatology probabilities ─────────────────────────────
-    # prob_clim_mr_week* are stored in logit scale → convert back with expit()
+    # prob_clim_week* are stored in logit scale → convert back with expit()
     clim_logit_cols = {
-        f"prob_clim_mr_week{w}": f"clim_week{w}" for w in range(1, 5)
+        f"prob_clim_week{w}": f"clim_week{w}" for w in _week_nums(clim_day, "prob_clim_")
     }
     missing_clim = [c for c in clim_logit_cols if c not in clim_day.columns]
     if missing_clim:
@@ -269,8 +277,8 @@ def main():
     for logit_col, out_col in clim_logit_cols.items():
         clim_out[out_col] = expit(clim_day[logit_col].values.astype(float))
 
-    # clim_later = max(0, 1 - sum(clim_week1..4))
-    clim_week_cols = [f"clim_week{w}" for w in range(1, 5)]
+    # clim_later = max(0, 1 - sum(clim_week1..N))
+    clim_week_cols = list(clim_logit_cols.values())
     clim_out["clim_later"] = np.maximum(
         0.0, 1.0 - clim_out[clim_week_cols].sum(axis=1)
     )

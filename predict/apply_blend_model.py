@@ -22,7 +22,7 @@ Usage (run from repo root)
 --------------------------
     # Historical year:
     python predict/apply_blend_model.py \\
-        --spec_id   cv_models_clim_mok_date \\
+        --spec_id   cv_models_fixed_cutoff \\
         --model     blended_model \\
         --year_tag  2022 \\
         --year      2022 \\
@@ -33,7 +33,7 @@ Usage (run from repo root)
 
     # Future year (no ground truth):
     python predict/apply_blend_model.py \\
-        --spec_id    cv_models_clim_mok_date \\
+        --spec_id    cv_models_fixed_cutoff \\
         --model      blended_model \\
         --year       2026 \\
         --coef_tag   clim_mok_date_2022_year2022 \\
@@ -42,7 +42,7 @@ Usage (run from repo root)
 Input files
 ------------
 1. The spec YAML (via --spec_id):
-   specs/2025_blend/cv_models_clim_mok_date.yml
+   specs/2025_blend/cv_models_fixed_cutoff.yml
    Used to get cutoff_mode, holdout_years, and the formula.
 
 2. The coef pickle (looked up automatically from --coef_dir):
@@ -221,7 +221,7 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--spec_id", required=True,
-                        help="CV spec ID (e.g. cv_models_clim_mok_date)")
+                        help="CV spec ID (e.g. cv_models_fixed_cutoff)")
     parser.add_argument("--model",   required=True,
                         help="Model name as in cv_models*.yml (e.g. blended_model)")
     parser.add_argument("--year",    required=True, type=int,
@@ -233,14 +233,14 @@ def main():
                         help="CV method (default: global)")
     parser.add_argument("--coef_tag",   default=None,                        # ← NEW
                         help="Override entire output tag for coef filename. "  # ← NEW
-                             "e.g. clim_mok_date_2022_year2022  "
-                             "for coefs_blended_model_global_clim_mok_date_2022_year2022.pkl"
+                             "e.g. fixed_cutoff_2022_year2022  "
+                             "for coefs_blended_model_global_fixed_cutoff_2022_year2022.pkl"
                              "e.g. 'final' for coefs saved by 3_fit_final_model.py. "  # ← NEW
                              "Coef file becomes: coefs_{model}_{method}_{coef_tag}.pkl")  # ← NEW
     parser.add_argument("--input_path", default=None,                        # ← NEW
                         help="Path to wide_df pickle for a future year. "     # ← NEW
                              "e.g. Monsoon_Data/Processed_Data/2026/cv_data... next line "
-                             "cv_data_clim_mok_date_new_pipeline_2026.pkl"
+                             "cv_data_fixed_cutoff_new_pipeline_2026.pkl"
                              "If provided, skips standard pipeline input lookup "  # ← NEW
                              "and skips outcome filtering and metrics.")       # ← NEW
     parser.add_argument("--coef_dir", default=None,

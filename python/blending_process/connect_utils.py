@@ -13,6 +13,7 @@
 #   sum_week_probs(df, prefix, ...)
 #   sum_week_probs_with_day0(df, prefix, ...)
 #   make_clim_logits_from_prefix(raw, input_prefix, output_tag, ...)
+#   make_rain_transform(spec_value)
 #   roll_sums_mat(mat, k)
 #   week_max_over_starts(roll_mat, week_start_days)
 #   week_min_over_starts(roll_mat, week_start_days)
@@ -25,7 +26,66 @@ import numpy as np
 import pandas as pd
 from scipy.special import logit, expit
 
-from ..pipelines._shared.misc import coalesce
+from ..pipelines._shared.misc import coalesce, assign_lead_bin
+from ..pipelines._shared.read_spec import load_spec
+from ..prepare_data.onset_utils import read_onset_params
+
+
+def resolve_onset_window_map(spec):
+    """
+    Build a map of symbolic rain-predictor window tokens -> integer day counts,
+    derived from the onset definition so predictors track it automatically.
+
+    Source, in priority order:
+      1. spec['onset_spec']  -> loads specs/raw_data/<id>.yml (single source of
+         truth; the same definition drives onset detection).
+      2. spec itself, if it carries options.window / options.onset_definition inline.
+    Returns {} if no onset source is configured (symbolic tokens then raise a
+    helpful error in _resolve_window).
+
+    Tokens: trigger/window -> trigger window; dry_spell/sum_window -> dry-spell
+    window; follow -> follow_days; min_dry -> min_dry_days.
+    """
+    onset_src = None
+    onset_spec_id = spec.get("onset_spec")
+    if onset_spec_id:
+        onset_src = load_spec(onset_spec_id, "raw_data")
+    else:
+        opts = spec.get("options") or {}
+        if "window" in opts or opts.get("onset_definition") is not None:
+            onset_src = spec
+    if onset_src is None:
+        return {}
+    p = read_onset_params(onset_src)
+    return {
+        "trigger":    p.win,
+        "window":     p.win,
+        "dry_spell":  p.sum_window,
+        "sum_window": p.sum_window,
+        "follow":     p.follow_days,
+        "min_dry":    p.min_dry_days,
+    }
+
+
+def _resolve_window(w, window_map):
+    """Resolve a rain-predictor window to an int: explicit int / numeric string
+    passes through; a symbolic token is looked up in window_map (from the onset
+    definition)."""
+    if isinstance(w, bool):
+        raise ValueError(f"rain_predictor window must be an int or token, got bool {w!r}")
+    if isinstance(w, (int, np.integer)):
+        return int(w)
+    s = str(w).strip()
+    if s.isdigit():
+        return int(s)
+    tok = s.lower()
+    if tok in window_map:
+        return int(window_map[tok])
+    raise ValueError(
+        f"rain_predictor window '{w}' is not an integer and not a known onset token "
+        f"{sorted(window_map) if window_map else '(none available)'}. Set the connect "
+        f"spec's 'onset_spec' to the raw_data spec id, or use an explicit integer window."
+    )
 
 
 def winsor_weekp(p, lo=0.0001, hi=0.9999):
@@ -39,7 +99,7 @@ def logit_winsor(p, lo=0.0001, hi=0.9999):
 
 
 def sum_week_probs_from_dayprefix(df, day_prefix, out_prefix,
-                                  day_max=28, days_per_week=7, n_weeks=4):
+                                  day_max=28, days_per_bin=7, n_bins=4):
     """
     Sum daily columns <day_prefix>1..<day_prefix>N into weekly bins.
     Returns DataFrame with week columns named <out_prefix>_week1..N.
@@ -52,14 +112,14 @@ def sum_week_probs_from_dayprefix(df, day_prefix, out_prefix,
     mat = df[cols].values
 
     result = {}
-    for w in range(1, n_weeks + 1):
-        lo = (w - 1) * days_per_week
-        hi = w * days_per_week
+    for w in range(1, n_bins + 1):
+        lo = (w - 1) * days_per_bin
+        hi = w * days_per_bin
         result[f"{out_prefix}_week{w}"] = mat[:, lo:hi].sum(axis=1)
     return pd.DataFrame(result, index=df.index)
 
 
-def sum_week_probs(df, prefix, day_max=28, days_per_week=7, n_weeks=4):
+def sum_week_probs(df, prefix, day_max=28, days_per_bin=7, n_bins=4):
     """Sum <prefix>_p_onset_day_0or1..<day_max> into weekly bins.
     Auto-detects whether day 0 exists (new 0-indexed data) or starts at 1 (legacy).
     """
@@ -71,32 +131,96 @@ def sum_week_probs(df, prefix, day_max=28, days_per_week=7, n_weeks=4):
     mat = df[cols].values
 
     result = {}
-    for w in range(1, n_weeks + 1):
-        lo = (w - 1) * days_per_week
-        hi = w * days_per_week
+    for w in range(1, n_bins + 1):
+        lo = (w - 1) * days_per_bin
+        hi = w * days_per_bin
         result[f"{prefix}_p_onset_week{w}"] = mat[:, lo:hi].sum(axis=1)
     return pd.DataFrame(result, index=df.index)
 
 
-def sum_week_probs_with_day0(df, prefix, day_max=28, days_per_week=7, n_weeks=4):
+def sum_week_probs_with_day0(df, prefix, day_max=28, days_per_bin=7, n_bins=4):
     """Like sum_week_probs but also extracts day_0 column for 'earlier' bin."""
     col0 = f"{prefix}_p_onset_day_0"
     if col0 not in df.columns:
         raise ValueError(f"Missing required column: {col0}")
-    week_tbl = sum_week_probs(df, prefix, day_max=day_max, days_per_week=days_per_week, n_weeks=n_weeks)
+    week_tbl = sum_week_probs(df, prefix, day_max=day_max, days_per_bin=days_per_bin, n_bins=n_bins)
     return {"day0": df[col0].values.copy(), "week": week_tbl}
 
 
 def make_clim_logits_from_prefix(raw, input_prefix, output_tag,
-                                  day_max, days_per_week, n_weeks):
+                                  day_max, days_per_bin, n_bins):
     """Aggregate climatology day probs to weeks and apply logit_winsor."""
     wk = sum_week_probs(raw, prefix=input_prefix, day_max=day_max,
-                        days_per_week=days_per_week, n_weeks=n_weeks)
+                        days_per_bin=days_per_bin, n_bins=n_bins)
     result = {}
-    for w in range(1, n_weeks + 1):
+    for w in range(1, n_bins + 1):
         col = f"{input_prefix}_p_onset_week{w}"
-        result[f"prob_clim_mr_{output_tag}_week{w}"] = logit_winsor(wk[col].values)
+        result[f"prob_clim_{output_tag}_week{w}"] = logit_winsor(wk[col].values)
     return pd.DataFrame(result, index=raw.index)
+
+
+def make_rain_transform(spec_value):
+    """
+    Build a vectorized, non-negative rainfall transform from a spec value.
+
+    The returned function is applied ONLY when constructing rain-based blend
+    features (the diff/max/min predictors). It does NOT affect onset detection
+    or climatology, which operate on untransformed rainfall upstream.
+
+    Accepted spec values
+    ---------------------
+      - None / "identity" / "none" / ""   -> f(x) = x                (default)
+      - "sqrt"                            -> f(x) = x ** 0.5
+      - "fourth_root"                     -> f(x) = x ** 0.25
+      - "log1p"                           -> f(x) = log(1 + x)
+      - "power:<p>"                       -> f(x) = x ** p
+      - {"power": <p>}                    -> f(x) = x ** p
+      - a bare number <p>                 -> f(x) = x ** p
+
+    Power and log transforms clip inputs at 0 first. Rainfall accumulations and
+    onset thresholds are non-negative, so this only guards against tiny negative
+    round-off (which would otherwise produce NaN under a fractional power).
+    NaNs propagate unchanged so missing-week sentinels are preserved.
+    """
+    def _power(p):
+        p = float(p)
+        def f(x):
+            x = np.asarray(x, dtype=float)
+            return np.where(np.isnan(x), x, np.clip(x, 0.0, None) ** p)
+        return f
+
+    def _identity(x):
+        return np.asarray(x, dtype=float)
+
+    if spec_value is None:
+        return _identity
+
+    if isinstance(spec_value, dict):
+        if "power" in spec_value:
+            return _power(spec_value["power"])
+        raise ValueError(f"Unknown rain_transform dict {spec_value!r} (expected key 'power').")
+
+    if isinstance(spec_value, (int, float)) and not isinstance(spec_value, bool):
+        return _power(spec_value)
+
+    name = str(spec_value).strip().lower()
+    if name in ("identity", "none", ""):
+        return _identity
+    if name == "sqrt":
+        return _power(0.5)
+    if name == "fourth_root":
+        return _power(0.25)
+    if name == "log1p":
+        def f_log1p(x):
+            x = np.asarray(x, dtype=float)
+            return np.where(np.isnan(x), x, np.log1p(np.clip(x, 0.0, None)))
+        return f_log1p
+    if name.startswith("power:"):
+        return _power(name.split(":", 1)[1])
+    raise ValueError(
+        f"Unknown rain_transform '{spec_value}'. Expected one of: identity, sqrt, "
+        f"fourth_root, log1p, 'power:<p>', {{power: <p>}}, or a number."
+    )
 
 
 def roll_sums_mat(mat, k):
@@ -153,8 +277,8 @@ def make_cv_rds_from_daylevel(spec):
     input_rds = spec["input_rds"]
     output_rds = spec["output_rds"]
     day_max = coalesce(spec.get("day_max"), 28)
-    days_per_week = coalesce(spec.get("days_per_week"), 7)
-    n_weeks = coalesce(spec.get("n_weeks"), 4)
+    days_per_bin = coalesce(spec.get("days_per_bin"), 7)
+    n_bins = coalesce(spec.get("n_bins"), 4)
 
     with open(input_rds, "rb") as f:
         raw = pickle.load(f)
@@ -185,28 +309,16 @@ def make_cv_rds_from_daylevel(spec):
     raw["true_onset_date"] = pd.to_datetime(raw["true_onset_date"]).dt.date
     raw["lead_day"] = (pd.to_datetime(raw["true_onset_date"]) - pd.to_datetime(raw["time"])).dt.days
 
-    def _assign_outcome(ld):
-        if pd.isna(ld) or ld <= 0:
-            return None
-        elif ld <= 7:
-            return "week1"
-        elif ld <= 14:
-            return "week2"
-        elif ld <= 21:
-            return "week3"
-        elif ld <= 28:
-            return "week4"
-        else:
-            return "later"
-
-    raw["outcome"] = raw["lead_day"].apply(_assign_outcome)
+    raw["outcome"] = raw["lead_day"].apply(
+        lambda ld: assign_lead_bin(ld, days_per_bin, n_bins, allow_earlier=False)
+    )
 
     # Climatology base prefix
     base_prefix = coalesce(spec.get("climatology", {}).get("base_prefix"), "clim")
     unc_prefix = coalesce(spec.get("climatology", {}).get("unconditional_prefix"), "clim_unc")
 
     clim_week_probs = sum_week_probs(raw, base_prefix, day_max=day_max,
-                                     days_per_week=days_per_week, n_weeks=n_weeks)
+                                     days_per_bin=days_per_bin, n_bins=n_bins)
 
     # Climatology window variants
     window_tags = spec.get("climatology", {}).get("window_tags") or []
@@ -216,7 +328,7 @@ def make_cv_rds_from_daylevel(spec):
             pref = f"{base_prefix}_{tag}"
             variant_parts.append(
                 make_clim_logits_from_prefix(raw, pref, tag,
-                                              day_max=day_max, days_per_week=days_per_week, n_weeks=n_weeks)
+                                              day_max=day_max, days_per_bin=days_per_bin, n_bins=n_bins)
             )
         clim_variant_logits = pd.concat(variant_parts, axis=1)
     else:
@@ -227,7 +339,7 @@ def make_cv_rds_from_daylevel(spec):
     for fm in spec["forecast_models"]:
         model_name = fm["name"]
         model_week_cols_list[model_name] = sum_week_probs(
-            raw, model_name, day_max=day_max, days_per_week=days_per_week, n_weeks=n_weeks
+            raw, model_name, day_max=day_max, days_per_bin=days_per_bin, n_bins=n_bins
         )
         for variant in (fm.get("variants") or []):
             variant_key = f"{model_name}_{variant}"
@@ -236,42 +348,51 @@ def make_cv_rds_from_daylevel(spec):
                 day_prefix=f"{model_name}_p_onset_{variant}_day_",
                 out_prefix=f"{model_name}_p_onset_{variant}",
                 day_max=day_max,
-                days_per_week=days_per_week,
-                n_weeks=n_weeks,
+                days_per_bin=days_per_bin,
+                n_bins=n_bins,
             )
     model_week_cols = pd.concat(model_week_cols_list.values(), axis=1)
 
     # Unconditional climatology (has day_0 -> "earlier")
     unc = sum_week_probs_with_day0(raw, unc_prefix, day_max=day_max,
-                                    days_per_week=days_per_week, n_weeks=n_weeks)
+                                    days_per_bin=days_per_bin, n_bins=n_bins)
     unc_day0 = unc["day0"]
     unc_week_probs = unc["week"]
 
-    # Build logit features
-    clim_logits = pd.DataFrame({
-        "prob_clim_mr_week1": logit_winsor(clim_week_probs[f"{base_prefix}_p_onset_week1"].values),
-        "prob_clim_mr_week2": logit_winsor(clim_week_probs[f"{base_prefix}_p_onset_week2"].values),
-        "prob_clim_mr_week3": logit_winsor(clim_week_probs[f"{base_prefix}_p_onset_week3"].values),
-        "prob_clim_mr_week4": logit_winsor(clim_week_probs[f"{base_prefix}_p_onset_week4"].values),
-        "prob_clim_mr_unc_earlier": logit_winsor(unc_day0),
-        "prob_clim_mr_unc_week1": logit_winsor(unc_week_probs[f"{unc_prefix}_p_onset_week1"].values),
-        "prob_clim_mr_unc_week2": logit_winsor(unc_week_probs[f"{unc_prefix}_p_onset_week2"].values),
-        "prob_clim_mr_unc_week3": logit_winsor(unc_week_probs[f"{unc_prefix}_p_onset_week3"].values),
-        "prob_clim_mr_unc_week4": logit_winsor(unc_week_probs[f"{unc_prefix}_p_onset_week4"].values),
-    }, index=raw.index)
+    # Build logit features (one per configured week bin, + unconditional 'earlier')
+    clim_feats = {"prob_clim_unc_earlier": logit_winsor(unc_day0)}
+    for w in range(1, n_bins + 1):
+        clim_feats[f"prob_clim_week{w}"] = logit_winsor(
+            clim_week_probs[f"{base_prefix}_p_onset_week{w}"].values)
+        clim_feats[f"prob_clim_unc_week{w}"] = logit_winsor(
+            unc_week_probs[f"{unc_prefix}_p_onset_week{w}"].values)
+    clim_logits = pd.DataFrame(clim_feats, index=raw.index)
 
     # Rain-based predictors
     week_start_days_list = [
-        list(range((w - 1) * days_per_week + 1, w * days_per_week + 1))
-        for w in range(1, n_weeks + 1)
+        list(range((w - 1) * days_per_bin + 1, w * days_per_bin + 1))
+        for w in range(1, n_bins + 1)
     ]
     rain_predictors_dict = {}
+
+    # Symbolic window tokens (e.g. window: trigger / dry_spell) resolve from the
+    # onset definition so predictors track it. Explicit ints always win.
+    onset_window_map = resolve_onset_window_map(spec)
 
     for fm in spec["forecast_models"]:
         model_name = fm["name"]
         rain_preds = fm.get("rain_predictors") or []
         if not rain_preds:
             continue
+
+        # Optional transform applied to rain features before they enter the
+        # blend. Per-model `rain_transform` wins; otherwise fall back to a
+        # spec-level default; otherwise identity. Does not affect onset or
+        # climatology (computed upstream from untransformed rainfall).
+        rain_tf = make_rain_transform(
+            coalesce(fm.get("rain_transform"),
+                     coalesce(spec.get("rain_transform"), "identity"))
+        )
 
         _rain_start = 0 if f"{model_name}_rain_mean_day_0" in raw.columns else 1
         need_rain = [f"{model_name}_rain_mean_day_{k}" for k in range(_rain_start, day_max + 11)]
@@ -280,15 +401,19 @@ def make_cv_rds_from_daylevel(spec):
             raise ValueError(f"Missing {model_name} rain columns: {', '.join(miss_rain)}")
         rain_mat = raw[need_rain].values
 
-        # Parse rain_predictors: support both legacy strings ("diff_5day") and
-        # new dicts ({ agg: diff, window: 5 }).
+        # Parse rain_predictors. Supports:
+        #   - dicts:   { agg: diff, window: 5 }  or  { agg: min, window: dry_spell }
+        #   - legacy strings: "diff_5day", "min_10day", "max_5day"
+        # window may be an int, a numeric string, or a symbolic onset token
+        # (trigger / dry_spell / follow / min_dry) resolved from the onset definition.
         def _parse_pred(p):
             if isinstance(p, dict):
-                return str(p["agg"]).lower(), int(p["window"])
-            # legacy string format: e.g. "diff_5day", "min_10day", "max_5day"
+                return str(p["agg"]).lower(), _resolve_window(p["window"], onset_window_map)
             parts = str(p).split("_")
             agg = parts[0]
-            window = int("".join(filter(str.isdigit, parts[-1])))
+            tok = parts[-1]
+            digits = "".join(filter(str.isdigit, tok))
+            window = int(digits) if digits else _resolve_window(tok, onset_window_map)
             return agg, window
 
         parsed_preds = [_parse_pred(p) for p in rain_preds]
@@ -313,15 +438,17 @@ def make_cv_rds_from_daylevel(spec):
                         raise ValueError(f"Unknown rain predictor agg '{agg}' in model '{model_name}'")
 
         for agg, window in parsed_preds:
-            for w in range(1, n_weeks + 1):
+            for w in range(1, n_bins + 1):
                 wi = w - 1
                 agg_vals = agg_cache[(agg, window, wi)]
                 if agg == "diff":
                     col_name = f"diff_{model_name}_week{w}"
-                    rain_predictors_dict[col_name] = agg_vals - raw["onset_threshold"].values
+                    rain_predictors_dict[col_name] = (
+                        rain_tf(agg_vals) - rain_tf(raw["onset_threshold"].values)
+                    )
                 else:
                     col_name = f"{agg}_{model_name}_{window}day_week{w}"
-                    rain_predictors_dict[col_name] = agg_vals
+                    rain_predictors_dict[col_name] = rain_tf(agg_vals)
 
     rain_predictors = pd.DataFrame(rain_predictors_dict, index=raw.index)
 

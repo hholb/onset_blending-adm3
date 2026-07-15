@@ -2,7 +2,7 @@
 
 Package for probabilistic rainy season onset forecasts that blend rainfall observations with AI weather prediction model forecasts (NeuralGCM, AIFS, GenCast) through multinomial blending models. This package reproduces all results from data preparation through cross-validated evaluation to realtime operational forecast. 
 
-> **Note:** TThis package is an administrative district blending version of the orginal lat/lon gridded [blending code] (git@github.com:bosup/onset_blending.git)
+> **Note:** This package is an administrative district blending version of the original lat/lon gridded [blending code](git@github.com:bosup/onset_blending.git)
 
 ---
 
@@ -10,7 +10,7 @@ Package for probabilistic rainy season onset forecasts that blend rainfall obser
 
 All pipeline behaviour is controlled by YAML spec files. You can point the pipeline at your own data without modifying any Python code.
 
-- **Different ground truth rainfall**: Create a new spec in `specs/raw_data/` modelled after `imd_clim_mok_date.yml`. Point `input.nc_folder` at your NetCDF files and configure the variable name, dimension mappings, and onset thresholds for your grid.
+- **Different ground truth rainfall**: Create a new spec in `specs/raw_data/` modelled after `ref_rain_fixed_cutoff_2026.yml`. Point `input.nc_folder` at your NetCDF files and configure the variable name, dimension mappings, and onset thresholds for your grid.
 - **Different AI forecast models**: Create a new spec in `specs/raw_data/` modelled after `ngcm.yml` (for ensembles) or `aifs.yml`. The pipeline handles ensemble forecasts in NetCDF format with configurable dimension names and variable mappings. The `name` field under `forecast_models` in the connect spec controls all downstream column names and formula terms — changing it there propagates everywhere automatically.
 - **Different grid resolutions**: Not being used in the current version.
 - **Different onset definitions**: Edit `options.onset_definition` in your raw data spec (see [Onset Definition](#onset-definition) below). All numerical parameters — trigger window, wet-day threshold, accumulation threshold, follow-up period, and dry-spell check — are fully configurable from the yml. No code changes needed.
@@ -25,7 +25,7 @@ If you add new input sources, you will need to create matching `combine` and `20
 ## Repository Layout
 
 ```
-et_blending/
+onset_blending_for_laude/
 ├── python/
 │   ├── _shared/                      Core utilities
 │   │   ├── misc.py                     Null-coalescing and general helpers
@@ -33,7 +33,7 @@ et_blending/
 │   ├── prepare_data/                 Data preparation helpers
 │   │   ├── nc_utils.py                 NetCDF reading, regridding, wide-table construction,
 │   │   │                               onset processing pipeline driver
-│   │   ├── onset_utils.py              Onset detection (two dry-spell modes), MOK dates,
+│   │   ├── onset_utils.py              Onset detection (two dry-spell modes), reference onset dates,
 │   │   │                               threshold loading, onset parameter parsing
 │   │   ├── climatology_utils.py        KDE fitting, climatological forecasts
 │   │   └── combine_forecasts_utils.py  Merging climatology + forecast families
@@ -55,12 +55,12 @@ et_blending/
 │       ├── 2_2025_evaluation.py
 │       └── 3_produce_figures.py
 ├── specs/
-│   ├── raw_data/                     NetCDF input specs (aifs, ngcm, imd variants)
+│   ├── raw_data/                     NetCDF input specs (aifs, ngcm, ref_rain variants)
 │   ├── combine/                      Data combination templates
 │   └── 2025_blend/                   Blended model specs (formulas, MME config, connect specs)
 ├── Monsoon_Data/                     Data directory (not tracked in git)
 │   ├── raw_nc/                         Raw NetCDF inputs (IMD, NGCM, AIFS)
-│   ├── reference/                      Onset thresholds, MOK dates
+│   ├── reference/                      Onset thresholds, reference onset dates
 │   ├── Processed_Data/
 │   │   ├── Models/                       Per-system onset tables (.pkl)
 │   │   ├── Climatology/                  KDE climatology forecasts (.pkl)
@@ -83,18 +83,19 @@ et_blending/
 | `Monsoon_Data/raw_nc/IMD_2by2/` | IMD gridded rainfall NetCDF files (`data_YYYY.nc`), one per year |
 | `Monsoon_Data/raw_nc/ngcm/` | NeuralGCM ensemble forecast NetCDF files, one per year |
 | `Monsoon_Data/raw_nc/aifs/` | AIFS ensemble forecast NetCDF files, one per year |
-| `Monsoon_Data/reference/thresholds_df.csv` | Per-grid-cell onset accumulation thresholds (`lat`, `lon`, `onset_threshold`) |
-| `Monsoon_Data/reference/MOK Onset May.csv` | Monsoon Onset Kerala dates by year (`Unnamed: 0`, `Year`, `MOK`) |
+| `Monsoon_Data/reference/thresholds_df.csv` | Per-unit onset accumulation thresholds (`adm3_name`, `onset_threshold`); legacy `lat`/`lon` keying also supported. Or omit the file and set `thresholds.constant` |
+| `Monsoon_Data/reference/MOK Onset May.csv` | Per-year reference onset dates (`Unnamed: 0`, `Year`, `MOK`) |
 | `Monsoon_Data/evaluation_2025/` | Out-of-sample forecast and ground truth CSVs (for stage 2) |
 
 #### Reference file formats
 
-**`thresholds_df.csv`** — one row per grid cell:
+**`thresholds_df.csv`** — one row per unit (adm3 format, current):
 ```
-Unnamed: 0,lat,lon,onset_threshold
-1,7.5,37.5,20.0
+adm3_name,onset_threshold
+Addi Arekay,20
 ...
 ```
+(Legacy `lat,lon,onset_threshold` keying is also accepted. For a single value everywhere, skip the file and set `thresholds: { constant: 20.0 }`.)
 
 **`MOK Onset May.csv`** — one row per year; `MOK` is days since `base_date` (May 1):
 ```
@@ -121,24 +122,24 @@ All scripts must be run from the repository root. Scripts use relative paths tha
 
 ```bash
 # Process raw NetCDF files into per-system onset tables
-python python/pipelines/prepare_data/1_process_raw_nc_files.py --spec_id imd_clim_mok_date
-python python/pipelines/prepare_data/1_process_raw_nc_files.py --spec_id ngcm
-python python/pipelines/prepare_data/1_process_raw_nc_files.py --spec_id aifs
+python python/pipelines/prepare_data/1_process_raw_nc_files.py --spec_id ref_rain_fixed_cutoff_2026
+python python/pipelines/prepare_data/1_process_raw_nc_files.py --spec_id ngcm_2026
+python python/pipelines/prepare_data/1_process_raw_nc_files.py --spec_id aifs_2026
 
-# Build KDE climatology forecasts from IMD onset dates
-python python/pipelines/prepare_data/2_build_climatology.py --spec_id imd_clim_mok_date
+# Build KDE climatology forecasts from the reference-rainfall onset dates
+python python/pipelines/prepare_data/2_build_climatology.py --spec_id ref_rain_fixed_cutoff_2026
 
 # Combine ground truth, model forecasts, and climatology into wide tables
-python python/pipelines/prepare_data/3_combine_datasets.py --spec_id combine_template_clim_mok_date_2025
+python python/pipelines/prepare_data/3_combine_datasets.py --spec_id combine_template_fixed_cutoff_2026
 ```
 
-**Outputs**: `Monsoon_Data/Processed_Data/Combined/combine_template_clim_mok_date_2025_combined_wide.pkl`
+**Outputs**: `Monsoon_Data/Processed_Data/Combined/combine_template_fixed_cutoff_2026_combined_wide.pkl`
 
 ### Stage 2: Blending Pipeline
 
 ```bash
 # Convert daily onset probabilities to weekly bins
-python python/pipelines/blending_process/0_connect_prepare_data_to_2025_pipeline.py --spec_id connect_clim_mok_date
+python python/pipelines/blending_process/0_connect_prepare_data_to_2025_pipeline.py --spec_id connect_fixed_cutoff_2026
 
 # Cross-validated model evaluation + MME weight optimisation
 python python/pipelines/blending_process/1_blend_evaluation.py
@@ -176,7 +177,7 @@ For generating a forecast for a new year (e.g. 2026), use `predict/run_operation
 Before running, ensure you have:
 - Forecast NetCDF files for the new year (aifs and aifs_ens)
 - Trained blending model coef pkl from `1_blend_evaluation.py` (historical training)
-- Historical ground truth wide pkl (e.g. `imd_clim_mok_date_wide.pkl`) covering 2000–2022
+- Historical ground truth wide pkl (e.g. `ref_rain_fixed_cutoff_wide.pkl`) covering 2000–2022
 - All 2026 yml specs created in `specs/raw_data/`, `specs/combine/`, `specs/2025_blend/`, and `specs/connect/`
 
 ### Minimal example
@@ -187,13 +188,13 @@ python predict/run_operational_pipeline.py \
     --issue_date 2026-06-09 \
     --aifs_spec aifs_2026 \
     --aifs_ens_spec aifs_ens_2026 \
-    --clim_spec imd_clim_mok_date_2026 \
-    --combine_spec combine_template_clim_mok_date_2026 \
-    --connect_spec connect_clim_mok_date_2026 \
-    --blend_spec cv_models_clim_mok_date_2026 \
+    --clim_spec ref_rain_fixed_cutoff_2026 \
+    --combine_spec combine_template_fixed_cutoff_2026 \
+    --connect_spec connect_fixed_cutoff_2026 \
+    --blend_spec cv_models_fixed_cutoff_2026 \
     --coef_dir Monsoon_Data/results/wet_spell_aifs_aifs_ens \
-    --coef_tag clim_mok_date_2022_year2022 \
-    --blend_input Monsoon_Data/Processed_Data/2026/cv_data_clim_mok_date_new_pipeline_2026.pkl \
+    --coef_tag fixed_cutoff_2022_year2022 \
+    --blend_input Monsoon_Data/Processed_Data/2026/cv_data_fixed_cutoff_new_pipeline_2026.pkl \
     --work_dir Monsoon_Data/Processed_Data/2026
 ```
 
@@ -207,17 +208,17 @@ python predict/run_operational_pipeline.py \
     --issue_date 2026-06-09 \
     --aifs_spec aifs_2026 \
     --aifs_ens_spec aifs_ens_2026 \
-    --clim_spec imd_clim_mok_date_2026 \
-    --combine_spec combine_template_clim_mok_date_2026 \
-    --connect_spec connect_clim_mok_date_2026 \
-    --blend_spec cv_models_clim_mok_date_2026 \
+    --clim_spec ref_rain_fixed_cutoff_2026 \
+    --combine_spec combine_template_fixed_cutoff_2026 \
+    --connect_spec connect_fixed_cutoff_2026 \
+    --blend_spec cv_models_fixed_cutoff_2026 \
     --coef_dir Monsoon_Data/results/wet_spell_aifs_aifs_ens \
-    --coef_tag clim_mok_date_2022_year2022 \
-    --blend_input Monsoon_Data/Processed_Data/2026/cv_data_clim_mok_date_new_pipeline_2026.pkl \
+    --coef_tag fixed_cutoff_2022_year2022 \
+    --blend_input Monsoon_Data/Processed_Data/2026/cv_data_fixed_cutoff_new_pipeline_2026.pkl \
     --work_dir Monsoon_Data/Processed_Data/2026 \
     --aifs_nc_folder /data/forecasts/aifs/2026 \
     --aifs_ens_nc_folder /data/forecasts/aifs_ens/2026 \
-    --gt_path Monsoon_Data/Processed_Data/Models/wet_spell/imd_clim_mok_date_wide.pkl
+    --gt_path Monsoon_Data/Processed_Data/Models/wet_spell/ref_rain_fixed_cutoff_wide.pkl
 ```
 
 When any of these overrides are provided, the script writes a patched temp spec (e.g. `aifs_2026_op.yml`) into the relevant `specs/` subdirectory, passes that to the downstream script, and deletes the temp file on exit.
@@ -251,12 +252,12 @@ python predict/run_operational_pipeline.py \
 | `--issue_date` | Yes | Forecast issue date, e.g. `2026-06-09` |
 | `--aifs_spec` | Yes | Spec ID for aifs `1_process_raw_nc_files`, e.g. `aifs_2026` |
 | `--aifs_ens_spec` | Yes | Spec ID for aifs_ens `1_process_raw_nc_files`, e.g. `aifs_ens_2026` |
-| `--clim_spec` | Yes | Spec ID for `2_build_climatology`, e.g. `imd_clim_mok_date_2026` |
-| `--combine_spec` | Yes | Spec ID for `3_combine_datasets`, e.g. `combine_template_clim_mok_date_2026` |
+| `--clim_spec` | Yes | Spec ID for `2_build_climatology`, e.g. `ref_rain_fixed_cutoff_2026` |
+| `--combine_spec` | Yes | Spec ID for `3_combine_datasets`, e.g. `combine_template_fixed_cutoff_2026` |
 | `--connect_spec` | Yes | Spec ID for `0_connect_prepare_data_to_2025_pipeline` |
 | `--blend_spec` | Yes | Spec ID for `apply_blend_model` |
 | `--coef_dir` | Yes | Directory containing the trained blending model coef pkl |
-| `--coef_tag` | Yes | Coef tag passed to `apply_blend_model --coef_tag`, e.g. `clim_mok_date_2022_year2022` |
+| `--coef_tag` | Yes | Coef tag passed to `apply_blend_model --coef_tag`, e.g. `fixed_cutoff_2022_year2022` |
 | `--blend_input` | Yes | Path to the wide pipeline pkl for `apply_blend_model --input_path` |
 | `--work_dir` | Yes | Output directory for all intermediate and final files |
 | `--aifs_nc_folder` | No | Override `input.nc_folder` in the aifs spec yml |
@@ -387,17 +388,28 @@ If the series ends before the full follow-up window is available, the veto is ch
 
 ---
 
-## Onset Filter Variants
+## Onset Start-Date Variants
 
-Three variants control which issue dates are included in training and evaluation:
+Three variants control the **earliest calendar date that can count as an onset**. This is *not* a filter on issue dates — forecasts may be (and are) issued before the cutoff. The onset search simply will not return a date earlier than the cutoff; it looks for the first valid onset from the cutoff onward. In the code this is the `start_day` argument to `find_onset` (producing `onset_raw`, `onset_fixed_cutoff`, `onset_ref`).
 
-| Variant | Spec suffix | Description |
-|---------|-------------|-------------|
-| **clim_mok_date** | `_clim_mok_date` | Only issue dates after a fixed climatological MOK date (June 1) |
-| **mok** | _(default)_ | Only issue dates after the observed MOK date each year |
-| **no_mok_filter** | `_no_mok_filter` | No MOK-based filtering; all issue dates from May 1 onward |
+| Variant | Spec suffix | Earliest date that can count as an onset |
+|---------|-------------|-------------------------------------------|
+| **fixed_cutoff** | `_fixed_cutoff` | A fixed climatological cutoff date each year (default June 2, via `options.fixed_cutoff_month_day`) |
+| **ref_onset** | _(default)_ | The observed per-year reference onset date |
+| **no_ref_filter** | `_no_ref_filter` | No restriction — onsets count from the season start (`options.cutoff_month_day`) onward |
 
 Each variant has its own connect and CV spec in `specs/2025_blend/`.
+
+**Configuring the `ref_onset` date** (the `ref_onset:` block in the raw-data spec) has three forms:
+- **A specific date**, same every year and unit: `ref_onset: { constant_month_day: "06-01" }`.
+- **A per-year file** (one date per year, all units): `file` + `year_col` + `day_col` + `base_date` (the reference onset date is `base_date` + `day_col` days).
+- **A per-unit file** (unit-specific dates): `file` + `unit_col` + `date_col` (a parseable date), or `unit_col` + `year_col`/`day_col`/`base_date` for per-unit-per-year.
+
+## Domain / spatial filtering
+
+The modelling domain is set in the raw-data spec's `filter:` block, with two composable restrictions:
+- **`dissemination_cells_file`** — a CSV of `adm3_name` values; keeps only those units (the base domain).
+- **`bbox`** — an optional *further* restriction `{lat_min, lat_max, lon_min, lon_max}` (any subset of keys), applied on top. Defaults to no bbox restriction (all dissemination cells). Unit lat/lon is taken from `lat`/`lon` columns, an id of the form `<lat>_<lon>` (grid-cell units), or a `filter.centroids_file` (`adm3_name` + lat/lon). For admin (shapefile) units, the regrid step (0) writes a suitable centroids CSV automatically — set `filter.centroids_file` to that file.
 
 ---
 
@@ -418,16 +430,36 @@ rain_predictors:
   - { agg: max,  window: 3 }   # optional, commented out by default
 ```
 
+**Symbolic windows tied to the onset definition.** Instead of a hardcoded integer, `window` may be a token that resolves from the onset definition, so predictors track it automatically when the definition changes. Set `onset_spec: <raw_data spec id>` at the top of the connect spec and use:
+
+| Token | Resolves to |
+|-------|-------------|
+| `trigger` / `window` | onset trigger window (`options.window`) |
+| `dry_spell` / `sum_window` | dry-spell window (`onset_definition.dry_spell.sum_window`) |
+| `follow` | `follow_days` |
+| `min_dry` | `min_dry_days` |
+
+```yaml
+onset_spec: ref_rain_fixed_cutoff_2026
+forecast_models:
+  - name: aifs
+    rain_predictors:
+      - { agg: diff, window: trigger }     # follows options.window
+      - { agg: min,  window: dry_spell }   # follows sum_window
+```
+
+Explicit integers always take precedence. Output column names use the *resolved* integer (e.g. `min_aifs_10day_week1`), so formula terms and the `_qx` contract are unchanged. A symbolic token with no `onset_spec` (and no inline onset definition) raises a clear error.
+
 The current default configuration uses only `diff` with a 3-day window, matching the 3-day trigger window:
 
 ```yaml
 forecast_models:
   - name: ngcm
-    variants: [clim_mok_date]
+    variants: [fixed_cutoff]
     rain_predictors:
       - { agg: diff, window: 3 }
   - name: aifs
-    variants: [clim_mok_date]
+    variants: [fixed_cutoff]
     rain_predictors:
       - { agg: diff, window: 3 }
 ```
@@ -442,9 +474,88 @@ Three aggregation types are available:
 
 Output column names (e.g. `diff_ngcm_week1`, `min_ngcm_7day_week1`) are constructed at runtime from the model name and window size, and must match formula terms in `cv_models*.yml` using the `_qx` shorthand, which expands to `_week1` through `_week4` at runtime.
 
+### Rain transform (feature-only)
+
+An optional transform can be applied to the rain features **before they enter the blend**. It does **not** affect onset detection or climatology — those are computed upstream from untransformed rainfall. For the `diff` aggregation the transform is applied to both sides of the subtraction, i.e. `f(weekly_sum) - f(onset_threshold)`; for `max`/`min` it is applied to the aggregated value.
+
+Set a spec-level default and/or a per-model override (`rain_transform` under a `forecast_models` entry wins over the spec-level key):
+
+```yaml
+rain_transform: fourth_root        # default for all models
+
+forecast_models:
+  - name: aifs
+    rain_transform: { power: 0.25 } # per-model override; any exponent
+    rain_predictors:
+      - { agg: diff, window: 3 }
+```
+
+| Value | Transform |
+|-------|-----------|
+| `identity` / omitted | `f(x) = x` |
+| `sqrt` | `f(x) = x^(1/2)` |
+| `fourth_root` | `f(x) = x^(1/4)` |
+| `log1p` | `f(x) = log(1 + x)` |
+| `power:<p>` or `{ power: <p> }` or a bare number | `f(x) = x^p` |
+
+Power/log transforms clip inputs at 0 (rainfall sums and thresholds are non-negative); NaNs (e.g. short-week sentinels) propagate unchanged.
+
 To add or remove a predictor: edit `rain_predictors` in the connect spec **and** add or remove the corresponding `_qx` term in the formula in `cv_models*.yml`. The two must stay in sync — a predictor present in the connect spec but absent from the formula is computed but silently unused; a formula term without a matching column will cause a runtime error.
 
 ---
+
+## Re-targeting to a New Geography
+
+The core pipeline keys on an abstract `id` and never touches lat/lon, so moving to a new region is mostly a matter of supplying a boundary shapefile and gridded inputs.
+
+### Optional pre-step: regrid a whole gridded dataset onto a shapefile
+
+`python/pipelines/prepare_data/0_regrid_to_shapefile.py --spec_id <id>` (spec in `specs/regrid/`) regrids gridded rainfall onto a shapefile's admin units **before** the normal pipeline, and handles partial ground-truth coverage correctly:
+
+1. builds area weights (grid cell → target unit);
+2. finds the grid cells that actually have ground-truth data (a rain-gauge grid has no data over the ocean);
+3. drops the no-data cells and renormalizes each unit's weights to **sum to 1** (a conservative area-weighted average over only the cells with data);
+4. applies that footprint to **both the ground truth and every forecast family**, so forecast and ground truth share one spatial footprint.
+
+**Target units** are set by the spec: with a `geometry.shapefile` the target is the shapefile's admin (political) units; **without a geometry block** the target is the **ground-truth grid cells** themselves (id `"<lat>_<lon>"`), i.e. forecasts are regridded to match the ground-truth grid. **Different forecast grids:** if a forecast's grid matches the ground truth it reuses the same weights; if it differs, it is regridded onto "the unit **minus** the parts where ground-truth data didn't exist" (unit ∩ coverage).
+
+**`clip_to_coverage`** (default **true**) toggles steps 2–4; set it false for a plain per-dataset regrid (the older woreda behavior, where `remap_nc` renormalizes over non-NaN cells per timestep with no shared footprint). This step supersedes the standalone `utils/remap.py` / `remap_weights*.py` weight-builders.
+
+**Supplying your own weights.** Instead of computing weights, you can point the spec at precomputed weight CSVs (columns `latitude, longitude, adm3_name, weight`): a top-level `weights_in:` applies to everything, or a per-target `weights_in:` (under `ground_truth` or a `forecasts[]` entry) overrides it. When all weights are supplied, no shapefile overlay / coverage scan / report runs — the step just applies them. (The low-level `utils/remap.py apply --weights <csv>` does the same for a single file.)
+
+Regridding is applied to **rainfall** (raw NetCDF variables), never to onset probabilities — those are computed downstream. Each `<name>.nc` becomes `<name>_adm3.nc` alongside it; point the step-1 specs at those (`file_regex: '..._adm3\.nc$'`). A **coverage report** CSV lists, for all units and for the dissemination subset, how many units are affected by missing ground truth and the min/5/25/50/75/95/max quantiles of the missing-area fraction. When a shapefile is used, a **unit centroids** CSV (`adm3_name, lat, lon`) is also written (`centroids_out`), ready to use as `filter.centroids_file` for the bbox domain filter.
+
+### Regridding a grid onto admin units (low-level)
+
+`utils/remap.py` builds and applies the grid→admin-unit weight table. Resolution is auto-detected from the NetCDF coordinates, and the admin key column / CRS are configurable (defaults reproduce the Ethiopia `adm3_name` / EPSG:4326 setup). It supersedes the older `utils/remap_weights*.py` scripts.
+
+```bash
+# 1. Build area-fraction weights from a boundary shapefile + a sample grid
+python utils/remap.py weights \
+    --shapefile data/shapefile/admin.shp \
+    --sample-nc Monsoon_Data/raw_nc/aifs \
+    --out Monsoon_Data/grid_to_district_mapping.csv \
+    [--region-key adm3_name] [--parent-key adm2_name] [--crs EPSG:4326]
+
+# 2. Aggregate gridded .nc files to *_adm3.nc using those weights
+python utils/remap.py apply \
+    --weights Monsoon_Data/grid_to_district_mapping.csv \
+    --input-dir Monsoon_Data/raw_nc/aifs
+```
+
+A shapefile whose admin key column is not literally `adm3_name` is handled via `--region-key` (it is renamed to the canonical `adm3_name` on read). The reusable helpers live in `python/prepare_data/geometry_utils.py`.
+
+### Output maps
+
+`predict/run_maps.py` accepts `--shapefile` (adm3, must contain `adm3_name`), `--adm2_shapefile` (optional zone overlays), and `--region`, so a new geography's boundaries can be swapped in without editing the map modules.
+
+### Computed onset thresholds
+
+Onset threshold *y* is either a single constant or provided per unit — it is **never** auto-computed inside the pipeline:
+- **Constant** (e.g. Ethiopia): `thresholds: { constant: 20.0 }` — one value for every unit, no file.
+- **Per-unit file**: `thresholds.file` pointing at a CSV (keyed by `adm3_name`), NetCDF, or `.mat`, optionally transformed by `rule: { type: scale, factor: …, offset: …, min: … }`.
+
+If you *want* a rule-derived per-unit threshold (e.g. the q-quantile of the seasonal `window`-day accumulation), run the standalone, opt-in `utils/compute_thresholds.py` yourself and point `thresholds.file` at its output CSV. This is deliberately separate from the pipeline so thresholds are always explicit.
 
 ## Spec-Driven Design
 
@@ -454,7 +565,7 @@ All pipeline behaviour is controlled by YAML specs. Spec files define input path
 
 | Directory | Purpose | Used by |
 |-----------|---------|---------|
-| `specs/raw_data/` | NetCDF input config (paths, variables, thresholds, MOK, onset definition) | `1_process_raw_nc_files.py`, `2_build_climatology.py` |
+| `specs/raw_data/` | NetCDF input config (paths, variables, thresholds, reference onset, onset definition) | `1_process_raw_nc_files.py`, `2_build_climatology.py` |
 | `specs/combine/` | Which processed datasets to merge into wide tables | `3_combine_datasets.py` |
 | `specs/2025_blend/connect_*.yml` | Day-to-week conversion, forecast models, rain predictors | `0_connect_prepare_data_to_2025_pipeline.py` |
 | `specs/2025_blend/cv_models*.yml` | Model formulas, MME config, forecast calibration | `1_blend_evaluation.py` |
@@ -490,7 +601,7 @@ The model `name` field in `connect_*.yml` is the single source of truth for colu
 | `read_onset_params(spec)` | Parses `options.onset_definition` from spec; returns an `OnsetParams` namedtuple with all onset definition parameters and defaults |
 | `find_onset(series, thresh, params)` | Finds first valid onset day in a rainfall series under the configured definition |
 | `find_onset_precomp(series, win, thresh, ..., params)` | Batch-optimised version used by `calc_onsets_rowwise`; legacy positional args retained for call-site compatibility |
-| `read_mok_dates(spec)` | Reads MOK dates CSV; returns DataFrame with `year`, `mok_date` |
+| `read_ref_onset_dates(spec)` | Reads the reference onset date source: a constant month-day, a per-year file, or a per-unit file (keyed by `year` and/or `id`) |
 | `read_thresholds(spec)` | Reads per-cell onset thresholds from CSV, NetCDF, or `.mat` |
 | `roll_sum_na_rm_left(x, k)` | Left-aligned k-day rolling sum, NA treated as 0 |
 | `roll_sum_na_propagate_left(x, k)` | Left-aligned k-day rolling sum, NA propagates |
@@ -500,8 +611,8 @@ The model `name` field in `connect_*.yml` is the single source of truth for colu
 | Function | Description |
 |----------|-------------|
 | `run_single_pipeline(spec_id)` | Main driver: loads spec, processes all NetCDF years, writes output pickles |
-| `calc_onsets_rowwise(df, day_cols, day_ints, win, params)` | Computes onset indices (raw, clim_mok_date, mok) for every row; passes `params` to `find_onset_precomp` |
-| `process_rainfall_forecast_id(df, spec, ...)` | Forecast pipeline: reads onset params from spec, attaches thresholds and MOK dates, computes ensemble onset probabilities |
+| `calc_onsets_rowwise(df, day_cols, day_ints, win, params)` | Computes onset indices (raw, fixed_cutoff, ref_onset) for every row; passes `params` to `find_onset_precomp` |
+| `process_rainfall_forecast_id(df, spec, ...)` | Forecast pipeline: reads onset params from spec, attaches thresholds and reference onset dates, computes ensemble onset probabilities |
 | `process_ground_truth_rainfall_id(df, spec, ...)` | Ground truth pipeline: computes true onset dates per cell-year |
 | `attach_thresholds_id(df, thr_df)` | Left-joins per-cell `onset_thresh` onto the main DataFrame by `id` |
 
@@ -520,7 +631,8 @@ The model `name` field in `connect_*.yml` is the single source of truth for colu
 
 - Spatial key: `id = f"{lat}_{lon}"`
 - Time columns: `time` (date), `year` (int)
-- Outcome categories: `week1` through `week4` plus `later` (five weekly bins)
+- Outcome categories: `week1`..`weekN` plus `later`, where **N = `n_bins`** and each bin spans **`days_per_bin`** days (both set in the connect spec; default 4×7 = a 28-day horizon). **`n_bins` counts only the interval bins that carry a threshold date — it does NOT include the `earlier` or `later` bins.** So `n_bins: 4` means the four bins `week1`–`week4`, and the full outcome set is `earlier` (before the first bin, used by the unconditional climatology), `week1`…`week4`, and `later` (after the last bin) — i.e. `n_bins + 2` categories in total, or `n_bins + 1` for the multinomial outcome (which omits `earlier`). The labels keep the `week` prefix for data-contract stability even when a bin is not 7 days wide.
+  The bin structure is honored end-to-end through the data and model pipeline: onset outcome binning, bin-probability aggregation, climatology logits, rain predictors, formula `_qx` expansion, CV, Platt calibration, metrics, RPS, and the operational export. The plotting layer now renders **all** bins present in the data.
 - All intermediate data stored as pandas DataFrames serialised to `.pkl` (replacing `.rds` from the R version)
 - Forecast probabilities stored in wide format with system-specific prefixes
 - All scripts must be run from the repository root

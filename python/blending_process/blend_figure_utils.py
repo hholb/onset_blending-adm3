@@ -157,11 +157,23 @@ def make_fig4_variant(summ_df, models_keep, label_text, file_stem, out_dir,
 
 def make_weekly_bins_plot(df, title_suffix="", variant="", include_later=True,
                            model_labels=None, figsize=(12, 6)):
-    """Faceted bar chart of per-week Brier skill and AUC by model."""
+    """Faceted bar chart of per-week Brier skill and AUC by model.
+
+    The week bins are inferred from the data (any number of week<n> values),
+    so this adapts to the configured n_bins. NOTE: some other figures in this
+    module use fixed hand-designed panel layouts (e.g. the 3-panel reliability
+    diagram combines week3+4) and assume the 4-week structure.
+    """
     if model_labels is None:
         model_labels = {}
     fig, ax = plt.subplots(figsize=figsize)
-    weeks = ["week1", "week2", "week3", "week4"]
+    _key = "week" if "week" in df.columns else ("bin" if "bin" in df.columns else None)
+    if _key is not None:
+        wk_nums = sorted({int(m.group(1)) for v in df[_key].astype(str)
+                          for m in [re.match(r"^week(\d+)$", v)] if m})
+        weeks = [f"week{n}" for n in wk_nums] or ["week1", "week2", "week3", "week4"]
+    else:
+        weeks = ["week1", "week2", "week3", "week4"]
     if include_later:
         weeks.append("later")
 
@@ -208,11 +220,18 @@ def make_yearly_plot(yearly_df, title_suffix="", model_labels=None, figsize=(12,
 # ---------------------------------------------------------------------------
 
 def plot_reliability_3panel(rel_data, model_order=None, model_labels=None, figsize=(14, 5)):
-    """3-panel reliability diagram (week1, week2, week3+4 combined)."""
+    """Reliability diagram with one panel per bin present in the data (plots ALL bins)."""
     if model_labels is None:
         model_labels = {}
-    fig, axes = plt.subplots(1, 3, figsize=figsize)
-    panels = ["week1", "week2", "week3_4"]
+    _key = "panel" if "panel" in rel_data.columns else ("week" if "week" in rel_data.columns else None)
+    if _key is not None:
+        panels = sorted(rel_data[_key].dropna().astype(str).unique(),
+                        key=lambda v: (int(m.group(1)) if (m := re.match(r"^week(\d+)", v)) else 999))
+    else:
+        panels = ["week1", "week2", "week3", "week4"]
+    n = max(1, len(panels))
+    fig, axes = plt.subplots(1, n, figsize=(figsize[0] / 3 * n, figsize[1]))
+    axes = np.atleast_1d(axes)
 
     for ax, panel in zip(axes, panels):
         ax.plot([0, 1], [0, 1], "k--", linewidth=0.8, label="Perfect")

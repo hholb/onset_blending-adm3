@@ -8,7 +8,7 @@
 #   NetCDF file year-by-year, writing per-year results to combined outputs.
 #
 # Usage (run from MO_Forecast_Code/ directory)
-#   python pipelines/prepare_data/1_process_raw_nc_files.py --spec_id imd
+#   python pipelines/prepare_data/1_process_raw_nc_files.py --spec_id ref_rain
 #   python pipelines/prepare_data/1_process_raw_nc_files.py --spec_id ngcm
 #   python pipelines/prepare_data/1_process_raw_nc_files.py --spec_id aifs
 # ==============================================================================

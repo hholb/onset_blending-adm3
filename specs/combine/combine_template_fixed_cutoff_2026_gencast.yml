@@ -1,6 +1,6 @@
 # ==============================================================================
 # Spec for combining climatology (IMD), NGCM, and AIFS  forecasts at the 2 degree grid cell level
-# combine_template_clim_mok_date_2025.yml
+# combine_template_fixed_cutoff_2025.yml
 # Feeds into 3_combine_forecasts.R
 # ------------------------------------------------------------------------------
 # This YAML provides specs to produce data formatted for input into Monsoon Onset models
@@ -34,29 +34,29 @@ options:
   #only include forecasts up to the true onset date (needed for onset forecasts)
   trim_forecasts_after_true_onset: true
   # Which prob column from rainfall_forecast to use by default
-  # (stage-2 long has predicted_prob, predicted_prob_clim_mok_date, predicted_prob_mok)
+  # (stage-2 long has predicted_prob, predicted_prob_fixed_cutoff, predicted_prob_ref)
   default_prob_col: "predicted_prob"
 
 forecasts:
-  #ngcm:
-  aifs_ens:
+  gencast:
+  #aifs_ens:
     max_day: 45
     sources:
-      #- file: "Monsoon_Data/Processed_Data/Models/ngcm_wide.pkl"
-      - file: "Monsoon_Data/Processed_Data/2026/aifs_ens_2026_wide.pkl"
+      - file: "Monsoon_Data/Processed_Data/2026/gencast_2026_wide.pkl"
+      #- file: "Monsoon_Data/Processed_Data/2026/aifs_ens_2026_wide.pkl"
         years: "2026:2026"
 
     #constant variables are constant per lat/lon/initialization date
     # daily variables have different values for each day
     constants:
-      - {col: "onset_thresh", out: "onset_thresh"}   # -> ngcm_onset_thresh 
-      - {col: "mok_date",     out: "mok_date"}       # -> ngcm_mok_date
+      - {col: "onset_thresh", out: "onset_thresh"}   # -> gencast_onset_thresh 
+      - {col: "ref_onset_date",     out: "ref_onset_date"}       # -> gencast_ref_onset_date
 
     daily: #add_plus: add a "day_29plus" version which is 1- sum of others. 
       # add_plus generally makes sense for onset probabilites but not other things.
       - {col: "predicted_prob",      out: "p_onset", add_plus: true} 
-      - {col: "predicted_prob_clim_mok_date",      out: "p_onset_clim_mok_date", add_plus: true} 
-      - {col: "predicted_prob_mok",      out: "p_onset_mok", add_plus: true} 
+      - {col: "predicted_prob_fixed_cutoff",      out: "p_onset_fixed_cutoff", add_plus: true} 
+      - {col: "predicted_prob_ref",      out: "p_onset_ref", add_plus: true} 
       - {col: "forecast_rain",       out: "rain_mean", add_plus: false}
 
   aifs:
@@ -64,12 +64,12 @@ forecasts:
     sources:
       - file: "Monsoon_Data/Processed_Data/2026/aifs_2026_wide.pkl"
         years: "2026:2026"
-        prob_col: "predicted_prob_clim_mok_date"   # override per-source (optional)
+        prob_col: "predicted_prob_fixed_cutoff"   # override per-source (optional)
     daily: #add_plus: add a "day_29plus" version which is 1- sum of others. 
       # add_plus generally makes sense for onset probabilites but not other things.
       - {col: "predicted_prob",      out: "p_onset", add_plus: true} 
-      - {col: "predicted_prob_mok",      out: "p_onset_mok", add_plus: true} 
-      - {col: "predicted_prob_clim_mok_date",      out: "p_onset_clim_mok_date", add_plus: true} 
+      - {col: "predicted_prob_ref",      out: "p_onset_ref", add_plus: true} 
+      - {col: "predicted_prob_fixed_cutoff",      out: "p_onset_fixed_cutoff", add_plus: true} 
       - {col: "forecast_rain",       out: "rain_mean", add_plus: false}
 
 #options for climatology files (same for all files)

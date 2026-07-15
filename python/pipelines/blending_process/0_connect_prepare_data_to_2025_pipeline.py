@@ -7,9 +7,9 @@
 #   weekly-bin pickle that 1_blend_evaluation.py expects.
 #
 # Usage (run from MO_Forecast_Code/ directory)
-#   python pipelines/blending_process/0_connect_prepare_data_to_2025_pipeline.py --spec_id connect_mok
-#   python pipelines/blending_process/0_connect_prepare_data_to_2025_pipeline.py --spec_id connect_clim_mok_date
-#   python pipelines/blending_process/0_connect_prepare_data_to_2025_pipeline.py --spec_id connect_no_mok_filter
+#   python pipelines/blending_process/0_connect_prepare_data_to_2025_pipeline.py --spec_id connect_ref
+#   python pipelines/blending_process/0_connect_prepare_data_to_2025_pipeline.py --spec_id connect_fixed_cutoff
+#   python pipelines/blending_process/0_connect_prepare_data_to_2025_pipeline.py --spec_id connect_no_ref_filter
 # ==============================================================================
 
 import argparse
@@ -26,7 +26,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Convert daily combined data to weekly-bin RDS for blending."
     )
-    parser.add_argument("--spec_id", default="connect_mok",
+    parser.add_argument("--spec_id", default="connect_ref",
                         help="Spec file name (without .yml) in specs/2025_blend/")
     args = parser.parse_args()
 

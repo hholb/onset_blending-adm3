@@ -1,3 +1,8 @@
+# DEPRECATED: superseded by utils/remap.py + python/prepare_data/geometry_utils.py.
+# This version hardcodes the grid half-cell to 0.125 (0.25-deg grids only) and
+# has hardcoded paths in __main__. Prefer:
+#     python utils/remap.py weights --shapefile <shp> --sample-nc <dir> --out <csv>
+# which auto-detects resolution and reads the admin key column / CRS from config.
 import os
 import glob
 import pandas as pd
@@ -12,7 +17,7 @@ def normalize_adm2_name(adm2_id_series):
     """
     return adm2_id_series.astype(str).str.lower().str.replace(" ", "_")
 
-def standardize_imd_dataset(ds):
+def standardize_ref_dataset(ds):
     """
     Ensures the dataset has 'latitude' and 'longitude' names.
     IMD files sometimes use 'lat' and 'lon'.
@@ -40,15 +45,15 @@ def build_grid_to_district_mapping(dirs, shp_file):
     #india["adm2_name"] = normalize_adm2_name(india["adm2_id"])
     india = india[["adm3_name", "geometry"]].reset_index(drop=True)
 
-    #imd_path = os.path.join(dirs["raw"], "aifs")
-    imd_path = dirs["raw"]
-    sample_files = sorted(glob.glob(os.path.join(imd_path, "*.nc"))) # Adjusted to catch all .nc
+    #ref_rain_path = os.path.join(dirs["raw"], "aifs")
+    ref_rain_path = dirs["raw"]
+    sample_files = sorted(glob.glob(os.path.join(ref_rain_path, "*.nc"))) # Adjusted to catch all .nc
     
     if not sample_files:
-        raise FileNotFoundError(f"No IMD files found in {imd_path}")
+        raise FileNotFoundError(f"No IMD files found in {ref_rain_path}")
         
     ds_sample = xr.open_dataset(sample_files[0])
-    ds_sample = standardize_imd_dataset(ds_sample)
+    ds_sample = standardize_ref_dataset(ds_sample)
     lats = ds_sample.latitude.values
     lons = ds_sample.longitude.values
     ds_sample.close()

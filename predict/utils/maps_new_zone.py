@@ -17,6 +17,7 @@
 
 from datetime import timedelta
 import os
+import re
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
@@ -134,7 +135,7 @@ def load_adm2_geometries(base, shapefile_path=None):
 # Main map generator
 # ---------------------------------------------------------------------------
 
-def make_maps(summary, output_path, mok=False, all_cells_file=None,
+def make_maps(summary, output_path, ref_onset=False, all_cells_file=None,
               woreda_shapefile=None,
               adm2_shapefile=None,                                      # [ADDED]
               use_cartopy=False, region='country',
@@ -151,7 +152,7 @@ def make_maps(summary, output_path, mok=False, all_cells_file=None,
           later (optional).
     output_path : Path
         Directory where output PNGs will be saved.
-    mok : bool
+    ref_onset : bool
         If True, save into maps_mok/ subfolder with _mok suffix.
     all_cells_file : Path or None
         Path to all_cells.csv (adm3_name column).  Defaults to
@@ -197,7 +198,7 @@ def make_maps(summary, output_path, mok=False, all_cells_file=None,
     first_date = pd.to_datetime(summary["time"].iloc[0])
     date_str_fmt = first_date.strftime("%Y%m%d")
 
-    output_dir = output_path / ("maps_mok" if mok else "maps")
+    output_dir = output_path / ("maps_ref" if ref_onset else "maps")
     os.makedirs(output_dir, exist_ok=True)
 
     # Prepare forecast data — normalise id column
@@ -206,14 +207,18 @@ def make_maps(summary, output_path, mok=False, all_cells_file=None,
         preds_df["id"] = preds_df["adm3_name"]
     preds_df = preds_df[~preds_df["id"].isin(exclude_set)]
 
-    for i in range(1, 5):
+    # Bins present in the data (any number) -- plot ALL of them.
+    bin_nums = sorted(int(m.group(1)) for c in preds_df.columns
+                      for m in [re.match(r"^week(\d+)$", c)] if m) or [1, 2, 3, 4]
+    NB = len(bin_nums)
+    for i in bin_nums:
         preds_df[f"Climatology_p_{i}"] = preds_df[f"clim_week{i}"]
         preds_df[f"Forecast_p_{i}"]    = preds_df[f"week{i}"]
     preds_df["Forecast_p_later"] = preds_df.get(
-        "later", 1 - preds_df[[f"Forecast_p_{i}" for i in range(1, 5)]].sum(axis=1)
+        "later", 1 - preds_df[[f"Forecast_p_{i}" for i in bin_nums]].sum(axis=1)
     )
     preds_df["Climatology_p_later"] = (
-        1 - preds_df[[f"Climatology_p_{i}" for i in range(1, 5)]].sum(axis=1)
+        1 - preds_df[[f"Climatology_p_{i}" for i in bin_nums]].sum(axis=1)
     )
 
 #    print(preds_df["Forecast_p_later"].isna().sum())
@@ -231,7 +236,7 @@ def make_maps(summary, output_path, mok=False, all_cells_file=None,
 
     # Color schemes
     #period_order  = ['just_week1', 'weeks12', 'weeks23', 'weeks34', 'weeks4later', 'later']
-    period_order  = ['week1', 'week2', 'week3', 'week4', 'later']
+    period_order  = [f'week{i}' for i in bin_nums] + ['later']
     #plasma_cmap   = plt.get_cmap('plasma')
     plasma_cmap   = plt.get_cmap('Blues_r')
     #plasma_cmap   = plt.get_cmap('cool_r')
@@ -320,7 +325,7 @@ def make_maps(summary, output_path, mok=False, all_cells_file=None,
         #sums = [vf[0]+vf[1], vf[1]+vf[2], vf[2]+vf[3], vf[3]+vf[4]]
         #return ['weeks12', 'weeks23', 'weeks34', 'weeks4later'][int(np.argmax(sums))]
 
-        period_keys = ['week1', 'week2', 'week3', 'week4', 'later']
+        period_keys = [f'week{i}' for i in bin_nums] + ['later']
         return period_keys[int(np.argmax(vf))]
 
     # ------------------------------------------------------------------
@@ -331,21 +336,22 @@ def make_maps(summary, output_path, mok=False, all_cells_file=None,
         week_titles = {
             i: (f"{(pd.Timestamp(t) + timedelta(days=(i-1)*7+1)).strftime('%m/%d/%Y')} - "
                 f"{(pd.Timestamp(t) + timedelta(days=i*7)).strftime('%m/%d/%Y')}")
-            for i in range(1, 5)
+            for i in bin_nums
         }
 
         # Join forecast probs onto woreda geometries
-        merged = woredas.merge(grp[["id"] + [f"Forecast_p_{i}" for i in range(1, 5)] +
-                                    [f"Climatology_p_{i}" for i in range(1, 5)]],
+        merged = woredas.merge(grp[["id"] + [f"Forecast_p_{i}" for i in bin_nums] +
+                                    [f"Climatology_p_{i}" for i in bin_nums]],
                                left_on="adm3_name", right_on="id", how="left")
 
         # Keep the non-NaN row if duplicates exist
         #merged = (merged.sort_values("Forecast_p_later", na_position="last")
         #.drop_duplicates(subset="adm3_name", keep="first") )
 
-        fig, axes = plt.subplots(1, 4, figsize=(18, 5), sharex=True, sharey=True,
+        fig, axes = plt.subplots(1, NB, figsize=(4.5 * NB, 5), sharex=True, sharey=True,
                                  gridspec_kw={'wspace': 0.1})
-        for i, ax in enumerate(axes, 1):
+        axes = np.atleast_1d(axes)
+        for i, ax in zip(bin_nums, axes):
             country_gdf.boundary.plot(ax=ax, linewidth=0.5, edgecolor='black')
 
             # Fill with forecast prob colour
@@ -422,13 +428,13 @@ def make_maps(summary, output_path, mok=False, all_cells_file=None,
 #                        borderpad=0.5, labelspacing=0.3, framealpha=0.8)
         fig.subplots_adjust(left=0.03, right=0.98, top=0.90, bottom=0.22)
 
-        suffix = '_mok' if mok else ''
-        fname = output_dir / f"prob_weeks1-4_{ds_str}{suffix}_zone.png"
+        suffix = '_ref' if ref_onset else ''
+        fname = output_dir / f"prob_bins_{ds_str}{suffix}_zone.png"
         plt.savefig(fname, dpi=300, bbox_inches='tight')
         logging.info(f"Saved weekly probability map: {fname}")
 
         # NetCDF export
-        prob_cols = [f"Forecast_p_{i}" for i in range(1, 5)] + ["Forecast_p_later"]
+        prob_cols = [f"Forecast_p_{i}" for i in bin_nums] + ["Forecast_p_later"]
         nc_path = os.path.join(output_dir, f"weekly_probs_{date_str_fmt}{suffix}.nc")
         export_to_netcdf(grp, prob_cols, nc_path, pd.Timestamp(t).date())
 
@@ -441,12 +447,12 @@ def make_maps(summary, output_path, mok=False, all_cells_file=None,
         ds_str = pd.Timestamp(t).strftime('%Y-%m-%d')
 
         merged = woredas.merge(
-            grp[["id"] + [f"Forecast_p_{i}" for i in range(1, 5)] + ["Forecast_p_later"]],
+            grp[["id"] + [f"Forecast_p_{i}" for i in bin_nums] + ["Forecast_p_later"]],
             left_on="adm3_name", right_on="id", how="left"
         )
 
         def _row_max_period(row):
-            vf = [row.get(f"Forecast_p_{i}", np.nan) for i in range(1, 5)] + \
+            vf = [row.get(f"Forecast_p_{i}", np.nan) for i in bin_nums] + \
                  [row.get("Forecast_p_later", np.nan)]
             #print(f"vf={vf}, any_nan={any(pd.isna(vf))}")  # DEBUG
             if any(pd.isna(vf)):
@@ -479,16 +485,9 @@ def make_maps(summary, output_path, mok=False, all_cells_file=None,
         #import sys
         #sys.exit()
 
-        labels = _period_labels(pd.Timestamp(t))
-        #week_labels = ["week1", "week2", "week3", "week4"]
-        week_labels = ["week1", "week2", "week3", "week4+"]
-        #handles = [
-        #    Patch(facecolor=period_colors[k], edgecolor='none', label=labels[k])
-        #    for k in period_order
-        #]
         handles = [
-            Patch(facecolor=period_colors[k], edgecolor='none', label=week_labels[p])
-            for k,p in zip(period_order, range(0,4))
+            Patch(facecolor=period_colors[k], edgecolor='none', label=k)
+            for k in period_order
         ]
         handles.append(Patch(facecolor=period_colors['none'], edgecolor='none',
                              label='No forecast/onset'))
@@ -539,14 +538,14 @@ def make_maps(summary, output_path, mok=False, all_cells_file=None,
                     ha='center', va='center', zorder=5,
                     clip_on=True)
 
-        suffix = '_mok' if mok else ''
+        suffix = '_ref' if ref_onset else ''
         fname = output_dir / f"map_max_period_{ds_str}{suffix}_zone.png"
         plt.tight_layout(); plt.savefig(fname, dpi=300, bbox_inches='tight'); plt.close(fig)
         logging.info(f"Saved max-period map: {fname}")
 
         # NetCDF export for max period
         def _identify_max_period_idx(row):
-            probs = [row.get(f"Forecast_p_{i}", np.nan) for i in range(1, 5)] + \
+            probs = [row.get(f"Forecast_p_{i}", np.nan) for i in bin_nums] + \
                     [row.get("Forecast_p_later", np.nan)]
             if any(pd.isna(probs)):
                 return np.nan

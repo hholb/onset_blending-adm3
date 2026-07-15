@@ -67,7 +67,7 @@ def get_climatology_options_from_run(co):
         "test_year_max": int(co["test_year_max"]),
         "season_start_md": str(co["season_start_md"]),
         "issue_end_md": str(co["issue_end_md"]),
-        "onset_col": str(co.get("onset_col") or "mr_onset_day"),
+        "onset_col": str(co.get("onset_col") or "onset_day"),
         "forecast_window": int(co["forecast_window"]) if co.get("forecast_window") is not None else None,
         "horizons": co.get("horizons"),
         "conditional": bool(co["conditional"]) if co.get("conditional") is not None else True,
@@ -79,7 +79,7 @@ def get_climatology_options_from_run(co):
 # Ground-truth IO
 # ---------------------------------------------------------------------------
 
-def read_gt_onset_from_tbl(gt_tbl, onset_col="mr_onset_day", na_sentinel=None):
+def read_gt_onset_from_tbl(gt_tbl, onset_col="onset_day", na_sentinel=None):
     """
     Read and standardize ground-truth onset data from a loaded wide table.
 

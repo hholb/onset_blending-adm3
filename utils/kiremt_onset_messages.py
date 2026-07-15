@@ -162,8 +162,8 @@ def main():
         how="left"
     )
 
-    # ── derive climatology onset date  (median_mr_onset_idx + 120 = DOY) ──
-    df["clim_doy"]  = df["median_mr_onset_idx"] + 120
+    # ── derive climatology onset date  (median_onset_idx + 120 = DOY) ──
+    df["clim_doy"]  = df["median_onset_idx"] + 120
     df["clim_date"] = df["clim_doy"].apply(
         lambda d: doy_to_mmm_dd(d) if pd.notna(d) else "unknown"
     )

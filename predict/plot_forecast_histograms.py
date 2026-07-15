@@ -21,6 +21,7 @@ from pathlib import Path
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import re
 import numpy as np
 import pandas as pd
 import xarray as xr
@@ -70,18 +71,17 @@ def load_cells(cells_file: str) -> set[str]:
 
 def plot_adm3(name: str, values: dict[str, float], output_dir: Path,
               issue_date: str | None) -> None:
-    """Render and save a single histogram for one adm3_name."""
-    heights = [
-        values["Forecast_p_1"],
-        values["Forecast_p_2"],
-        values["Forecast_p_3"],
-        values["Forecast_p_4"] + values["Forecast_p_later"],
-    ]
+    """Render and save a single histogram for one adm3_name (plots ALL bins)."""
+    bin_nums = sorted(int(m.group(1)) for k in values
+                      for m in [re.match(r"^Forecast_p_(\d+)$", k)] if m)
+    bin_labels = [f"Week {i}" for i in bin_nums] + ["Later"]
+    bin_colors = ["grey"] * len(bin_labels)
+    heights = [values[f"Forecast_p_{i}"] for i in bin_nums] + [values["Forecast_p_later"]]
 
-    fig, ax = plt.subplots(figsize=(5, 4))
+    fig, ax = plt.subplots(figsize=(max(5, 1.1 * len(bin_labels)), 4))
 
-    x = np.arange(len(BIN_LABELS))
-    bars = ax.bar(x, heights, width=1.0, color=BIN_COLORS,
+    x = np.arange(len(bin_labels))
+    bars = ax.bar(x, heights, width=1.0, color=bin_colors,
                   edgecolor="white", linewidth=0.5)
 
     # Value labels on each bar
@@ -95,8 +95,8 @@ def plot_adm3(name: str, values: dict[str, float], output_dir: Path,
             )
 
     ax.set_xticks(x)
-    ax.set_xticklabels(BIN_LABELS, fontsize=9)
-    ax.set_xlim(-0.5, len(BIN_LABELS) - 0.5)
+    ax.set_xticklabels(bin_labels, fontsize=9)
+    ax.set_xlim(-0.5, len(bin_labels) - 0.5)
     ax.set_ylim(0, min(1.0, max(heights) * 1.25 + 0.05))
     ax.set_ylabel("Probability", fontsize=9)
     ax.set_xlabel("Forecast week", fontsize=9)
@@ -161,8 +161,10 @@ def main() -> None:
     adm3_names: list[str] = ds["adm3_name"].values.tolist()
     print(f"Found {len(adm3_names)} adm3 regions in dataset. Issue date: {issue_date or 'unknown'}")
 
-    required_vars = ["Forecast_p_1", "Forecast_p_2",
-                     "Forecast_p_3", "Forecast_p_4", "Forecast_p_later"]
+    # Detect however many Forecast_p_<n> bins the file contains (plot all of them).
+    bin_nums = sorted(int(m.group(1)) for v in ds.data_vars
+                      for m in [re.match(r"^Forecast_p_(\d+)$", str(v))] if m)
+    required_vars = [f"Forecast_p_{i}" for i in bin_nums] + ["Forecast_p_later"]
     missing = [v for v in required_vars if v not in ds.data_vars]
     if missing:
         sys.exit(f"ERROR: Missing variables in dataset: {missing}")

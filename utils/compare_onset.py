@@ -21,8 +21,8 @@ Usage (run from repo root)
     python compare_onset.py \\
         --obs_file     /path/to/2000.nc \\
         --fct_file     /path/to/2003.nc \\
-        --obs_spec     imd_clim_mok_date \\
-        --fct_spec     imd_clim_mok_date \\
+        --obs_spec     ref_rain_fixed_cutoff \\
+        --fct_spec     ref_rain_fixed_cutoff \\
         --obs_year     2000 \\
         --fct_year     2003 \\
         --lat          9.0 \\
@@ -293,32 +293,32 @@ def resolve_threshold(spec, lat, lon, thresh_override):
     return float(nearest["onset_thresh"])
 
 
-def resolve_mok(spec, year):
-    mok_cfg = spec.get("mok")
-    if not mok_cfg or not mok_cfg.get("file"):
+def resolve_ref(spec, year):
+    ref_onset_cfg = spec.get("ref_onset")
+    if not ref_onset_cfg or not ref_onset_cfg.get("file"):
         return None
-    mok_file = mok_cfg["file"]
+    mok_file = ref_onset_cfg["file"]
     if not os.path.exists(mok_file):
         print(f"  MOK file not found: {mok_file}")
         return None
     mok_df      = pd.read_csv(mok_file)
-    ycol        = mok_cfg.get("year_col", "Year")
-    dcol        = mok_cfg.get("day_col",  "MOK")
-    base_md     = mok_cfg.get("base_date", "01-01")
+    ycol        = ref_onset_cfg.get("year_col", "Year")
+    dcol        = ref_onset_cfg.get("day_col",  "MOK")
+    base_md     = ref_onset_cfg.get("base_date", "01-01")
     row         = mok_df[mok_df[ycol] == year]
     if row.empty:
         print(f"  MOK date: year {year} not found.")
         return None
     mok_day = int(row.iloc[0][dcol])
-    mok_ts  = pd.Timestamp(f"{year}-{base_md}") + pd.Timedelta(days=mok_day)
-    print(f"  MOK date for {year}: {mok_ts.date()} ({mok_day} days after {base_md})")
-    return mok_ts
+    ref_onset_ts  = pd.Timestamp(f"{year}-{base_md}") + pd.Timedelta(days=mok_day)
+    print(f"  MOK date for {year}: {ref_onset_ts.date()} ({mok_day} days after {base_md})")
+    return ref_onset_ts
 
 
-def mok_start_day(mok_date, dates):
-    if mok_date is None:
+def mok_start_day(ref_onset_date, dates):
+    if ref_onset_date is None:
         return 0
-    matches = np.where(dates == pd.Timestamp(mok_date))[0]
+    matches = np.where(dates == pd.Timestamp(ref_onset_date))[0]
     return int(matches[0]) + 1 if len(matches) > 0 else 0
 
 
@@ -379,7 +379,7 @@ def plot_comparison(
     actual_lat, actual_lon,
     obs_year,   fct_year,
     obs_label,  fct_label,
-    mok_date=None,
+    ref_onset_date=None,
     plot_start_md="05-01", plot_end_md="07-31",
     member=1, overlap="nearest",
     out_path="compare_onset.png",
@@ -413,8 +413,8 @@ def plot_comparison(
 
     # ---- plot window: start at MOK date (or plot_start_md), end at plot_end_md ----
     plot_end = pd.Timestamp(f"{obs_year}-{plot_end_md}")
-    if mok_date is not None:
-        plot_start = pd.Timestamp(mok_date).replace(year=obs_year)
+    if ref_onset_date is not None:
+        plot_start = pd.Timestamp(ref_onset_date).replace(year=obs_year)
     else:
         plot_start = pd.Timestamp(f"{obs_year}-{plot_start_md}")
 
@@ -493,10 +493,10 @@ def plot_comparison(
                 label=thresh_label)
 
     # ---- MOK date line ----
-    if mok_date is not None:
-        mok_ts = pd.Timestamp(mok_date).replace(year=obs_year)
-        ax.axvline(mok_ts, color=MOK_COLOR, lw=1.4, ls="--", zorder=5,
-                   label=f"MOK date: {mok_ts.strftime('%b %d')}")
+    if ref_onset_date is not None:
+        ref_onset_ts = pd.Timestamp(ref_onset_date).replace(year=obs_year)
+        ax.axvline(ref_onset_ts, color=MOK_COLOR, lw=1.4, ls="--", zorder=5,
+                   label=f"MOK date: {ref_onset_ts.strftime('%b %d')}")
 
     # ---- right-axis decoration ----
     ax2.set_ylabel(f"{obs_params.win}-day rolling sum (mm)", fontsize=9, color="#555555")
@@ -763,11 +763,11 @@ def main():
           f"{fct_dates[0].date()} → {fct_dates[-1].date()}")
 
     # ---- MOK date (from obs spec, obs year) ----
-    mok_date = resolve_mok(obs_spec, obs_year)
+    ref_onset_date = resolve_ref(obs_spec, obs_year)
 
     # ---- detect onset ----
-    obs_start = mok_start_day(mok_date, obs_dates)
-    fct_start = mok_start_day(mok_date, fct_dates)
+    obs_start = mok_start_day(ref_onset_date, obs_dates)
+    fct_start = mok_start_day(ref_onset_date, fct_dates)
 
     obs_onset_idx = find_onset(obs_series, thresh=obs_thresh,
                                params=obs_params, start_day=obs_start)
@@ -802,7 +802,7 @@ def main():
         fct_year       = fct_year,
         obs_label      = obs_label,
         fct_label      = fct_label,
-        mok_date       = mok_date,
+        ref_onset_date       = ref_onset_date,
         plot_start_md  = args.plot_start_md,
         plot_end_md    = args.plot_end_md,
         member         = args.member,

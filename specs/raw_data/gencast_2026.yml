@@ -134,13 +134,13 @@ thresholds:
 # ----------------------------
 # MOK (optional)
 # ----------------------------
-mok:
+ref_onset:
   # If you use MOK, provide this file and column mapping.
-  # If you omit mok entirely, pipeline will set mok_date = NA and skip MOK restriction.
+  # If you omit ref_onset entirely, pipeline will set ref_onset_date = NA and skip MOK restriction.
   file: "Monsoon_Data/reference/MOK Onset May.csv"
   year_col: "Year"
   day_col: "MOK"
-  # mok_date = as.Date(paste0(year, "-", base_date)) + day
+  # ref_onset_date = as.Date(paste0(year, "-", base_date)) + day
   base_date: "05-01"
 
 # ----------------------------

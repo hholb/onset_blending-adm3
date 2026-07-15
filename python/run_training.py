@@ -27,10 +27,10 @@ Usage (run from repo root)
         --model_ens       aifs_ens \\
         --aifs_spec       aifs \\
         --aifs_ens_spec   aifs_ens \\
-        --clim_spec       imd_clim_mok_date \\
-        --combine_spec    combine_template_clim_mok_date \\
-        --connect_spec    connect_clim_mok_date \\
-        --blend_spec      cv_models_clim_mok_date \\
+        --clim_spec       ref_rain_fixed_cutoff \\
+        --combine_spec    combine_template_fixed_cutoff \\
+        --connect_spec    connect_fixed_cutoff \\
+        --blend_spec      cv_models_fixed_cutoff \\
         --work_dir        Monsoon_Data/Processed_Data/training \\
         --results_dir     Monsoon_Data/results/dry_spell_aifs_aifs_ens \\
         [--aifs_nc_file       /path/to/aifs.nc] \\
@@ -215,16 +215,16 @@ def main():
                         help="Spec ID for step 3: process aifs_ens nc files, e.g. aifs_ens")
     parser.add_argument("--clim_spec",      required=True,
                         help="Spec ID for step 4: build climatology, "
-                             "e.g. imd_clim_mok_date")
+                             "e.g. ref_rain_fixed_cutoff")
     parser.add_argument("--combine_spec",   required=True,
                         help="Spec ID for step 5: combine datasets, "
-                             "e.g. combine_template_clim_mok_date")
+                             "e.g. combine_template_fixed_cutoff")
     parser.add_argument("--connect_spec",   required=True,
                         help="Spec ID for step 6: connect/prepare pipeline input, "
-                             "e.g. connect_clim_mok_date")
+                             "e.g. connect_fixed_cutoff")
     parser.add_argument("--blend_spec",     required=True,
                         help="Spec ID for step 7: blend evaluation, "
-                             "e.g. cv_models_clim_mok_date")
+                             "e.g. cv_models_fixed_cutoff")
     parser.add_argument("--work_dir",       required=True,
                         help="Working directory for all intermediate files")
     parser.add_argument("--results_dir",    required=True,
@@ -426,7 +426,7 @@ def main():
     log(f"Patched spec written: {blend_spec_op_path}")
 
     # ── Expected output paths ─────────────────────────────────────────────
-    imd_pkl     = os.path.join(work_dir, f"{args.clim_spec}_wide.pkl")
+    ref_rain_pkl     = os.path.join(work_dir, f"{args.clim_spec}_wide.pkl")
     connect_pkl = connect_output_rds
 
     TOTAL = 7
@@ -447,7 +447,7 @@ def main():
             sys.executable,
             "python/pipelines/prepare_data/1_process_raw_nc_files.py",
             "--spec_id", clim_spec,
-        ], imd_pkl),
+        ], ref_rain_pkl),
 
         (2, "Process aifs nc files", [
             sys.executable,

@@ -9,7 +9,7 @@ Cross-validated weekly-bin multinomial onset blending. Combines climatology, Neu
 Converts day-level wide pickle from the prepare_data pipeline into weekly-bin format. Aggregates daily onset probabilities into 4 weekly bins plus a "later" bin, computes logit-scale climatology features, and derives rain-based predictors.
 
 Driven by YAML specs in `specs/2025_blend/connect_*.yml`:
-- `--spec_id connect_clim_mok_date`: Uses fixed climatological MOK date (June 1)
+- `--spec_id connect_fixed_cutoff`: Uses fixed climatological MOK date (June 1)
 
 Each connect spec defines `mode`, `input_rds`, `output_rds`, `forecast_models` (with `rain_predictors` in dict format), and `climatology` prefix settings.
 
@@ -19,7 +19,7 @@ Each connect spec defines `mode`, `input_rds`, `output_rds`, `forecast_models` (
 
 Main cross-validation engine. Fits weekly-bin multinomial logistic regression models using formulas defined in the YAML spec. Formula terms ending in `_qx` are expanded automatically to `_week1` through `_week4` at runtime. Computes metrics (Brier, RPS, AUC), reliability plots, and (when enabled) optimized multi-model ensemble (MME) weights. The `summary_models` outputs in the results folder store the primary metrics of interest.
 
-Currently active model formulas (in `cv_models_clim_mok_date.yml`):
+Currently active model formulas (in `cv_models_fixed_cutoff.yml`):
 - `ngcm_blend`: climatology × ngcm diff
 - `int_all`: climatology × ngcm diff × aifs diff (interaction)
 - `add_blend`: climatology + ngcm diff + aifs diff (additive)
@@ -43,10 +43,10 @@ All commands run from the repository root:
 
 ```bash
 # Stage 0: Convert daily -> weekly bins
-python python/pipelines/blending_process/0_connect_prepare_data_to_2025_pipeline.py --spec_id connect_clim_mok_date
+python python/pipelines/blending_process/0_connect_prepare_data_to_2025_pipeline.py --spec_id connect_fixed_cutoff
 
 # Stage 1: CV evaluation
-python python/pipelines/blending_process/1_blend_evaluation.py --spec_id cv_models_clim_mok_date
+python python/pipelines/blending_process/1_blend_evaluation.py --spec_id cv_models_fixed_cutoff
 
 # Stage 2: 2025 out-of-sample evaluation
 python python/pipelines/blending_process/2_2025_evaluation.py
@@ -65,21 +65,21 @@ Located in `specs/2025_blend/*.yml`. Key fields:
 
 | Field | Description |
 |-------|-------------|
-| `mode` | MOK filter mode: `clim_mok_date` |
+| `mode` | MOK filter mode: `fixed_cutoff` |
 | `input_rds` | Path to combined wide pickle from prepare_data pipeline |
 | `output_rds` | Output path for weekly-bin pickle |
-| `day_max`, `days_per_week`, `n_weeks` | Weekly binning parameters |
+| `day_max`, `days_per_bin`, `n_bins` | Weekly binning parameters |
 | `climatology.base_prefix` | Column prefix for conditional climatology |
 | `climatology.unconditional_prefix` | Column prefix for unconditional climatology |
 | `forecast_models[].name` | Model name — drives all output column names downstream |
-| `forecast_models[].variants` | Onset filter variants to include |
+| `forecast_models[].variants` | Onset start-date variants to compute (earliest date an onset can count, e.g. `fixed_cutoff`) |
 | `forecast_models[].rain_predictors` | List of `{ agg, window }` dicts (or legacy strings) |
 
 ### `cv_models*.yml`
 
 | Field | Description |
 |-------|-------------|
-| `run.cutoff_mode` | MOK filter mode (`clim_mok_date`) |
+| `run.cutoff_mode` | MOK filter mode (`fixed_cutoff`) |
 | `run.training_years` | Years used for CV training (currently 2019–2022) |
 | `run.cv_holdout_years` | Years used as CV holdout (currently 2019–2022) |
 | `cv.methods` | CV strategy: `global` |
@@ -108,7 +108,7 @@ Located in `specs/2025_blend/*.yml`. Key fields:
 
 ## Adding a New Model Formula
 
-1. Open the relevant spec in `specs/2025_blend/` (e.g. `cv_models_clim_mok_date.yml`).
+1. Open the relevant spec in `specs/2025_blend/` (e.g. `cv_models_fixed_cutoff.yml`).
 2. Add a new entry under `models.formulas` with a name and `text` string.
 3. Use `_qx` as a shorthand for week columns — it expands to `_week1` through `_week4` automatically.
 4. Ensure any new predictor columns exist in the weekly-bin pickle (add them via `rain_predictors` in the connect spec if needed).
@@ -120,7 +120,7 @@ models:
   formulas:
     my_new_model:
       enabled: true
-      text: "outcome ~ prob_clim_mr_qx + diff_ngcm_qx"
+      text: "outcome ~ prob_clim_qx + diff_ngcm_qx"
 ```
 
 ## Adding a New Rain Predictor
@@ -133,7 +133,7 @@ models:
    ```
 2. Add the corresponding `_qx` term to the formula in `cv_models*.yml`:
    ```yaml
-   text: "outcome ~ prob_clim_mr_qx * diff_ngcm_qx + min_ngcm_7day_qx"
+   text: "outcome ~ prob_clim_qx * diff_ngcm_qx + min_ngcm_7day_qx"
    ```
 3. Re-run Stage 0, then Stage 1.
 

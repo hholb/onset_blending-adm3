@@ -1,5 +1,5 @@
 run:
-  cutoff_mode: "clim_mok_date"
+  cutoff_mode: "fixed_cutoff"
   MR: true
   #training_years: [2019, 2020, 2021, 2022]
   #cv_holdout_years: [2019, 2020, 2021, 2022]
@@ -26,37 +26,37 @@ models:
 #    #ngcm_blend:
 #    aifs_ens_blend:
 #      enabled: true
-#      text: "outcome ~ prob_clim_mr_qx * diff_ngcm_qx"
+#      text: "outcome ~ prob_clim_qx * diff_ngcm_qx"
 
 #    int_all:
 #      enabled: true
-#      text: "outcome ~ prob_clim_mr_qx * diff_ngcm_qx * diff_aifs_qx"
+#      text: "outcome ~ prob_clim_qx * diff_ngcm_qx * diff_aifs_qx"
 
 #    add_blend:
 #      enabled: true
-#      text: "outcome ~ prob_clim_mr_qx + diff_ngcm_qx + diff_aifs_qx"
+#      text: "outcome ~ prob_clim_qx + diff_ngcm_qx + diff_aifs_qx"
 
     blended_model:
       enabled: true
-      #text: "outcome ~ prob_clim_mr_qx * diff_aifs_ens_qx * diff_aifs_qx"
-      text: "outcome ~ prob_clim_mr_qx * diff_aifs_qx"
-      #text: "outcome ~ prob_clim_mr_qx * diff_ngcm_qx * diff_aifs_qx"
-      #text: "outcome ~ prob_clim_mr_qx * diff_ngcm_qx * diff_aifs_qx + min_ngcm_10day_qx + min_aifs_10day_qx"
+      #text: "outcome ~ prob_clim_qx * diff_aifs_ens_qx * diff_aifs_qx"
+      text: "outcome ~ prob_clim_qx * diff_aifs_qx"
+      #text: "outcome ~ prob_clim_qx * diff_ngcm_qx * diff_aifs_qx"
+      #text: "outcome ~ prob_clim_qx * diff_ngcm_qx * diff_aifs_qx + min_ngcm_10day_qx + min_aifs_10day_qx"
 
   window_variants:
     enabled: false
-    only_if_cutoff_mode: "mok"
+    only_if_cutoff_mode: "ref_onset"
     base_name: "blended_model"
     start_years: [1900]
     end_year: 2026
     include_baseline_1900: true
     replace:
-      from: "prob_clim_mr_qx"
-      to: "prob_clim_mr{window}_qx"
+      from: "prob_clim_qx"
+      to: "prob_clim{window}_qx"
 
 mme:
   enabled: false
-  variants: ["clim_mok_date"]
+  variants: ["fixed_cutoff"]
   mc_cores: 25
   blend_models:
     - name: clim_raw
@@ -64,20 +64,20 @@ mme:
     #- name: ngcm
 #    - name: aifs_ens
 #      source: forecast
-#      cal_variant: clim_mok_date
+#      cal_variant: fixed_cutoff
     - name: aifs
       source: forecast
-      cal_variant: clim_mok_date
+      cal_variant: fixed_cutoff
 
 extras:
   clim_logits:
     - name: unc_clim_raw
-      base_col_prefix: prob_clim_mr_unc
-      earlier_col: prob_clim_mr_unc_earlier   
+      base_col_prefix: prob_clim_unc
+      earlier_col: prob_clim_unc_earlier   
       earlier_is_logit: true
 
     - name: clim_raw
-      base_col_prefix: prob_clim_mr
+      base_col_prefix: prob_clim
       window_start_years: [1900]
       window_end_year: 2026
 
@@ -86,16 +86,16 @@ extras:
   forecasts:
     #- name: ngcm
 #    - name: aifs_ens 
-#      variant: clim_mok_date
+#      variant: fixed_cutoff
 #      raw: true
 #      calibrated: true
 #      fair_brier: true
 #      export_platt_weights: true
     - name: aifs
-      variant: clim_mok_date
+      variant: fixed_cutoff
       raw: false
       calibrated: true
 
   forecast_variants:
     base: ""
-    clim_mok_date: "_clim_mok_date"
+    fixed_cutoff: "_fixed_cutoff"

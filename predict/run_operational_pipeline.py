@@ -30,19 +30,19 @@ Usage (run from repo root)
         --model_ens       aifs_ens \\
         --aifs_spec       aifs_2026 \\
         --aifs_ens_spec   aifs_ens_2026 \\
-        --clim_spec       imd_clim_mok_date_2026 \\
-        --combine_spec    combine_template_clim_mok_date_2026 \\
-        --connect_spec    connect_clim_mok_date_2026 \\
-        --blend_spec      cv_models_clim_mok_date_2026 \\
+        --clim_spec       ref_rain_fixed_cutoff_2026 \\
+        --combine_spec    combine_template_fixed_cutoff_2026 \\
+        --connect_spec    connect_fixed_cutoff_2026 \\
+        --blend_spec      cv_models_fixed_cutoff_2026 \\
         --coef_dir        Monsoon_Data/results/wet_spell_aifs_aifs_ens \\
-        --coef_tag        clim_mok_date_2022_year2022 \\
+        --coef_tag        fixed_cutoff_2022_year2022 \\
         --work_dir        Monsoon_Data/Processed_Data/2026 \\
         [--aifs_nc_file       /path/to/aifs/2026.nc] \
         [--aifs_ens_nc_file   /path/to/aifs_ens/2026.nc] \
         [--aifs_nc_folder     /path/to/aifs/nc/files] \\
         [--aifs_ens_nc_folder /path/to/aifs_ens/nc/files] \\
-        [--blend_input     Monsoon_Data/Processed_Data/2026/cv_data_clim_mok_date_new_pipeline_2026.pkl] \\
-        [--gt_path            Monsoon_Data/Processed_Data/Models/wet_spell/imd_clim_mok_date_wide.pkl] \\
+        [--blend_input     Monsoon_Data/Processed_Data/2026/cv_data_fixed_cutoff_new_pipeline_2026.pkl] \\
+        [--gt_path            Monsoon_Data/Processed_Data/Models/wet_spell/ref_rain_fixed_cutoff_wide.pkl] \\
         [--map_output_path    predict/output/2026/] \\
         [--skip_to STEP] \\
         [--stop_at STEP] \\
@@ -61,7 +61,7 @@ Notes
 
 --gt_path
     Path to the historical ground truth wide pkl. Simultaneously overrides:
-      - input.gt_path  in the clim spec     (imd_clim_mok_date_2026.yml)
+      - input.gt_path  in the clim spec     (ref_rain_fixed_cutoff_2026.yml)
       - ground_truth_wide_rds in the combine spec (combine_template_*_2026.yml)
     Both fields must point to the same file, so a single arg controls both.
 
@@ -171,12 +171,12 @@ def check_output_exists(path, step_name):
 
 
 def run_step(step_num, total, name, cmd, expected_output, dry_run):
-    log(f"── Step {step_num}/{total}: {name} ──────────────────────────────")
+    log(f"-- Step {step_num}/{total}: {name} ------------------------------")
     cmd_str = " ".join(cmd)
     log(f"Command: {cmd_str}")
 
     if dry_run:
-        log("(dry run — skipping execution)")
+        log("(dry run - skipping execution)")
         return
 
     result = subprocess.run(cmd, cwd=REPO_ROOT)
@@ -205,21 +205,21 @@ def main():
                 --issue_date 2026-06-09 \\
                 --aifs_spec aifs_2026 \\
                 --aifs_ens_spec aifs_ens_2026 \\
-                --clim_spec imd_clim_mok_date_2026 \\
-                --combine_spec combine_template_clim_mok_date_2026 \\
-                --connect_spec connect_clim_mok_date_2026 \\
-                --blend_spec cv_models_clim_mok_date_2026 \\
+                --clim_spec ref_rain_fixed_cutoff_2026 \\
+                --combine_spec combine_template_fixed_cutoff_2026 \\
+                --connect_spec connect_fixed_cutoff_2026 \\
+                --blend_spec cv_models_fixed_cutoff_2026 \\
                 --coef_dir Monsoon_Data/results/wet_spell_aifs_aifs_ens \\
-                --coef_tag clim_mok_date_2022_year2022 \\
-                --blend_input Monsoon_Data/Processed_Data/2026/cv_data_clim_mok_date_new_pipeline_2026.pkl \\
+                --coef_tag fixed_cutoff_2022_year2022 \\
+                --blend_input Monsoon_Data/Processed_Data/2026/cv_data_fixed_cutoff_new_pipeline_2026.pkl \\
                 --work_dir Monsoon_Data/Processed_Data/2026 \\
                 --aifs_nc_folder /data/forecasts/aifs/2026 \\
                 --aifs_ens_nc_folder /data/forecasts/aifs_ens/2026 \\
-                --gt_path Monsoon_Data/Processed_Data/Models/wet_spell/imd_clim_mok_date_wide.pkl
+                --gt_path Monsoon_Data/Processed_Data/Models/wet_spell/ref_rain_fixed_cutoff_wide.pkl
         """),
     )
 
-    # ── Required ─────────────────────────────────────────────────────────
+    # -- Required ---------------------------------------------------------
     parser.add_argument("--year",          required=True)
     parser.add_argument("--issue_date",    required=True,
                         help="Forecast issue date, e.g. 2026-06-09")
@@ -228,9 +228,9 @@ def main():
     parser.add_argument("--aifs_ens_spec", required=True,
                         help="Base spec ID for aifs_ens 1_process_raw_nc_files, e.g. aifs_ens_2026")
     parser.add_argument("--clim_spec",     required=True,
-                        help="Base spec ID for 2_build_climatology, e.g. imd_clim_mok_date_2026")
+                        help="Base spec ID for 2_build_climatology, e.g. ref_rain_fixed_cutoff_2026")
     parser.add_argument("--combine_spec",  required=True,
-                        help="Base spec ID for 3_combine_datasets, e.g. combine_template_clim_mok_date_2026")
+                        help="Base spec ID for 3_combine_datasets, e.g. combine_template_fixed_cutoff_2026")
     parser.add_argument("--connect_spec",  required=True,
                         help="Spec ID for 0_connect_prepare_data_to_2025_pipeline")
     parser.add_argument("--blend_spec",    required=True,
@@ -250,7 +250,7 @@ def main():
                     help="Name of the ensemble forecast model, e.g. 'aifs_ens'. "
                          "Overrides 'aifs_ens' key in combine, connect, and cv_models specs.")
 
-    # ── yml field overrides ───────────────────────────────────────────────
+    # -- yml field overrides -----------------------------------------------
     parser.add_argument("--aifs_nc_folder", default=None,
                         help="Override input.nc_folder in the aifs spec yml")
     parser.add_argument("--aifs_ens_nc_folder", default=None,
@@ -269,9 +269,9 @@ def main():
                              "in the combine spec (both must point to the same file)")
     parser.add_argument("--blend_input", default=None,
                     help="Path to the wide pipeline pkl for apply_blend_model --input_path. "
-                         "Defaults to <work_dir>/cv_data_clim_mok_date_new_pipeline_<year>.pkl")
+                         "Defaults to <work_dir>/cv_data_fixed_cutoff_new_pipeline_<year>.pkl")
 
-    # ── Optional ─────────────────────────────────────────────────────────
+    # -- Optional ---------------------------------------------------------
     parser.add_argument("--map_output_path", default=None,
                         help="Output directory for maps. Default: predict/output/{year}/")
     parser.add_argument("--blend_model",   default="blended_model",
@@ -284,9 +284,14 @@ def main():
                         help="Stop after step N (1-indexed). Default: None (run all steps)")
     parser.add_argument("--dry_run",       action="store_true",
                         help="Print commands without executing them")
+    parser.add_argument("--regrid_spec",   default=None,
+                        help="Optional. Regrid spec id (specs/regrid/<id>.yml). When set, gridded "
+                             "rainfall is regridded onto the shapefile's admin units before step 1 "
+                             "(use when the target boundaries are political). Omit to run on the "
+                             "existing grid. The step-1 specs must then read the *_adm3.nc outputs.")
     args = parser.parse_args()
 
-    # ── Derived paths ─────────────────────────────────────────────────────
+    # -- Derived paths -----------------------------------------------------
     year       = args.year
     issue_date = args.issue_date
     work_dir   = args.work_dir
@@ -296,7 +301,7 @@ def main():
     os.makedirs(work_dir, exist_ok=True)
     #os.makedirs(map_out,  exist_ok=True)
 
-    # ── Patch specs where overrides are provided ──────────────────────────
+    # -- Patch specs where overrides are provided --------------------------
     aifs_spec     = args.aifs_spec
     aifs_ens_spec = args.aifs_ens_spec
     clim_spec     = args.clim_spec
@@ -410,10 +415,10 @@ def main():
     # patch connect spec
     # Patch connect_spec input_rds to match the _op combine output basename.
     # write_patched_spec appends _op to combine_spec, so the combine output is
-    # named <combine_spec>_op_combined_wide.pkl — the connect spec must match.
+    # named <combine_spec>_op_combined_wide.pkl - the connect spec must match.
     #combine_basename = f"{combine_spec}_combined_wide.pkl"
 
-#    # NEW — reads output.out_dir from the combine spec itself, so subdirs like dry_spell_strict/ are respected
+#    # NEW - reads output.out_dir from the combine spec itself, so subdirs like dry_spell_strict/ are respected
 #    def _read_combine_out_dir(spec_id):
 #        """Return output.out_dir from specs/combine/<spec_id>.yml, falling back to work_dir."""
 #        path = os.path.join("specs", "combine", f"{spec_id}.yml")
@@ -436,7 +441,7 @@ def main():
     connect_spec_path = os.path.join("specs", "2025_blend", f"{args.connect_spec}.yml")
     combine_basename = f"{args.combine_spec}_combined_wide.pkl"
     connect_input_rds = os.path.join(work_dir, combine_basename)
-    connect_output_rds = os.path.join(work_dir, f"cv_data_clim_mok_date_new_pipeline_{year}.pkl")
+    connect_output_rds = os.path.join(work_dir, f"cv_data_fixed_cutoff_new_pipeline_{year}.pkl")
     if args.blend_input:
         connect_output_rds = args.blend_input   # honour explicit override
     #connect_spec = write_patched_spec(
@@ -505,7 +510,7 @@ def main():
     log(f"Patched spec written: {blend_spec_op_path}")
 
 
-    # ── Expected output paths ─────────────────────────────────────────────
+    # -- Expected output paths ---------------------------------------------
 #    aifs_pkl     = os.path.join(work_dir, f"aifs_{year}_wide.pkl")
 #    aifs_ens_pkl = os.path.join(work_dir, f"aifs_ens_{year}_wide.pkl")
     #connect_pkl  = args.blend_input
@@ -581,7 +586,7 @@ def main():
         ], None),
     ]
 
-    # ── Run ───────────────────────────────────────────────────────────────
+    # -- Run ---------------------------------------------------------------
     log(f"Starting operational pipeline for year={year}, issue_date={issue_date}")
     log(f"Work dir    : {work_dir}")
     #log(f"Map output  : {map_out}")
@@ -596,21 +601,34 @@ def main():
     if args.gt_path:
         log(f"gt_path override (clim+combine): {args.gt_path}")
     if args.skip_to > 1:
-        log(f"Skipping steps 1–{args.skip_to - 1} (--skip_to {args.skip_to})")
+        log(f"Skipping steps 1-{args.skip_to - 1} (--skip_to {args.skip_to})")
     if args.dry_run:
-        log("DRY RUN — commands will be printed but not executed")
+        log("DRY RUN - commands will be printed but not executed")
     print()
 
     if args.stop_at is not None:
         log(f"Stopping after step {args.stop_at} (--stop_at {args.stop_at})")
 
+    # -- Optional pre-step 0: regrid gridded rainfall onto political boundaries --
+    if args.regrid_spec:
+        if args.skip_to > 1:
+            log(f"-- Step 0/{TOTAL}: Regrid to shapefile [SKIPPED - skip_to={args.skip_to}] --")
+        else:
+            run_step("0", TOTAL, "Regrid rainfall to shapefile (political boundaries)", [
+                sys.executable,
+                "python/pipelines/prepare_data/0_regrid_to_shapefile.py",
+                "--spec_id", args.regrid_spec,
+            ], None, args.dry_run)
+    else:
+        log("No --regrid_spec given; running on the existing grid (no regridding).")
+
     for step_num, name, cmd, expected_output in steps:
         if step_num < args.skip_to:
-            log(f"── Step {step_num}/{TOTAL}: {name} [SKIPPED] ──")
+            log(f"-- Step {step_num}/{TOTAL}: {name} [SKIPPED] --")
             continue
 
         if args.stop_at is not None and step_num > args.stop_at:
-            log(f"── Step {step_num}/{TOTAL}: {name} [SKIPPED — stop_at={args.stop_at}] ──")
+            log(f"-- Step {step_num}/{TOTAL}: {name} [SKIPPED - stop_at={args.stop_at}] --")
             continue
 
         run_step(step_num, TOTAL, name, cmd, expected_output, args.dry_run)
@@ -620,7 +638,7 @@ def main():
         log(f"Pipeline complete. Outputs in : {work_dir}")
         #log(f"Maps in                       : {map_out}")
     else:
-        log("Dry run complete — no files were created.")
+        log("Dry run complete - no files were created.")
 
 
 if __name__ == "__main__":

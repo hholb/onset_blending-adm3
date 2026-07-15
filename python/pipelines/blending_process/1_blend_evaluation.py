@@ -22,8 +22,10 @@ import pandas as pd
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 
-from python.pipelines._shared.misc import coalesce
+import re
+from python.pipelines._shared.misc import coalesce, interval_bins
 from python.blending_process.blend_evaluation_utils import (
+    _present_weeks,
     build_formulas_from_spec,
     print_formula_summary,
     compute_cv_global,
@@ -93,7 +95,7 @@ def main():
 
     os.makedirs(path_box, exist_ok=True)
 
-    cutoff_mode = coalesce(spec.get("run", {}).get("cutoff_mode"), "mok")
+    cutoff_mode = coalesce(spec.get("run", {}).get("cutoff_mode"), "ref_onset")
     training_years = list(map(int, coalesce(spec.get("run", {}).get("training_years"), list(range(2000, 2025)))))
     true_holdout_years = list(map(int, coalesce(spec.get("run", {}).get("true_holdout_years"), [])))
     cv_holdout_years = list(map(int, coalesce(spec.get("run", {}).get("cv_holdout_years"), [])))
@@ -134,9 +136,15 @@ def main():
     with open(input_path, "rb") as f:
         wide_df = pickle.load(f)
 
+    # Number of forecast week-bins, inferred from the connect-stage output
+    # (prob_clim_week<n> columns). Drives all bin lists below so a spec with a
+    # different days_per_bin / n_bins flows through unchanged.
+    N_BINS = max([int(m.group(1)) for c in wide_df.columns
+                   for m in [re.match(r"^prob_clim_week(\d+)$", c)] if m] or [4])
+
 
 #    # --- DIAGNOSTIC
-#    mask = wide_df["prob_clim_mr_week1"].isna() & wide_df["ngcm_p_onset_clim_mok_date_week1"].notna()
+#    mask = wide_df["prob_clim_week1"].isna() & wide_df["ngcm_p_onset_fixed_cutoff_week1"].notna()
 #    print(f"Before outcome filter — NaN clim but valid ngcm: {mask.sum()}")
 #    print(f"  of which outcome is notna: {(mask & wide_df['outcome'].notna()).sum()}")
 #    print(f"  of which outcome is NA:    {(mask & wide_df['outcome'].isna()).sum()}")
@@ -150,7 +158,7 @@ def main():
 #        gt_wide = pickle.load(f)
 #    
 #    # Get the 570 ghost cells (NaN clim but valid ngcm, before outcome filter)
-#    mask = wide_df["prob_clim_mr_week1"].isna() & wide_df["ngcm_p_onset_clim_mok_date_week1"].notna()
+#    mask = wide_df["prob_clim_week1"].isna() & wide_df["ngcm_p_onset_fixed_cutoff_week1"].notna()
 #    ghost_ids = set(wide_df[mask]["id"].unique())
 #    
 #    # Count non-NaN onset years per cell in ground truth
@@ -159,7 +167,7 @@ def main():
 #        .groupby("id")
 #        .apply(lambda g: pd.Series({
 #            "n_years_total": len(g),
-#            "n_years_with_onset": g["mr_onset_day"].notna().sum(),
+#            "n_years_with_onset": g["onset_day"].notna().sum(),
 #            "lat": g.name.split("_")[0],
 #            "lon": g.name.split("_")[1],
 #        }))
@@ -175,11 +183,11 @@ def main():
 #    wide_df = wide_df[wide_df["outcome"].notna()].copy()
 #
 #    # --- DIAGNOSTIC
-#    mask = wide_df["prob_clim_mr_week1"].isna() & wide_df["ngcm_p_onset_clim_mok_date_week1"].notna()
-#    #print(f"\nRows where prob_clim_mr_week1 is NaN but ngcm has a value: {mask.sum()}")
-#    #print(wide_df[mask][["id", "year", "time", "outcome", "prob_clim_mr_week1", "ngcm_p_onset_clim_mok_date_week1"]].to_string())
+#    mask = wide_df["prob_clim_week1"].isna() & wide_df["ngcm_p_onset_fixed_cutoff_week1"].notna()
+#    #print(f"\nRows where prob_clim_week1 is NaN but ngcm has a value: {mask.sum()}")
+#    #print(wide_df[mask][["id", "year", "time", "outcome", "prob_clim_week1", "ngcm_p_onset_fixed_cutoff_week1"]].to_string())
 #
-#    clim_cols = [c for c in wide_df.columns if c.startswith("prob_clim_mr")]
+#    clim_cols = [c for c in wide_df.columns if c.startswith("prob_clim")]
 #    raw_col = next((c for c in wide_df.columns if "ngcm" in c and "p_onset" in c and "week" in c), None)
 #    if clim_cols and raw_col:
 #        has_raw   = wide_df[raw_col].notna()
@@ -194,7 +202,7 @@ def main():
 #    holdout_mask = wide_df["year"].isin(training_years)  # or holdout_years
 #    
 #    # Check which columns have NaN in holdout rows
-#    clim_cols = [c for c in wide_df.columns if c.startswith("prob_clim_mr")]
+#    clim_cols = [c for c in wide_df.columns if c.startswith("prob_clim")]
 #    ngcm_cols = [c for c in wide_df.columns if "ngcm_p_onset" in c and "week" in c]
 #    aifs_cols = [c for c in wide_df.columns if "aifs_p_onset" in c and "week" in c]
 #    
@@ -223,7 +231,7 @@ def main():
 
     # Drop rows with NaN in any feature column to ensure consistent n
     # across blended models and raw/calibrated forecast evaluation
-    feature_prefixes = ("prob_clim_mr", "diff_", "min_", "max_")
+    feature_prefixes = ("prob_clim", "diff_", "min_", "max_")
     feature_cols = [c for c in wide_df.columns
                     if any(c.startswith(p) for p in feature_prefixes)]
     wide_df = wide_df.dropna(subset=feature_cols).copy()
@@ -310,7 +318,7 @@ def main():
                 all_cells_list.append(cell_metrics)
 
                 # Yearly metrics
-                bins = ["week1", "week2", "week3", "week4", "later"]
+                bins = interval_bins(N_BINS)
                 cv_cols = [f"cv_{b}" for b in bins]
                 sub = cv_preds.dropna(subset=["outcome"] + cv_cols)
                 for yr, g in sub.groupby("year"):
@@ -475,17 +483,18 @@ def main():
                             get_forecast_variant_suffix, forecast_prob_cols
                         )
                         suf = get_forecast_variant_suffix(spec, variant)
-                        cols = forecast_prob_cols(fc_name, suf)
-                        missing = [c for c in cols.values() if c not in wide_df.columns]
-                        if not missing:
+                        base = f"{fc_name}_p_onset{suf}"
+                        weeks = _present_weeks(wide_df, base)
+                        if weeks:
                             platt_df_full = wide_df[wide_df["year"].isin(training_years + holdout_years)].copy()
-                            for wk in ["week1", "week2", "week3", "week4"]:
-                                platt_df_full[wk] = platt_df_full[cols[wk]]
+                            wk_labels = [f"week{w}" for w in weeks]
+                            for w in weeks:
+                                platt_df_full[f"week{w}"] = platt_df_full[f"{base}_week{w}"]
                             platt_df_full["later"] = np.maximum(
-                                0.0, 1.0 - platt_df_full[["week1", "week2", "week3", "week4"]].sum(axis=1)
+                                0.0, 1.0 - platt_df_full[wk_labels].sum(axis=1)
                             )
                             platt_result = fit_platt_weights_export(
-                                platt_df_full, ["week1", "week2", "week3", "week4", "later"],
+                                platt_df_full, wk_labels + ["later"],
                                 training_years, year_col="year"
                             )
                             platt_path = os.path.join(
@@ -505,11 +514,11 @@ def main():
     mme_cfg = spec.get("mme") or {}
     if mme_cfg.get("enabled", False) and clim_cv_preds_list:
 
-        mme_variants = list(mme_cfg.get("variants") or ["clim_mok_date"])
+        mme_variants = list(mme_cfg.get("variants") or ["fixed_cutoff"])
         blend_models = mme_cfg.get("blend_models") or []
         mc_cores = args.cores or mme_cfg.get("mc_cores", 1)
 
-        bins5 = ["week1", "week2", "week3", "week4", "later"]
+        bins5 = interval_bins(N_BINS)
         cols5 = [f"cv_{b}" for b in bins5]
         id_vars = ["time", "id", "lat", "lon", "year", "outcome"]
 

@@ -6,7 +6,7 @@
 #   rainfall time series.
 #
 # Functions
-#   read_mok_dates(spec)
+#   read_ref_onset_dates(spec)
 #   read_thresholds(spec)
 #   roll_sum_na_rm_left(x, k)
 #   roll_sum_na_propagate_left(x, k)
@@ -20,42 +20,184 @@ import pandas as pd
 from datetime import date
 
 
-def read_mok_dates(spec):
+def read_ref_onset_dates(spec):
     """
-    Read Monsoon Onset Kerala (MOK) dates from the file specified in spec.
+    Read the reference seasonal-onset dates (the "MOK"-style date used by the
+    ref_onset start-date variant). Configured under spec["ref_onset"]:
 
-    Returns a DataFrame with columns: year (int), mok_date (datetime.date).
-    Returns None if spec["mok"]["file"] is not set.
+      # Option 1 - a specific calendar date, same every year and unit:
+      ref_onset: { constant_month_day: "06-01" }
+
+      # Option 2 - a per-year file (one date per year, all units):
+      ref_onset: { file: "...csv", year_col: Year, day_col: MOK, base_date: "05-01" }
+
+      # Option 3 - a file of unit-specific dates (optionally also per-year):
+      ref_onset: { file: "...csv", unit_col: adm3_name, date_col: onset_date }
+      ref_onset: { file: "...csv", unit_col: adm3_name, year_col: Year,
+                   day_col: MOK, base_date: "05-01" }
+
+    Returns one of:
+      - None (nothing configured),
+      - {"mode": "constant_month_day", "month_day": "MM-DD"},
+      - a DataFrame with column ref_onset_date plus key column(s) among
+        {"year", "id"} to merge on.
     """
-    if spec.get("mok") is None or spec["mok"].get("file") is None:
+    cfg = spec.get("ref_onset") or {}
+    if not cfg:
         return None
 
-    f = spec["mok"]["file"]
+    md = cfg.get("constant_month_day") or cfg.get("date")
+    if md:
+        return {"mode": "constant_month_day", "month_day": str(md)}
+
+    f = cfg.get("file")
+    if not f:
+        return None
     if not os.path.exists(f):
-        raise FileNotFoundError(f"MOK file not found: {f}")
+        raise FileNotFoundError(f"ref_onset file not found: {f}")
 
-    mok = pd.read_csv(f)
-    ycol = spec["mok"]["year_col"]
-    dcol = spec["mok"]["day_col"]
-    if ycol not in mok.columns or dcol not in mok.columns:
-        raise ValueError(f"MOK file must contain columns '{ycol}' and '{dcol}'")
+    tbl = pd.read_csv(f)
+    ycol, dcol = cfg.get("year_col"), cfg.get("day_col")
+    base_md = cfg.get("base_date")
+    date_col = cfg.get("date_col")
+    unit_col = cfg.get("unit_col")
 
-    base_md = spec["mok"]["base_date"]  # e.g. "01-01"
-    mok["mok_date"] = mok.apply(
-        lambda row: pd.to_datetime(f"{int(row[ycol])}-{base_md}") + pd.Timedelta(days=int(row[dcol])),
-        axis=1
-    ).dt.date
-    return mok[[ycol, "mok_date"]].rename(columns={ycol: "year"}).assign(year=lambda d: d["year"].astype(int))
+    if date_col and date_col in tbl.columns:
+        tbl["ref_onset_date"] = pd.to_datetime(tbl[date_col], errors="coerce").dt.date
+    elif ycol and dcol and base_md and ycol in tbl.columns and dcol in tbl.columns:
+        tbl["ref_onset_date"] = tbl.apply(
+            lambda row: (pd.to_datetime(f"{int(row[ycol])}-{base_md}")
+                         + pd.Timedelta(days=int(row[dcol]))).date(),
+            axis=1,
+        )
+    else:
+        raise ValueError(
+            "ref_onset file needs either a parseable 'date_col', or "
+            "'year_col'+'day_col'+'base_date'."
+        )
+
+    keys = []
+    if unit_col:
+        if unit_col not in tbl.columns:
+            raise ValueError(f"ref_onset unit_col '{unit_col}' not in file columns {tbl.columns.tolist()}")
+        tbl = tbl.rename(columns={unit_col: "id"})
+        tbl["id"] = tbl["id"].astype(str).str.strip()
+        keys.append("id")
+    if ycol and ycol in tbl.columns:
+        tbl = tbl.rename(columns={ycol: "year"})
+        tbl["year"] = tbl["year"].astype(int)
+        keys.append("year")
+    if not keys:
+        raise ValueError("ref_onset file needs a 'year_col' and/or 'unit_col' to key on.")
+
+    return tbl[keys + ["ref_onset_date"]].drop_duplicates()
+
+
+def threshold_quantile_accumulation(series_by_id, window, q):
+    """
+    Data-driven onset threshold rule: per unit, the q-quantile of the
+    `window`-day rolling rainfall accumulation, pooled over all supplied days.
+
+    This is the "computed according to a rule" threshold y in the onset
+    definition "x days accumulating >= y". It is a pure function of the rainfall
+    and is exercised by utils/compute_thresholds.py (kept decoupled from the main
+    pipeline so it can run offline and write a per-unit thresholds CSV).
+
+    Parameters
+    ----------
+    series_by_id : dict[str, array-like]
+        Unit id -> 1-D daily rainfall (concatenated across the seasonal windows
+        / years to pool from). NaNs are treated as 0 in the rolling sum.
+    window : int
+        Trigger accumulation window (days) — normally options.window.
+    q : float
+        Quantile in [0, 1] (e.g. 0.9).
+
+    Returns
+    -------
+    dict[str, float]  unit id -> threshold. Units with fewer than `window`
+    valid days are omitted.
+    """
+    out = {}
+    for uid, series in series_by_id.items():
+        roll = roll_sum_na_rm_left(series, int(window))
+        if roll.size == 0:
+            continue
+        out[str(uid)] = float(np.quantile(roll, float(q)))
+    return out
+
+
+def _apply_threshold_scale(base, rule):
+    """
+    Apply a `scale` rule (factor / offset / clip) to a resolved base threshold,
+    which may be a scalar or a DataFrame with an `onset_thresh` column.
+    onset_thresh -> clip(onset_thresh * factor + offset, min, max).
+    """
+    factor = float(rule.get("factor", 1.0))
+    offset = float(rule.get("offset", 0.0))
+    lo = rule.get("min")
+    hi = rule.get("max")
+
+    def _clip(x):
+        x = x * factor + offset
+        if lo is not None:
+            x = np.maximum(x, float(lo))
+        if hi is not None:
+            x = np.minimum(x, float(hi))
+        return x
+
+    if isinstance(base, (int, float, np.floating, np.integer)):
+        return float(_clip(np.asarray(float(base))))
+    base = base.copy()
+    base["onset_thresh"] = _clip(base["onset_thresh"].astype(float).values)
+    return base
 
 
 def read_thresholds(spec):
     """
     Read per-grid-cell onset thresholds.
 
-    Returns a DataFrame with columns: lat, lon, onset_thresh.
-    Returns None if spec["thresholds"]["file"] is not set.
+    Returns a DataFrame with columns: lat, lon, onset_thresh (or id, onset_thresh
+    for adm3 data), or a scalar float. Returns None if no threshold source is set.
+
+    A `thresholds.rule` block can compute the threshold instead of / on top of a
+    fixed source:
+      rule:
+        type: constant          # every unit gets `value`
+        value: 20.0
+      rule:
+        type: scale             # transform a resolved base source (needs `file`)
+        factor: 0.9             # onset_thresh -> onset_thresh*factor + offset,
+        offset: 0.0             # clipped to [min, max] if given
+        min: 5.0
+    Data-driven rules (e.g. a rainfall quantile) are produced offline by
+    utils/compute_thresholds.py, which writes a CSV you point `file` at.
     """
-    if spec.get("thresholds") is None or spec["thresholds"].get("file") is None:
+    tcfg = spec.get("thresholds") or {}
+    rule = tcfg.get("rule")
+
+    # Simplest form: one constant threshold for every unit (e.g. Ethiopia uses a
+    # single accumulation threshold). No file is read.
+    if tcfg.get("constant") is not None:
+        return float(tcfg["constant"])
+
+    # Equivalent `rule` form.
+    if rule is not None and str(rule.get("type", "")).lower() == "constant":
+        return float(rule["value"])
+
+    base = _read_threshold_source(spec)
+    if base is None:
+        return None
+    if rule is not None and str(rule.get("type", "")).lower() == "scale":
+        return _apply_threshold_scale(base, rule)
+    return base
+
+
+def _read_threshold_source(spec):
+    """Resolve the fixed threshold source (scalar / CSV / NetCDF / .mat).
+    Returns a scalar float, a DataFrame with an `onset_thresh` column, or None."""
+    tcfg = spec.get("thresholds") or {}
+    if tcfg.get("file") is None:
         return None
 
     f = spec["thresholds"]["file"]

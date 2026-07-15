@@ -8,8 +8,8 @@
 #   Supports MULTIPLE climatology runs from a single YAML spec.
 #
 # Usage (run from MO_Forecast_Code/ directory)
-#   python pipelines/prepare_data/2_build_climatology.py --spec_id imd
-#   python pipelines/prepare_data/2_build_climatology.py --spec_id imd --run clim_1965_2024
+#   python pipelines/prepare_data/2_build_climatology.py --spec_id ref_rain
+#   python pipelines/prepare_data/2_build_climatology.py --spec_id ref_rain --run clim_1965_2024
 # ==============================================================================
 
 import argparse

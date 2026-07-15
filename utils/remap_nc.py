@@ -37,6 +37,16 @@ def batch_aggregate_to_adm3_matrix(input_dir, mapping_csv_path, input_file=None)
         # masked to NaN before any arithmetic. This was the main data bug:
         # -99 fill values were being included in the weighted sum.
         with xr.open_dataset(file_path, mask_and_scale=True) as ds:
+            # Standardize spatial coord names so we always work in lat/lon
+            # (input files may use latitude/longitude, e.g. the IMD grids).
+            rename_ll = {}
+            if 'latitude' in ds.dims or 'latitude' in ds.coords:
+                rename_ll['latitude'] = 'lat'
+            if 'longitude' in ds.dims or 'longitude' in ds.coords:
+                rename_ll['longitude'] = 'lon'
+            if rename_ll:
+                ds = ds.rename(rename_ll)
+
             processed_vars = {}
 
             for var_name in ds.data_vars:

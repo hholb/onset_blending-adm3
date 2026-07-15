@@ -23,7 +23,7 @@ from itertools import product
 from ..pipelines._shared.misc import coalesce
 from ..pipelines._shared.read_spec import load_spec, validate_spec
 from .onset_utils import (
-    read_mok_dates, read_thresholds,
+    read_ref_onset_dates, read_thresholds,
     read_onset_params,
     roll_sum_na_rm_left, roll_sum_na_propagate_left,
     find_onset_precomp,
@@ -306,30 +306,125 @@ def attach_thresholds_id(df, thr_df):
 # Cell filtering by dissemination cells list
 # ---------------------------------------------------------------------------
 
+def _resolve_unit_latlon(df, filt):
+    """
+    Return (lat, lon) arrays aligned to df rows for the domain bbox filter, or
+    (None, None) if they cannot be determined. Sources, in order:
+      1. explicit 'lat'/'lon' columns on df (gridded/legacy data),
+      2. an id of the form '<lat>_<lon>' (grid-cell units),
+      3. filter.centroids_file: CSV with adm3_name + lat/lon (or center_lat/
+         center_lon) giving a representative point per unit (admin units).
+    """
+    if "lat" in df.columns and "lon" in df.columns:
+        return df["lat"].astype(float).values, df["lon"].astype(float).values
+
+    ids = df["id"].astype(str)
+    parsed = ids.str.extract(r"^(-?\d+(?:\.\d+)?)_(-?\d+(?:\.\d+)?)$")
+    if len(df) and parsed.notna().all(axis=None):
+        return parsed[0].astype(float).values, parsed[1].astype(float).values
+
+    cf = (filt or {}).get("centroids_file")
+    if cf:
+        if not os.path.exists(cf):
+            raise FileNotFoundError(f"filter.centroids_file not found: {cf}")
+        c = pd.read_csv(cf)
+        keyc = "adm3_name" if "adm3_name" in c.columns else c.columns[0]
+        latc = next((x for x in ("lat", "center_lat", "latitude") if x in c.columns), None)
+        lonc = next((x for x in ("lon", "center_lon", "longitude") if x in c.columns), None)
+        if not latc or not lonc:
+            raise ValueError("filter.centroids_file must have lat/lon (or center_lat/center_lon).")
+        c = c.rename(columns={keyc: "id", latc: "_lat", lonc: "_lon"})
+        c["id"] = c["id"].astype(str).str.strip()
+        m = df[["id"]].merge(c[["id", "_lat", "_lon"]].drop_duplicates("id"), on="id", how="left")
+        return m["_lat"].astype(float).values, m["_lon"].astype(float).values
+
+    return None, None
+
+
+def attach_ref_onset(df, ref):
+    """
+    Attach a `ref_onset_date` column to df from the value returned by
+    read_ref_onset_dates: None (NaT), a constant-month-day dict (a fixed date
+    each year), or a DataFrame keyed by 'year' and/or 'id' (per-year and/or
+    per-unit dates). Merges on whichever keys are present in both.
+    """
+    df = df.copy()
+    if ref is None:
+        df["ref_onset_date"] = pd.NaT
+        return df
+    if isinstance(ref, dict) and ref.get("mode") == "constant_month_day":
+        md = ref["month_day"]
+        if "year" in df.columns:
+            df["ref_onset_date"] = pd.to_datetime(
+                df["year"].astype(int).astype(str) + "-" + md, errors="coerce"
+            ).dt.date
+        else:
+            df["ref_onset_date"] = pd.NaT
+        return df
+    # DataFrame keyed by year and/or id
+    if "id" in ref.columns:
+        df = ensure_id_col(df)
+    keys = [k for k in ("id", "year") if k in ref.columns and k in df.columns]
+    if not keys:
+        df["ref_onset_date"] = pd.NaT
+        return df
+    return df.merge(ref, on=keys, how="left")
+
+
 def filter_by_dissemination_cells(df, spec):
     """
-    If spec['filter']['dissemination_cells_file'] is set, keep only rows whose
-    id appears in that CSV's adm3_name column.
-    Returns the (possibly filtered) DataFrame unchanged if no file is given.
+    Restrict the domain to the modelling units of interest. Two independent,
+    composable restrictions read from spec['filter']:
+
+      - dissemination_cells_file : keep only ids listed in that CSV's adm3_name
+        column (the base domain when set).
+      - bbox : an optional FURTHER restriction {lat_min, lat_max, lon_min,
+        lon_max} (any subset of keys), applied on top of the dissemination set.
+        Defaults to no bbox restriction (i.e. all dissemination cells).
+
+    Returns df unchanged if neither is configured.
     """
     filt = spec.get("filter") or {}
-    dc_file = filt.get("dissemination_cells_file")
-    if not dc_file:
-        return df
-    if not os.path.exists(dc_file):
-        raise FileNotFoundError(f"dissemination_cells_file not found: {dc_file}")
-    dc = pd.read_csv(dc_file)
-    if "adm3_name" not in dc.columns:
-        raise ValueError(
-            f"dissemination_cells_file must contain an 'adm3_name' column. "
-            f"Found: {dc.columns.tolist()}"
-        )
-    valid_ids = set(dc["adm3_name"].astype(str).str.strip())
     df = ensure_id_col(df)
-    before = len(df)
-    df = df[df["id"].isin(valid_ids)]
-    print(f"  dissemination_cells filter: {before} → {len(df)} rows "
-          f"({before - len(df)} removed)")
+
+    dc_file = filt.get("dissemination_cells_file")
+    if dc_file:
+        if not os.path.exists(dc_file):
+            raise FileNotFoundError(f"dissemination_cells_file not found: {dc_file}")
+        dc = pd.read_csv(dc_file)
+        if "adm3_name" not in dc.columns:
+            raise ValueError(
+                f"dissemination_cells_file must contain an 'adm3_name' column. "
+                f"Found: {dc.columns.tolist()}"
+            )
+        valid_ids = set(dc["adm3_name"].astype(str).str.strip())
+        before = len(df)
+        df = df[df["id"].isin(valid_ids)]
+        print(f"  dissemination_cells filter: {before} -> {len(df)} rows "
+              f"({before - len(df)} removed)")
+
+    bbox = filt.get("bbox")
+    if bbox:
+        lat, lon = _resolve_unit_latlon(df, filt)
+        if lat is None:
+            raise ValueError(
+                "filter.bbox requested but unit lat/lon could not be determined: "
+                "df has no 'lat'/'lon' columns, ids are not '<lat>_<lon>', and no "
+                "filter.centroids_file was provided."
+            )
+        mask = np.ones(len(df), dtype=bool)
+        if bbox.get("lat_min") is not None:
+            mask &= lat >= float(bbox["lat_min"])
+        if bbox.get("lat_max") is not None:
+            mask &= lat <= float(bbox["lat_max"])
+        if bbox.get("lon_min") is not None:
+            mask &= lon >= float(bbox["lon_min"])
+        if bbox.get("lon_max") is not None:
+            mask &= lon <= float(bbox["lon_max"])
+        before = len(df)
+        df = df[mask]
+        print(f"  bbox filter {bbox}: {before} -> {len(df)} rows ({before - len(df)} removed)")
+
     return df
 
 
@@ -601,29 +696,37 @@ def order_day_cols(df, key_cols):
     return [valid_cols[i] for i in order], [day_ints[i] for i in order]
 
 
-def calc_onsets_rowwise(df, day_cols, day_ints, win, params=None):
+def calc_onsets_rowwise(df, day_cols, day_ints, win, params=None,
+                        fixed_cutoff_month_day="06-02"):
     """
     Compute per-row onset indices under three restriction rules:
-      raw, clim_mok_date (after June 2), mok (after MOK date).
+      raw, fixed_cutoff (after a fixed climatological cutoff date), ref_onset
+      (after the per-year reference onset date).
+
+    fixed_cutoff_month_day : str "MM-DD"
+        Fixed climatological cutoff (default "06-02"); the fixed_cutoff variant
+        only considers onsets on/after this month-day each year. Configurable
+        via options.fixed_cutoff_month_day in the spec so a new geography can set
+        its own climatological season cutoff.
     """
     X = df[day_cols].values.astype(float)
     t0 = pd.to_datetime(df["time"]).values
     th = df["onset_thresh"].values.astype(float)
     yr = df["year"].values.astype(int)
 
-    june2 = np.array([np.datetime64(f"{y}-06-02") for y in yr])
-    need_clim_offset = (june2 - t0).astype("timedelta64[D]").astype(int)
+    cutoff_dates = np.array([np.datetime64(f"{y}-{fixed_cutoff_month_day}") for y in yr])
+    need_clim_offset = (cutoff_dates - t0).astype("timedelta64[D]").astype(int)
     day_ints_arr = np.array(day_ints)
     need_clim = np.searchsorted(day_ints_arr, need_clim_offset - 1, side='right') + 1
     need_clim = np.where(need_clim > len(day_ints_arr), 9999, need_clim).astype(int)
 
-    mok_dates = pd.to_datetime(df["mok_date"]).values if "mok_date" in df.columns else np.array([pd.NaT] * len(df))
-    start_mok = np.ones(len(df), dtype=int)
+    ref_onset_dates = pd.to_datetime(df["ref_onset_date"]).values if "ref_onset_date" in df.columns else np.array([pd.NaT] * len(df))
+    start_ref = np.ones(len(df), dtype=int)
 
     n = len(df)
     onset_raw = []
-    onset_clim_mok_date = []
-    onset_mok = []
+    onset_fixed_cutoff = []
+    onset_ref = []
 
     for i in range(n):
         s = X[i]
@@ -639,23 +742,23 @@ def calc_onsets_rowwise(df, day_cols, day_ints, win, params=None):
             last10start = 0
 
         onset_raw.append(find_onset_precomp(s, win, th[i], wsum_all, pre_bad, last10start, start_day=0, params=params))
-        onset_clim_mok_date.append(find_onset_precomp(s, win, th[i], wsum_all, pre_bad, last10start,
+        onset_fixed_cutoff.append(find_onset_precomp(s, win, th[i], wsum_all, pre_bad, last10start,
                                                        start_day=int(need_clim[i]), params=params))
 
-        mk = mok_dates[i]
+        mk = ref_onset_dates[i]
         if pd.isnull(mk):
-            sd_mok = 1
+            sd_ref = 1
         else:
             offset = int((mk - t0[i]).astype("timedelta64[D]").astype(int))
-            sd_mok = int(np.searchsorted(day_ints_arr, offset - 1, side='right')) + 1
-            if sd_mok > len(day_ints_arr):
-                sd_mok = 9999
-        onset_mok.append(find_onset_precomp(s, win, th[i], wsum_all, pre_bad, last10start, start_day=sd_mok, params=params))
+            sd_ref = int(np.searchsorted(day_ints_arr, offset - 1, side='right')) + 1
+            if sd_ref > len(day_ints_arr):
+                sd_ref = 9999
+        onset_ref.append(find_onset_precomp(s, win, th[i], wsum_all, pre_bad, last10start, start_day=sd_ref, params=params))
 
-    return {"onset_raw": onset_raw, "onset_clim_mok_date": onset_clim_mok_date, "onset_mok": onset_mok}
+    return {"onset_raw": onset_raw, "onset_fixed_cutoff": onset_fixed_cutoff, "onset_ref": onset_ref}
 
 
-def process_rainfall_forecast_id(df, spec, mok_dt=None, thr_dt=None):
+def process_rainfall_forecast_id(df, spec, ref_onset_dt=None, thr_dt=None):
     """
     Forecast pipeline: compute ensemble onset probabilities per (id, time, year).
 
@@ -675,10 +778,7 @@ def process_rainfall_forecast_id(df, spec, mok_dt=None, thr_dt=None):
     max_number = filter_cfg.get("max_number")
 
     df = attach_thresholds_id(df, thr_dt)
-    if mok_dt is not None and "year" in df.columns:
-        df = df.merge(mok_dt, on="year", how="left")
-    else:
-        df["mok_date"] = pd.NaT
+    df = attach_ref_onset(df, ref_onset_dt)
 
     if has_number and max_number is not None:
         df = df[df["number"] <= int(max_number)]
@@ -698,7 +798,7 @@ def process_rainfall_forecast_id(df, spec, mok_dt=None, thr_dt=None):
     key_base = ["id", "time"]
     if "year" in df.columns:
         key_base.append("year")
-    key_base += ["onset_thresh", "mok_date"]
+    key_base += ["onset_thresh", "ref_onset_date"]
     key_member = key_base + (["number"] if has_number else [])
 
     # Drop non-key, non-day columns to avoid merge collisions
@@ -719,10 +819,12 @@ def process_rainfall_forecast_id(df, spec, mok_dt=None, thr_dt=None):
     if not keep_days:
         raise ValueError("After min_day/max_day filtering, no day columns remain.")
 
-    on = calc_onsets_rowwise(df, keep_days, keep_ints, win, params=onset_params)
+    fixed_cutoff_md = spec.get("options", {}).get("fixed_cutoff_month_day", "06-02")
+    on = calc_onsets_rowwise(df, keep_days, keep_ints, win, params=onset_params,
+                             fixed_cutoff_month_day=fixed_cutoff_md)
     df["onset_raw"] = on["onset_raw"]
-    df["onset_clim_mok_date"] = on["onset_clim_mok_date"]
-    df["onset_mok"] = on["onset_mok"]
+    df["onset_fixed_cutoff"] = on["onset_fixed_cutoff"]
+    df["onset_ref"] = on["onset_ref"]
 
     D = len(keep_ints)
 
@@ -747,10 +849,10 @@ def process_rainfall_forecast_id(df, spec, mok_dt=None, thr_dt=None):
         lambda g: pd.Series({
             **{f"predicted_prob_day_{keep_ints[j]}": p
                for j, p in enumerate(prob_from_idx(list(g["onset_raw"])))},
-            **{f"predicted_prob_clim_mok_date_day_{keep_ints[j]}": p
-               for j, p in enumerate(prob_from_idx(list(g["onset_clim_mok_date"])))},
-            **{f"predicted_prob_mok_day_{keep_ints[j]}": p
-               for j, p in enumerate(prob_from_idx(list(g["onset_mok"])))},
+            **{f"predicted_prob_fixed_cutoff_day_{keep_ints[j]}": p
+               for j, p in enumerate(prob_from_idx(list(g["onset_fixed_cutoff"])))},
+            **{f"predicted_prob_ref_day_{keep_ints[j]}": p
+               for j, p in enumerate(prob_from_idx(list(g["onset_ref"])))},
         })
     ).reset_index()
 
@@ -758,7 +860,7 @@ def process_rainfall_forecast_id(df, spec, mok_dt=None, thr_dt=None):
     return {"wide": wide}
 
 
-def process_ground_truth_rainfall_id(df, spec, mok_dt=None, thr_dt=None, value_col=None):
+def process_ground_truth_rainfall_id(df, spec, ref_onset_dt=None, thr_dt=None, value_col=None):
     """
     Ground-truth pipeline: compute onset dates per (id, year).
 
@@ -771,17 +873,14 @@ def process_ground_truth_rainfall_id(df, spec, mok_dt=None, thr_dt=None, value_c
     df[value_col] = df[value_col].astype(float)
 
     df = attach_thresholds_id(df, thr_dt)
-    if mok_dt is not None:
-        df = df.merge(mok_dt, on="year", how="left")
-    else:
-        df["mok_date"] = pd.NaT
+    df = attach_ref_onset(df, ref_onset_dt)
 
     cutoff_md = spec["options"]["cutoff_month_day"]
     df["cutoff_date"] = df["year"].apply(lambda y: pd.Timestamp(f"{y}-{cutoff_md}").date())
     df["start_date"] = df["cutoff_date"]
-    mask = ~df["mok_date"].isna()
+    mask = ~df["ref_onset_date"].isna()
     df.loc[mask, "start_date"] = df.loc[mask].apply(
-        lambda r: max(r["cutoff_date"], r["mok_date"]), axis=1
+        lambda r: max(r["cutoff_date"], r["ref_onset_date"]), axis=1
     )
 
     df = df.sort_values(["id", "year", "time"])
@@ -802,8 +901,8 @@ def process_ground_truth_rainfall_id(df, spec, mok_dt=None, thr_dt=None, value_c
         start_pos = int(start_pos_arr[0]) + 1 if len(start_pos_arr) > 0 else 9999
 
         if np.all(np.isnan(series)) or len(series) < win or np.isnan(th):
-            mr_idx = None
-            mr_date = None
+            onset_idx = None
+            onset_date = None
         else:
             wsum_all = roll_sum_na_rm_left(series, win)
             if len(series) >= 10:
@@ -815,29 +914,29 @@ def process_ground_truth_rainfall_id(df, spec, mok_dt=None, thr_dt=None, value_c
                 pre_bad = np.array([0])
                 last10start = 0
 
-            #mr_idx = find_onset_precomp(series, win, th, wsum_all, pre_bad, last10start,
+            #onset_idx = find_onset_precomp(series, win, th, wsum_all, pre_bad, last10start,
             #                            start_day=start_pos, reject_if_short_followup=True)
-            mr_idx = find_onset_precomp(series, win, th, wsum_all, pre_bad, last10start,
+            onset_idx = find_onset_precomp(series, win, th, wsum_all, pre_bad, last10start,
                             start_day=start_pos, reject_if_short_followup=True,
                             params=onset_params)
-            mr_date = dates[mr_idx - 1] if mr_idx is not None else None
+            onset_date = dates[onset_idx - 1] if onset_idx is not None else None
 
         cutoff_date = g["cutoff_date"].iloc[0]
-        if mr_date is not None:
-            mr_onset_day = (pd.Timestamp(mr_date) - pd.Timestamp(cutoff_date)).days
+        if onset_date is not None:
+            onset_day = (pd.Timestamp(onset_date) - pd.Timestamp(cutoff_date)).days
         else:
-            mr_onset_day = np.nan
+            onset_day = np.nan
 
         wide_rows.append({
             "id": cell_id,
             "year": yr,
-            "mr_onset_idx": mr_idx if mr_idx is not None else np.nan,
-            "mr_onset_date": mr_date,
-            "mr_onset_day": mr_onset_day,
+            "onset_idx": onset_idx if onset_idx is not None else np.nan,
+            "onset_date": onset_date,
+            "onset_day": onset_day,
             "cutoff_date": cutoff_date,
         })
 
-        mok_date = g["mok_date"].iloc[0]
+        ref_onset_date = g["ref_onset_date"].iloc[0]
         for _, row in g.iterrows():
             long_rows.append({
                 "id": cell_id,
@@ -845,9 +944,9 @@ def process_ground_truth_rainfall_id(df, spec, mok_dt=None, thr_dt=None, value_c
                 "year": yr,
                 value_col: row[value_col],
                 "onset_thresh": th,
-                "mok_date": mok_date,
-                "mr_onset_date": mr_date,
-                "mr_onset_flag": row["time"] == mr_date,
+                "ref_onset_date": ref_onset_date,
+                "onset_date": onset_date,
+                "onset_flag": row["time"] == onset_date,
             })
 
     wide = pd.DataFrame(wide_rows)
@@ -878,7 +977,7 @@ def run_single_pipeline(spec_id):
 
     var_name = get_value_var(spec)
     dim_rename_map = spec.get("dimensions", {}).get("rename") or {}
-    mok_dt = read_mok_dates(spec)
+    ref_onset_dt = read_ref_onset_dates(spec)
     thr_dt = read_thresholds(spec)
     weights_df = read_cell_transform(spec)
 
@@ -905,7 +1004,7 @@ def run_single_pipeline(spec_id):
             dt = filter_by_dissemination_cells(dt, spec)
             if weights_df is not None: # in spec yml if cell_transform_enabled: false, it does nothing
                 dt = transform_forecast_wide(dt, weights_df)
-            result = process_rainfall_forecast_id(dt, spec, mok_dt=mok_dt, thr_dt=thr_dt)
+            result = process_rainfall_forecast_id(dt, spec, ref_onset_dt=ref_onset_dt, thr_dt=thr_dt)
             wide_all.append(result["wide"])
 
         elif spec["type"] == "ground_truth_rainfall":
@@ -918,7 +1017,7 @@ def run_single_pipeline(spec_id):
             dt = filter_by_dissemination_cells(dt, spec)
             if weights_df is not None: # in spec yml if cell_transform_enabled: false, it does nothing
                 dt = transform_groundtruth_long(dt, weights_df, var_name.lower())
-            result = process_ground_truth_rainfall_id(dt, spec, mok_dt=mok_dt, thr_dt=thr_dt,
+            result = process_ground_truth_rainfall_id(dt, spec, ref_onset_dt=ref_onset_dt, thr_dt=thr_dt,
                                                        value_col=var_name.lower())
             wide_all.append(result["wide"])
             long_all.append(result["long"])

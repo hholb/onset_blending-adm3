@@ -1,0 +1,49 @@
+# ==============================================================================
+# Regrid spec (OPTIONAL pre-step) — 0_regrid_to_shapefile.py
+# ==============================================================================
+# Regrids gridded rainfall onto the admin units of a shapefile, using weights
+# derived from ground-truth coverage and shared between ground truth and
+# forecasts. Produces <name>_adm3.nc next to each input; point the step-1 specs
+# at those (file_regex '..._adm3\.nc$').
+# ==============================================================================
+
+# Target units:
+#   - with `geometry.shapefile` -> regrid onto the shapefile's admin (political) units
+#   - WITHOUT a geometry block   -> regrid onto the GROUND-TRUTH grid cells
+#                                   (id = "<lat>_<lon>"), i.e. match forecasts to the
+#                                   ground-truth grid. The spec decides which.
+geometry:
+  shapefile: Monsoon_Data/reference/shapefiles/STATE_BOUNDARY.shp
+  region_key_col: STATE          # shapefile's admin key; renamed to canonical adm3_name on read
+  crs: EPSG:4326                 # grid CRS; the shapefile is reprojected to this
+  grid_lat_var: latitude         # optional (auto-detected: latitude/lat)
+  grid_lon_var: longitude
+
+# Restrict/renormalize each unit to the cells that actually have ground-truth
+# data, and apply that same footprint to the forecasts (default true). Set false
+# for a plain per-dataset regrid (old woreda behavior).
+clip_to_coverage: true
+
+# Optional: supply your own weight table(s) instead of computing them. A
+# top-level `weights_in` applies to everything; a per-target `weights_in` (under
+# ground_truth or a forecasts[] entry) overrides it. When all weights are
+# supplied, no shapefile overlay / coverage scan / report runs. The CSV must have
+# columns: latitude, longitude, adm3_name, weight.
+# weights_in: Monsoon_Data/reference/my_weights.csv
+
+ground_truth:
+  nc_folder: Monsoon_Data/nc_data/IMD_2by2
+  file_regex: '^data_[0-9]{4}\.nc$'
+  value_col: RAINFALL            # cells with no data here (e.g. ocean) are excluded
+
+forecasts:
+  - nc_folder: Monsoon_Data/nc_data/aifs
+    file_regex: '^[0-9]{4}\.nc$'
+    value_col: tp                # regridded with the SAME (ground-truth-derived) weights
+
+weights_out: Monsoon_Data/reference/shared_regrid_weights_india_example.csv
+
+# Per-unit centroids are written here (adm3_name, lat, lon) whenever a shapefile
+# is used. Point a raw-data spec's filter.centroids_file at this to enable the
+# min/max lat/lon (bbox) domain filter on admin units.
+# centroids_out: Monsoon_Data/reference/unit_centroids_india_example.csv

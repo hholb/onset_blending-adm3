@@ -1,0 +1,73 @@
+# ==============================================================================
+# .gitignore — keep data, artifacts, and local cruft out of the repo
+# ==============================================================================
+# NOTE: .gitignore only affects UNtracked files. Files already committed keep
+# being tracked until removed from the index, e.g.:
+#     git rm -r --cached --quiet Monsoon_Data '**/__pycache__' '*.nc' '*.pkl'
+# (that stages their removal from the repo but leaves them on disk).
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.ipynb_checkpoints/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ---- Virtual environments ----
+.venv/
+venv/
+env/
+ENV/
+
+# ---- OS / editor ----
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ---- Data & pipeline artifacts (large / regenerable — not for GitHub) ----
+# Raw and regridded NetCDF rainfall
+*.nc
+*.nc4
+*.netcdf
+# Pickled intermediate tables, models, coefficients, predictions
+*.pkl
+# The data working tree (raw inputs, processed data, climatology, results)
+Monsoon_Data/nc_data/
+Monsoon_Data/raw_nc/
+Monsoon_Data/Processed_Data/
+Monsoon_Data/Climatology/
+Monsoon_Data/results/
+Monsoon_Data/evaluation_2025/
+Monsoon_Data/maps/
+
+# ---- Shapefiles / geospatial vector data (all sidecar components) ----
+*.shp
+*.shx
+*.dbf
+*.prj
+*.cpg
+*.sbn
+*.sbx
+*.shp.xml
+*.qpj
+*.qix
+*.gpkg
+*.geojson
+
+# ---- Generated outputs / figures ----
+predict/output/
+figures/
+test_onset_results.png
+
+# ---- Operational pipeline temp specs (auto-written with an _op suffix) ----
+specs/**/*_op.yml

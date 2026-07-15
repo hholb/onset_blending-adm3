@@ -20,7 +20,24 @@ from scipy.stats import ks_2samp
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score
 
-from ..pipelines._shared.misc import coalesce
+from ..pipelines._shared.misc import coalesce, week_labels, interval_bins
+
+
+def _present_weeks(df, base):
+    """Sorted week numbers present as `<base>_week<n>` columns in df."""
+    pat = re.compile(rf"^{re.escape(base)}_week(\d+)$")
+    return sorted(int(m.group(1)) for c in df.columns for m in [pat.match(c)] if m)
+
+
+def _cv_weeks(df):
+    """Sorted week numbers present as `cv_week<n>` columns in df."""
+    return sorted(int(m.group(1)) for c in df.columns
+                  for m in [re.match(r"^cv_week(\d+)$", c)] if m)
+
+
+def _spec_n_bins(spec):
+    """Number of forecast bins from the spec (default 4)."""
+    return int(coalesce((spec or {}).get("n_bins"), 4))
 
 # ---------------------------------------------------------------------------
 # Column name helpers
@@ -30,23 +47,18 @@ def get_forecast_variant_suffix(spec, variant):
     """Map variant name to column suffix string."""
     m = (spec.get("extras") or {}).get("forecast_variants") or {
         "base": "",
-        "mok": "_mok",
-        "clim_mok_date": "_clim_mok_date",
+        "ref_onset": "_ref",
+        "fixed_cutoff": "_fixed_cutoff",
     }
     if variant not in m:
         raise ValueError(f"Unknown forecast variant: {variant}")
     return m[variant]
 
 
-def forecast_prob_cols(forecast_name, variant_suffix):
-    """Build dict of week1..week4 probability column names."""
+def forecast_prob_cols(forecast_name, variant_suffix, n_bins=4):
+    """Build dict of week1..weekN probability column names."""
     base = f"{forecast_name}_p_onset{variant_suffix}"
-    return {
-        "week1": f"{base}_week1",
-        "week2": f"{base}_week2",
-        "week3": f"{base}_week3",
-        "week4": f"{base}_week4",
-    }
+    return {f"week{w}": f"{base}_week{w}" for w in range(1, int(n_bins) + 1)}
 
 
 def forecast_label(forecast_name, variant):
@@ -63,20 +75,21 @@ def make_year_tag(years):
 
 
 def make_cutoff_tag(cutoff_mode):
-    if cutoff_mode == "clim_mok_date":
-        return "_clim_mok_date"
-    if cutoff_mode == "no_mok_filter":
-        return "_no_mok_filter"
+    if cutoff_mode == "fixed_cutoff":
+        return "_fixed_cutoff"
+    if cutoff_mode == "no_ref_filter":
+        return "_no_ref_filter"
     return ""
 
 
 def input_rds_from_cutoff(cutoff_mode, resolution=""):
+    # Derive the CV-input filename from the single-source-of-truth cutoff tag
+    # (make_cutoff_tag) instead of hardcoding the variant token. The variant
+    # segment is generic (e.g. "fixed_cutoff"), so this tracks any rename.
     prefix = f"{resolution}_" if resolution else ""
-    if cutoff_mode == "clim_mok_date":
-        return f"cv_data_{prefix}clim_mok_date_new_pipeline.pkl"
-    if cutoff_mode == "no_mok_filter":
-        return f"cv_data_{prefix}no_mok_filter_new_pipeline.pkl"
-    return f"cv_data_{prefix}new_pipeline.pkl"
+    variant = make_cutoff_tag(cutoff_mode).lstrip("_")
+    variant_part = f"{variant}_" if variant else ""
+    return f"cv_data_{prefix}{variant_part}new_pipeline.pkl"
 
 
 # ---------------------------------------------------------------------------
@@ -109,10 +122,10 @@ def input_rds_from_cutoff(cutoff_mode, resolution=""):
 
 
 # AFTER
-def expand_formula_str(formula_str):
+def expand_formula_str(formula_str, n_bins=4):
     """
     Expand formula shortcuts in a formula string.
-    1. Terms containing '_qx' expand to '_week1'..'_week4'.
+    1. Terms containing '_qx' expand to '_week1'..'_weekN' (N = n_bins).
     2. '*' terms are expanded R/Wilkinson-style: a*b*c -> a + b + c + a:b + a:c + b:c + a:b:c
     Returns the expanded formula string.
     """
@@ -124,12 +137,12 @@ def expand_formula_str(formula_str):
     else:
         lhs, rhs = "", formula_str.strip()
 
-    # Step 1: split on '+' to get top-level terms, then expand _qx -> _week1.._week4
+    # Step 1: split on '+' to get top-level terms, then expand _qx -> _week1.._weekN
     raw_terms = [t.strip() for t in rhs.split("+")]
     qx_expanded = []
     for term in raw_terms:
         if "_qx" in term:
-            for i in range(1, 5):
+            for i in range(1, int(n_bins) + 1):
                 qx_expanded.append(term.replace("_qx", f"_week{i}"))
         else:
             qx_expanded.append(term)
@@ -162,13 +175,14 @@ def build_formulas_from_spec(spec, cutoff_mode):
     if not formula_cfg:
         raise ValueError("Spec must define models.formulas with named entries containing 'text'.")
 
+    n_bins = _spec_n_bins(spec)
     base_texts = {}
     for nm, v in formula_cfg.items():
         if v.get("enabled", True):
             txt = v.get("text")
             if not txt:
                 raise ValueError(f"Formula '{nm}' is enabled but has no non-empty 'text' in spec.")
-            base_texts[nm] = expand_formula_str(txt)
+            base_texts[nm] = expand_formula_str(txt, n_bins=n_bins)
 
     formulas = dict(base_texts)
 
@@ -200,7 +214,7 @@ def build_formulas_from_spec(spec, cutoff_mode):
                 window = make_window_suffix(sy, end_year)
                 to_replaced = to_pat.replace("{window}", window)
                 windowed = base_txt.replace(from_pat, to_replaced)
-                formulas[f"{base_name}{window}"] = expand_formula_str(windowed)
+                formulas[f"{base_name}{window}"] = expand_formula_str(windowed, n_bins=n_bins)
 
     return formulas
 
@@ -267,7 +281,7 @@ def print_formula_summary(spec, cutoff_mode):
         #    groups.setdefault(root, []).append(col)
         #for root, cols in groups.items():
         #    weeks = ", ".join(c.split("_week")[-1] for c in cols)
-        #    scale = "(logit)" if "clim_mr" in root else "(mm)"
+        #    scale = "(logit)" if "clim" in root else "(mm)"
         #    print(f"    {root}_week[{weeks}]  {scale}")
 
 # AFTER
@@ -275,7 +289,7 @@ def print_formula_summary(spec, cutoff_mode):
         all_terms = [t.strip() for t in rhs_exp.split("+")]
         print(f"  Predictor terms used ({len(all_terms)}):")
         for term in all_terms:
-            scale = "(logit)" if "clim_mr" in term else ("(interaction)" if ":" in term else "(mm)")
+            scale = "(logit)" if "clim" in term else ("(interaction)" if ":" in term else "(mm)")
             print(f"    {term}  {scale}")
 
     print()
@@ -289,23 +303,21 @@ def print_formula_summary(spec, cutoff_mode):
 # ---------------------------------------------------------------------------
 
 def make_raw_preds_from_wide(wide_df, forecast_name, variant, holdout_years, spec):
-    """Extract raw model predictions for holdout years."""
+    """Extract raw model predictions for holdout years (any number of week bins)."""
     suf = get_forecast_variant_suffix(spec, variant)
-    cols = forecast_prob_cols(forecast_name, suf)
-    missing = [c for c in cols.values() if c not in wide_df.columns]
-    if missing:
-        warnings.warn(f"Skipping raw for {forecast_name} ({variant}); missing: {', '.join(missing)}")
+    base = f"{forecast_name}_p_onset{suf}"
+    weeks = _present_weeks(wide_df, base)
+    if not weeks:
+        warnings.warn(f"Skipping raw for {forecast_name} ({variant}); no {base}_week* columns found")
         return None
 
     sub = wide_df[wide_df["year"].isin(holdout_years)].copy()
-    sub["cv_week1"] = sub[cols["week1"]]
-    sub["cv_week2"] = sub[cols["week2"]]
-    sub["cv_week3"] = sub[cols["week3"]]
-    sub["cv_week4"] = sub[cols["week4"]]
-    w_sum = sub[["cv_week1", "cv_week2", "cv_week3", "cv_week4"]].sum(axis=1)
-    sub["cv_later"] = np.clip(1.0 - w_sum, 0.0, 1.0)
-    return sub[["outcome", "time", "id", "year",
-                "cv_week1", "cv_week2", "cv_week3", "cv_week4", "cv_later"]]
+    cv_cols = []
+    for w in weeks:
+        sub[f"cv_week{w}"] = sub[f"{base}_week{w}"]
+        cv_cols.append(f"cv_week{w}")
+    sub["cv_later"] = np.clip(1.0 - sub[cv_cols].sum(axis=1), 0.0, 1.0)
+    return sub[["outcome", "time", "id", "year"] + cv_cols + ["cv_later"]]
 
 
 def make_raw_preds_from_wide_logit_window(wide_df, base_col_prefix, holdout_years,
@@ -316,59 +328,53 @@ def make_raw_preds_from_wide_logit_window(wide_df, base_col_prefix, holdout_year
     else:
         window = ""
     prefix = f"{base_col_prefix}{window}"
-    wk_cols = [f"{prefix}_week{i}" for i in range(1, 5)]
-    missing = [c for c in wk_cols if c not in wide_df.columns]
-    if missing:
-        warnings.warn(f"Skipping clim logit raw for prefix={prefix}; missing: {', '.join(missing)}")
+    weeks = _present_weeks(wide_df, prefix)
+    if not weeks:
+        warnings.warn(f"Skipping clim logit raw for prefix={prefix}; no _week* columns found")
         return None
 
     sub = wide_df[wide_df["year"].isin(holdout_years)].copy()
-    sub["p1"] = expit(sub[wk_cols[0]])
-    sub["p2"] = expit(sub[wk_cols[1]])
-    sub["p3"] = expit(sub[wk_cols[2]])
-    sub["p4"] = expit(sub[wk_cols[3]])
-    sub["cv_later"] = np.clip(1.0 - (sub["p1"] + sub["p2"] + sub["p3"] + sub["p4"]), 0.0, 1.0)
-    sub = sub.rename(columns={"p1": "cv_week1", "p2": "cv_week2", "p3": "cv_week3", "p4": "cv_week4"})
-    return sub[["outcome", "time", "id", "year",
-                "cv_week1", "cv_week2", "cv_week3", "cv_week4", "cv_later"]]
+    cv_cols = []
+    for w in weeks:
+        sub[f"cv_week{w}"] = expit(sub[f"{prefix}_week{w}"])
+        cv_cols.append(f"cv_week{w}")
+    sub["cv_later"] = np.clip(1.0 - sub[cv_cols].sum(axis=1), 0.0, 1.0)
+    return sub[["outcome", "time", "id", "year"] + cv_cols + ["cv_later"]]
 
 
 def make_raw_preds_from_wide_logit(wide_df, base_col_prefix, holdout_years,
                                     earlier_col=None, earlier_is_logit=True,
                                     add_cv_earlier=True, renormalize_6=True):
-    """Extract raw clim-logit predictions with optional 'earlier' bin."""
-    wk_cols = [f"{base_col_prefix}_week{i}" for i in range(1, 5)]
-    missing = [c for c in wk_cols if c not in wide_df.columns]
-    if missing:
-        warnings.warn(f"Skipping raw-logit for {base_col_prefix}; missing: {', '.join(missing)}")
+    """Extract raw clim-logit predictions with optional 'earlier' bin (any n bins)."""
+    weeks = _present_weeks(wide_df, base_col_prefix)
+    if not weeks:
+        warnings.warn(f"Skipping raw-logit for {base_col_prefix}; no _week* columns found")
         return None
     if add_cv_earlier and (not earlier_col or earlier_col not in wide_df.columns):
         raise ValueError(f"unc_clim_raw requires earlier_col and it must exist in wide_df.")
 
     sub = wide_df[wide_df["year"].isin(holdout_years)].copy()
-    sub["p1"] = expit(sub[wk_cols[0]])
-    sub["p2"] = expit(sub[wk_cols[1]])
-    sub["p3"] = expit(sub[wk_cols[2]])
-    sub["p4"] = expit(sub[wk_cols[3]])
+    week_cols = []
+    for w in weeks:
+        sub[f"cv_week{w}"] = expit(sub[f"{base_col_prefix}_week{w}"])
+        week_cols.append(f"cv_week{w}")
 
     if add_cv_earlier:
         pE = expit(sub[earlier_col]) if earlier_is_logit else sub[earlier_col].astype(float)
-        sub["pE"] = np.clip(pE, 0.0, 1.0)
+        sub["cv_earlier"] = np.clip(pE, 0.0, 1.0)
     else:
-        sub["pE"] = 0.0
+        sub["cv_earlier"] = 0.0
 
-    sub["pL"] = np.clip(1.0 - (sub["pE"] + sub["p1"] + sub["p2"] + sub["p3"] + sub["p4"]), 0.0, 1.0)
+    sub["cv_later"] = np.clip(1.0 - (sub["cv_earlier"] + sub[week_cols].sum(axis=1)), 0.0, 1.0)
 
     if renormalize_6 and add_cv_earlier:
-        rs6 = sub[["pE", "p1", "p2", "p3", "p4", "pL"]].sum(axis=1)
-        good = rs6.notna() & (rs6 > 0)
-        for c in ["pE", "p1", "p2", "p3", "p4", "pL"]:
-            sub.loc[good, c] = sub.loc[good, c] / rs6[good]
+        allc = ["cv_earlier"] + week_cols + ["cv_later"]
+        rs = sub[allc].sum(axis=1)
+        good = rs.notna() & (rs > 0)
+        for c in allc:
+            sub.loc[good, c] = sub.loc[good, c] / rs[good]
 
-    sub = sub.rename(columns={"p1": "cv_week1", "p2": "cv_week2", "p3": "cv_week3",
-                                "p4": "cv_week4", "pL": "cv_later", "pE": "cv_earlier"})
-    cols = ["outcome", "time", "id", "year",
-            "cv_week1", "cv_week2", "cv_week3", "cv_week4", "cv_later"]
+    cols = ["outcome", "time", "id", "year"] + week_cols + ["cv_later"]
     if add_cv_earlier:
         cols.append("cv_earlier")
     return sub[cols]
@@ -466,24 +472,23 @@ def platt_cv_multibin(df, prob_cols, holdout_years, true_holdout_years=(),
 def make_calibrated_preds_from_wide(wide_df, forecast_name, variant,
                                     training_years, holdout_years, true_holdout_years,
                                     allowed_cells, spec):
-    """Platt-calibrated predictions via platt_cv_multibin."""
+    """Platt-calibrated predictions via platt_cv_multibin (any number of week bins)."""
     suf = get_forecast_variant_suffix(spec, variant)
-    cols = forecast_prob_cols(forecast_name, suf)
-    missing = [c for c in cols.values() if c not in wide_df.columns]
-    if missing:
-        warnings.warn(f"Skipping calibrated for {forecast_name} ({variant}); missing: {', '.join(missing)}")
+    base = f"{forecast_name}_p_onset{suf}"
+    weeks = _present_weeks(wide_df, base)
+    if not weeks:
+        warnings.warn(f"Skipping calibrated for {forecast_name} ({variant}); no {base}_week* columns found")
         return None
 
     df = wide_df[wide_df["year"].isin(list(training_years) + list(holdout_years))].copy()
-    df["week1"] = df[cols["week1"]]
-    df["week2"] = df[cols["week2"]]
-    df["week3"] = df[cols["week3"]]
-    df["week4"] = df[cols["week4"]]
-    df["later"] = np.maximum(0.0, 1.0 - (df["week1"] + df["week2"] + df["week3"] + df["week4"]))
+    wk_labels = [f"week{w}" for w in weeks]
+    for w in weeks:
+        df[f"week{w}"] = df[f"{base}_week{w}"]
+    df["later"] = np.maximum(0.0, 1.0 - df[wk_labels].sum(axis=1))
 
     return platt_cv_multibin(
         df,
-        prob_cols=["week1", "week2", "week3", "week4", "later"],
+        prob_cols=wk_labels + ["later"],
         holdout_years=holdout_years,
         true_holdout_years=true_holdout_years,
         outcome_col="outcome",
@@ -860,8 +865,9 @@ def _fast_auc(y01, score):
 
 
 def compute_fair_brier5(cv_preds, allowed_cells, n_train=30):
-    """Compute fair (finite-sample corrected) Brier score for 5-bin predictions."""
-    bins = ["week1", "week2", "week3", "week4", "later"]
+    """Compute fair (finite-sample corrected) Brier score over the interval bins
+    (week1..weekN + later), inferred from the cv_week* columns present."""
+    bins = [f"week{w}" for w in _cv_weeks(cv_preds)] + ["later"]
     cols = [f"cv_{b}" for b in bins]
     sub = restrict_to_allowed(cv_preds, allowed_cells)
     sub = sub.dropna(subset=["outcome"] + cols)
@@ -878,20 +884,22 @@ def compute_cell_metrics_fast(df, allowed_cells=None):
     Compute per-cell and pooled Brier/RPS/AUC/pietra from cv_* probability columns.
 
     Matches R compute_cell_metrics_fast:
-    - Brier uses 5 bins: week1..week4, later (NOT including 'earlier')
-    - RPS uses up to 6 bins: earlier + week1..week4 + later (if earlier present)
+    - Brier uses the interval bins week1..weekN + later (NOT 'earlier'),
+      inferred from the cv_week* columns present
+    - RPS prepends 'earlier' when a cv_earlier column is present
     - Pooled AUC uses the fast Wilcoxon rank-sum method
     - Per-bin Brier and AUC are computed for the 'ALL' row
     - Pietra (KS statistic between pos/neg score distributions) is included
     - n (number of observations) is included
     - Returns per-cell rows PLUS an 'ALL' pooled row
     """
-    # Bins for Brier (5-bin, no earlier)
-    bins5 = ["week1", "week2", "week3", "week4", "later"]
+    # Interval bins (week1..weekN + later), inferred from cv_week* columns
+    _wk = [f"week{w}" for w in _cv_weeks(df)]
+    bins5 = _wk + ["later"]
     cv_cols5 = [f"cv_{b}" for b in bins5]
 
-    # Bins for RPS (6-bin if earlier present, else 5)
-    bins_rps_desired = ["earlier", "week1", "week2", "week3", "week4", "later"]
+    # RPS bins: prepend 'earlier' if that column is present
+    bins_rps_desired = (["earlier"] if "cv_earlier" in df.columns else []) + bins5
     present_rps = [b for b in bins_rps_desired if f"cv_{b}" in df.columns]
     cv_cols_rps = [f"cv_{b}" for b in present_rps]
 
@@ -1118,14 +1126,16 @@ def apply_mme_weights(mme_sources, blend_names, opt_w, id_vars, bins5=None):
     blend_names : list of str
     opt_w : np.ndarray of weights (same order as blend_names)
     id_vars : list of str (columns to keep as metadata)
-    bins5 : list of str, defaults to ["week1","week2","week3","week4","later"]
+    bins5 : list of str, defaults to the interval bins inferred from the first
+        source's cv_week* columns (week1..weekN + later).
 
     Returns
     -------
     DataFrame with id_vars + cv_week1..cv_later
     """
     if bins5 is None:
-        bins5 = ["week1", "week2", "week3", "week4", "later"]
+        first = mme_sources[blend_names[0]]
+        bins5 = [f"week{w}" for w in _cv_weeks(first)] + ["later"]
     cols5 = [f"cv_{b}" for b in bins5]
 
     # Join all sources on id_vars

@@ -14,7 +14,7 @@ per holdout year, so apply_blend_model.py can load it directly via --coef_tag.
 Usage (run from repo root)
 --------------------------
     python 3_fit_final_model.py \\
-        --spec_id  cv_models_clim_mok_date \\
+        --spec_id  cv_models_fixed_cutoff \\
         --model    blended_model \\
         [--method  global] \\
         [--tag     final] \\
@@ -27,7 +27,7 @@ Output
 
 Then to apply to a future year:
     python apply_blend_model.py \\
-        --spec_id    cv_models_clim_mok_date \\
+        --spec_id    cv_models_fixed_cutoff \\
         --model      blended_model \\
         --year       2026 \\
         --coef_tag   final \\
@@ -176,7 +176,7 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--spec_id", required=True,
-                        help="CV spec ID (e.g. cv_models_clim_mok_date)")
+                        help="CV spec ID (e.g. cv_models_fixed_cutoff)")
     parser.add_argument("--model",   required=True,
                         help="Model name in cv_models*.yml (e.g. blended_model)")
     parser.add_argument("--method",  default="global",
