@@ -22,6 +22,11 @@ from itertools import product
 
 from ..pipelines._shared.misc import coalesce
 from ..pipelines._shared.read_spec import load_spec, validate_spec
+from ..rain_horizon_utils import (
+    resolve_rain_day_max,
+    validate_day_coordinate,
+    validate_rain_horizon_frame,
+)
 from .onset_utils import (
     read_ref_onset_dates, read_thresholds,
     read_onset_params,
@@ -42,6 +47,26 @@ def validate_spec_single(spec):
             for nm in ("min_day", "max_day", "window"):
                 if s.get("options", {}).get(nm) is None:
                     raise ValueError(f"Missing options.{nm}")
+            configured_horizon = s.get("options", {}).get("rain_day_max")
+            if configured_horizon is not None:
+                rain_day_max, _ = resolve_rain_day_max(
+                    {
+                        "rain_day_max": configured_horizon,
+                        "rain_horizon_policy": s["options"].get(
+                            "rain_horizon_policy"
+                        ),
+                    },
+                    probability_day_max=1,
+                )
+                if int(s["options"]["min_day"]) != 1:
+                    raise ValueError(
+                        "Strict options.rain_day_max requires options.min_day: 1."
+                    )
+                if int(s["options"]["max_day"]) < rain_day_max:
+                    raise ValueError(
+                        "options.max_day must be at least options.rain_day_max "
+                        f"({rain_day_max}) in strict horizon mode."
+                    )
         if s["type"] == "ground_truth_rainfall":
             if s.get("options", {}).get("window") is None:
                 raise ValueError("Missing options.window")
@@ -227,34 +252,55 @@ def nc_time_to_dates(time_num, time_units):
 
 
 # ---------------------------------------------------------------------------
-# ID helpers  (adm3_name-based, replacing lat/lon)
+# ID helpers  (adm3_name or legacy lat/lon grids)
 # ---------------------------------------------------------------------------
+
+def _format_coord_component(value):
+    """Format a coordinate like R's format(..., scientific=FALSE, trim=TRUE)."""
+    value = float(value)
+    if not np.isfinite(value):
+        return None
+    return np.format_float_positional(value, trim="-")
+
+
+def _latlon_ids(lat, lon):
+    ids = []
+    for la, lo in zip(lat, lon):
+        la_s = _format_coord_component(la)
+        lo_s = _format_coord_component(lo)
+        ids.append(f"{la_s}_{lo_s}" if la_s is not None and lo_s is not None else None)
+    return ids
 
 def ensure_id_col(df, id_col="id"):
     """
     Ensure the DataFrame has an `id` column.
-    For adm3-based data the column is already named `adm3_name`; this renames
-    it to `id` (or leaves it if `id` already exists).
+    For adm3-based data, rename `adm3_name` to `id`. For legacy gridded data,
+    construct the same `<lat>_<lon>` key used by the R pipeline.
     """
     df = df.copy()
     if id_col in df.columns:
         return df
     if "adm3_name" in df.columns:
         df[id_col] = df["adm3_name"].astype(str)
+    elif "lat" in df.columns and "lon" in df.columns:
+        df[id_col] = _latlon_ids(df["lat"].values, df["lon"].values)
     else:
         raise ValueError(
-            "Cannot create id column: neither 'id' nor 'adm3_name' found in DataFrame."
+            "Cannot create id column: need 'id', 'adm3_name', or both 'lat' and 'lon'."
         )
     return df
 
 
 # Keep the old name as an alias so callers that import it directly still work.
 def add_id_from_latlon(df, lat_col="lat", lon_col="lon", id_col="id"):
-    """
-    Backward-compat wrapper.  With adm3 data the lat/lon columns are gone;
-    the id is already the adm3_name.  Delegates to ensure_id_col().
-    """
-    return ensure_id_col(df, id_col=id_col)
+    """Backward-compatible explicit lat/lon-to-id helper."""
+    if id_col in df.columns:
+        return df.copy()
+    if lat_col not in df.columns or lon_col not in df.columns:
+        return ensure_id_col(df, id_col=id_col)
+    out = df.copy()
+    out[id_col] = _latlon_ids(out[lat_col].values, out[lon_col].values)
+    return out
 
 
 def prep_thresholds_id(thr_df):
@@ -262,8 +308,9 @@ def prep_thresholds_id(thr_df):
     Normalize thresholds DataFrame to be keyed by id (adm3_name).
 
     Accepts:
-      - DataFrame with 'id' column  (new adm3 format)
-      - DataFrame with 'adm3_name' column  (also new format)
+      - DataFrame with 'id' column
+      - DataFrame with 'adm3_name' column
+      - DataFrame with legacy 'lat' and 'lon' columns
       - Scalar float / int  (single global threshold)
     """
     if thr_df is None:
@@ -276,9 +323,11 @@ def prep_thresholds_id(thr_df):
     if "id" not in thr_df.columns:
         if "adm3_name" in thr_df.columns:
             thr_df["id"] = thr_df["adm3_name"].astype(str)
+        elif "lat" in thr_df.columns and "lon" in thr_df.columns:
+            thr_df = add_id_from_latlon(thr_df)
         else:
             raise ValueError(
-                "Thresholds table must have either 'id' or 'adm3_name' column."
+                "Thresholds table must have 'id', 'adm3_name', or ('lat', 'lon')."
             )
     thr_df["onset_thresh"] = thr_df["onset_thresh"].astype(float)
     return thr_df[["id", "onset_thresh"]].drop_duplicates().set_index("id")
@@ -542,6 +591,23 @@ def nc_read_forecast_wide(nc_path, var_name, dim_rename_map, spec,
             )
 
         day_vals = dim_vals[dim_names[day_idx]]
+        strict_rain_day_max = spec.get("options", {}).get("rain_day_max")
+        if strict_rain_day_max is not None:
+            _, horizon_policy = resolve_rain_day_max(
+                {
+                    "rain_day_max": strict_rain_day_max,
+                    "rain_horizon_policy": spec["options"].get(
+                        "rain_horizon_policy"
+                    ),
+                },
+                probability_day_max=1,
+            )
+            validate_day_coordinate(
+                day_vals,
+                strict_rain_day_max,
+                context=f"NetCDF file {os.path.basename(nc_path)}",
+                allow_extra=horizon_policy == "truncate",
+            )
         day_vals_num = []
         for dv in day_vals:
             try:
@@ -563,7 +629,8 @@ def nc_read_forecast_wide(nc_path, var_name, dim_rename_map, spec,
         day_vals_num = [dv for dv, k in zip(day_vals_num, keep) if k]
 
         # Read and permute array so day is last
-        arr = np.array(v[:])
+        raw = v[:]
+        arr = np.ma.filled(raw, np.nan) if np.ma.isMaskedArray(raw) else np.asarray(raw)
         other_idx = [i for i in range(len(dim_names)) if i != day_idx]
         perm = other_idx + [day_idx]
         arr = np.transpose(arr, perm)
@@ -612,7 +679,8 @@ def nc_read_forecast_wide(nc_path, var_name, dim_rename_map, spec,
         ds.close()
 
 
-def nc_read_groundtruth_long(nc_path, var_name, dim_rename_map, add_year=True):
+def nc_read_groundtruth_long(nc_path, var_name, dim_rename_map, add_year=True,
+                             missing_rain_policy="keep"):
     """
     Read a ground-truth NetCDF (adm3_name-indexed) into a long (tidy) DataFrame.
 
@@ -646,7 +714,8 @@ def nc_read_groundtruth_long(nc_path, var_name, dim_rename_map, add_year=True):
                 else:
                     dim_vals[d] = np.arange(len(v))
 
-        arr = np.array(v[:])
+        raw = v[:]
+        arr = np.ma.filled(raw, np.nan) if np.ma.isMaskedArray(raw) else np.asarray(raw)
         grid_rows = list(product(*[dim_vals[d] for d in dim_names]))
         grid = pd.DataFrame(grid_rows, columns=dim_names)
         grid = rename_dimensions(grid, dim_rename_map or {})
@@ -661,7 +730,16 @@ def nc_read_groundtruth_long(nc_path, var_name, dim_rename_map, add_year=True):
 
         vcol = var_name.lower()
         grid[vcol] = arr.flatten()
-        #grid = grid.dropna(subset=[vcol])
+        missing_rain_policy = str(missing_rain_policy).lower()
+        if missing_rain_policy == "drop":
+            grid = grid.dropna(subset=[vcol]).reset_index(drop=True)
+        elif missing_rain_policy == "zero":
+            grid[vcol] = grid[vcol].fillna(0.0)
+        elif missing_rain_policy != "keep":
+            raise ValueError(
+                "missing_rain_policy must be 'keep', 'drop', or 'zero', "
+                f"got '{missing_rain_policy}'"
+            )
 
         if add_year and "time" in grid.columns:
             tinfo = get_nc_time(ds)
@@ -786,6 +864,28 @@ def process_rainfall_forecast_id(df, spec, ref_onset_dt=None, thr_dt=None):
             raise ValueError(f"After filtering number <= {max_number}, no rows remain.")
 
     wide_prefix = spec.get("input", {}).get("wide_prefix") or spec["input"]["value_col"].lower()
+    strict_rain_day_max = spec.get("options", {}).get("rain_day_max")
+    if strict_rain_day_max is not None:
+        _, horizon_policy = resolve_rain_day_max(
+            {
+                "rain_day_max": strict_rain_day_max,
+                "rain_horizon_policy": spec["options"].get(
+                    "rain_horizon_policy"
+                ),
+            },
+            probability_day_max=1,
+        )
+        validate_rain_horizon_frame(
+            df,
+            day_prefix=f"{wide_prefix}_day_",
+            rain_day_max=strict_rain_day_max,
+            model_name=spec.get("id", wide_prefix),
+            strict=True,
+            allow_extra=horizon_policy == "truncate",
+            key_columns=("id", "time", "year", "number"),
+            context="raw forecast before ensemble aggregation",
+        )
+
     day_pattern = re.compile(rf"^{re.escape(wide_prefix)}_day_(\d+)$")
     day_cols_pref = [c for c in df.columns if day_pattern.match(c)]
     if not day_cols_pref:
@@ -837,7 +937,10 @@ def process_rainfall_forecast_id(df, spec, ref_onset_dt=None, thr_dt=None):
             counts[int(x) - 1] += 1
         return list(counts / len(idxs))
 
-    stats_agg = df.groupby(key_base).apply(
+    # data.table keeps NA-valued grouping keys. Use dropna=False so pandas does
+    # the same for missing thresholds/reference dates instead of silently
+    # deleting complete forecast groups.
+    stats_agg = df.groupby(key_base, dropna=False).apply(
         lambda g: pd.Series({
             **{f"forecast_rain_day_{day_ints[j]}": g[keep_days[j]].mean() for j in range(len(keep_days))},
             **{f"forecast_rain_sd_day_{day_ints[j]}": g[keep_days[j]].std() for j in range(len(keep_days))},
@@ -845,7 +948,7 @@ def process_rainfall_forecast_id(df, spec, ref_onset_dt=None, thr_dt=None):
         })
     ).reset_index()
 
-    prob_agg = df.groupby(key_base).apply(
+    prob_agg = df.groupby(key_base, dropna=False).apply(
         lambda g: pd.Series({
             **{f"predicted_prob_day_{keep_ints[j]}": p
                for j, p in enumerate(prob_from_idx(list(g["onset_raw"])))},
@@ -1002,13 +1105,50 @@ def run_single_pipeline(spec_id):
             dt["year"] = yr
             # filter_by_dissemination_cells and transform_forecast_wide sequence need swapped !!!!
             dt = filter_by_dissemination_cells(dt, spec)
+            strict_rain_day_max = spec.get("options", {}).get("rain_day_max")
+            if strict_rain_day_max is not None:
+                _, horizon_policy = resolve_rain_day_max(
+                    {
+                        "rain_day_max": strict_rain_day_max,
+                        "rain_horizon_policy": spec["options"].get(
+                            "rain_horizon_policy"
+                        ),
+                    },
+                    probability_day_max=1,
+                )
+                validation_dt = dt
+                max_number = (spec.get("filter") or {}).get("max_number")
+                if "number" in validation_dt.columns and max_number is not None:
+                    validation_dt = validation_dt[
+                        validation_dt["number"].astype(int) <= int(max_number)
+                    ]
+                validate_rain_horizon_frame(
+                    validation_dt,
+                    day_prefix=f"{wide_prefix}_day_",
+                    rain_day_max=strict_rain_day_max,
+                    model_name=spec_id,
+                    strict=True,
+                    allow_extra=horizon_policy == "truncate",
+                    key_columns=(
+                        "id", "lat", "lon", "time", "year", "number"
+                    ),
+                    context="raw forecast before spatial transformation",
+                )
             if weights_df is not None: # in spec yml if cell_transform_enabled: false, it does nothing
                 dt = transform_forecast_wide(dt, weights_df)
             result = process_rainfall_forecast_id(dt, spec, ref_onset_dt=ref_onset_dt, thr_dt=thr_dt)
             wide_all.append(result["wide"])
 
         elif spec["type"] == "ground_truth_rainfall":
-            dt = nc_read_groundtruth_long(nc_path, var_name, dim_rename_map)
+            missing_rain_policy = (
+                spec.get("options", {}).get("missing_rain_policy")
+                or spec.get("input", {}).get("missing_rain_policy")
+                or "keep"
+            )
+            dt = nc_read_groundtruth_long(
+                nc_path, var_name, dim_rename_map,
+                missing_rain_policy=missing_rain_policy,
+            )
             if dt is None:
                 print(f"  Skipping {nc_path}: variable '{var_name}' not found.")
                 continue

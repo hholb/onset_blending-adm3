@@ -15,9 +15,25 @@
 # ==============================================================================
 
 import os
+import collections
 import numpy as np
 import pandas as pd
 from datetime import date
+
+
+OnsetParams = collections.namedtuple("OnsetParams", [
+    "win",                    # trigger window (days)
+    "wet_day_min_mm",
+    "trigger_rule",           # "all_days_wet" | "first_day_wet"
+    "wet_day_comparison",     # "gte" | "gt"
+    "follow_days",
+    "followup_anchor",        # "after_trigger" | "onset_day"
+    "mode",                   # "consecutive_dry" | "window_sum"
+    "min_dry_days",
+    "dry_day_min_mm",
+    "sum_window",
+    "sum_min_mm",
+])
 
 
 def read_ref_onset_dates(spec):
@@ -314,8 +330,9 @@ def read_onset_params(spec):
     Parse onset definition parameters from spec["options"]["onset_definition"].
 
     All parameters have defaults that reproduce the *new* consecutive-dry
-    definition when onset_definition is omitted entirely. Set
-    dry_spell.mode = "window_sum" to use the original definition.
+    definition when onset_definition is omitted entirely. The legacy Indian
+    Moron-Robertson definition can be selected with first_day_wet, a strict
+    greater-than comparison, window_sum, and an onset_day follow-up anchor.
 
     Returns an OnsetParams namedtuple consumed by find_onset /
     find_onset_precomp / calc_onsets_rowwise.
@@ -326,7 +343,10 @@ def read_onset_params(spec):
       window: 5                       # trigger rolling-window length (days)
       onset_definition:
         wet_day_min_mm: 1.0           # rain >= this => wet day
+        trigger_rule: "all_days_wet"  # "all_days_wet" | "first_day_wet"
+        wet_day_comparison: "gte"     # "gte" | "gt"
         follow_days: 21               # days after trigger window to check for dry spell
+        followup_anchor: "after_trigger" # "after_trigger" | "onset_day"
         dry_spell:
           mode: "consecutive_dry"     # "consecutive_dry" | "window_sum"
 
@@ -338,26 +358,15 @@ def read_onset_params(spec):
           sum_window: 10              # rolling window size for dry-spell check
           sum_min_mm: 5               # window sum below this => dry spell
     """
-    import collections
-    OnsetParams = collections.namedtuple("OnsetParams", [
-        "win",           # trigger window (days)
-        "wet_day_min_mm",
-        "follow_days",
-        "mode",          # "consecutive_dry" | "window_sum"
-        # consecutive_dry
-        "min_dry_days",
-        "dry_day_min_mm",
-        # window_sum
-        "sum_window",
-        "sum_min_mm",
-    ])
-
     opts = spec.get("options", {})
     win = int(opts.get("window", 5))
 
     od = opts.get("onset_definition") or {}
     wet_day_min_mm = float(od.get("wet_day_min_mm", 1.0))
+    trigger_rule = str(od.get("trigger_rule", "all_days_wet")).lower()
+    wet_day_comparison = str(od.get("wet_day_comparison", "gte")).lower()
     follow_days    = int(od.get("follow_days", 21))
+    followup_anchor = str(od.get("followup_anchor", "after_trigger")).lower()
 
     ds = od.get("dry_spell") or {}
     mode           = str(ds.get("mode", "consecutive_dry"))
@@ -371,11 +380,29 @@ def read_onset_params(spec):
             f"onset_definition.dry_spell.mode must be 'consecutive_dry' or "
             f"'window_sum', got '{mode}'"
         )
+    if trigger_rule not in ("all_days_wet", "first_day_wet"):
+        raise ValueError(
+            "onset_definition.trigger_rule must be 'all_days_wet' or "
+            f"'first_day_wet', got '{trigger_rule}'"
+        )
+    if wet_day_comparison not in ("gte", "gt"):
+        raise ValueError(
+            "onset_definition.wet_day_comparison must be 'gte' or 'gt', "
+            f"got '{wet_day_comparison}'"
+        )
+    if followup_anchor not in ("after_trigger", "onset_day"):
+        raise ValueError(
+            "onset_definition.followup_anchor must be 'after_trigger' or "
+            f"'onset_day', got '{followup_anchor}'"
+        )
 
     return OnsetParams(
         win=win,
         wet_day_min_mm=wet_day_min_mm,
+        trigger_rule=trigger_rule,
+        wet_day_comparison=wet_day_comparison,
         follow_days=follow_days,
+        followup_anchor=followup_anchor,
         mode=mode,
         min_dry_days=min_dry_days,
         dry_day_min_mm=dry_day_min_mm,
@@ -477,14 +504,11 @@ def find_onset(series, win=None, thresh=None, reject_if_short_followup=False,
     int or None  (1-based onset day index, or None)
     """
     if params is None:
-        import collections
-        OnsetParams = collections.namedtuple("OnsetParams", [
-            "win", "wet_day_min_mm", "follow_days", "mode",
-            "min_dry_days", "dry_day_min_mm", "sum_window", "sum_min_mm",
-        ])
         params = OnsetParams(
             win=int(win) if win is not None else 5,
-            wet_day_min_mm=1.0, follow_days=21,
+            wet_day_min_mm=1.0, trigger_rule="all_days_wet",
+            wet_day_comparison="gte", follow_days=21,
+            followup_anchor="after_trigger",
             mode="consecutive_dry", min_dry_days=7, dry_day_min_mm=1.0,
             sum_window=10, sum_min_mm=5.0,
         )
@@ -521,14 +545,11 @@ def find_onset_precomp(series, win, thresh, wsum_all, pre_bad, last10start,
     params : OnsetParams or None
     """
     if params is None:
-        import collections
-        OnsetParams = collections.namedtuple("OnsetParams", [
-            "win", "wet_day_min_mm", "follow_days", "mode",
-            "min_dry_days", "dry_day_min_mm", "sum_window", "sum_min_mm",
-        ])
         params = OnsetParams(
             win=int(win) if win is not None else 5,
-            wet_day_min_mm=1.0, follow_days=21,
+            wet_day_min_mm=1.0, trigger_rule="all_days_wet",
+            wet_day_comparison="gte", follow_days=21,
+            followup_anchor="after_trigger",
             mode="consecutive_dry", min_dry_days=7, dry_day_min_mm=1.0,
             sum_window=10, sum_min_mm=5.0,
         )
@@ -550,8 +571,9 @@ def _find_onset_core(series, n, wsum, aux1, aux2, thresh,
 
     Trigger (both modes)
     --------------------
-    - All days in the trigger window [d, d+win-1] are wet
-      (rain >= wet_day_min_mm).
+    - Either every day in [d, d+win-1] is wet, or only day d must be wet,
+      according to trigger_rule. wet_day_comparison controls whether the
+      threshold comparison is >= (gte) or > (gt).
     - Rolling sum over that window > thresh.
 
     Veto — "consecutive_dry"
@@ -584,23 +606,30 @@ def _find_onset_core(series, n, wsum, aux1, aux2, thresh,
 
     idx = np.arange(min_i, max_candidate + 1)   # 1-based
 
-    # --- trigger: all days in [d, d+win-1] wet AND rolling sum > thresh ---
-    # Build a (len(idx), win) boolean matrix; all columns must be True
-    wet_mat = np.stack(
-        [series[idx - 1 + k] >= wmm for k in range(win)],
-        axis=1
-    )
-    all_wet = wet_mat.all(axis=1)
+    # --- trigger wet-day rule + rolling sum > thresh ---
+    compare_wet = np.greater if params.wet_day_comparison == "gt" else np.greater_equal
+    if params.trigger_rule == "first_day_wet":
+        wet_ok = compare_wet(series[idx - 1], wmm)
+    else:
+        wet_mat = np.stack(
+            [compare_wet(series[idx - 1 + k], wmm) for k in range(win)],
+            axis=1
+        )
+        wet_ok = wet_mat.all(axis=1)
     acc_ok  = wsum[idx - 1] > thresh
-    base_ok = all_wet & acc_ok
+    base_ok = wet_ok & acc_ok
     base_ok = np.where(np.isnan(series[idx - 1]), False, base_ok)
 
     cand = idx[base_ok]
     if len(cand) == 0:
         return None
 
-    # --- reject_if_short_followup: need d + win - 1 + follow <= n ---
-    full_end = cand + win - 1 + follow   # last day of follow-up (1-based)
+    # Last checked day (1-based). The legacy Indian R rule anchors at the onset
+    # candidate; the newer rule anchors after the full trigger window.
+    if params.followup_anchor == "onset_day":
+        full_end = cand + follow
+    else:
+        full_end = cand + win - 1 + follow
     if reject_if_short_followup:
         cand = cand[full_end <= n]
         if len(cand) == 0:
@@ -612,9 +641,11 @@ def _find_onset_core(series, n, wsum, aux1, aux2, thresh,
     # --- veto ---
     if params.mode == "consecutive_dry":
         pre_dry = aux1
-        # Follow-up window starts right after the trigger: 0-based [d-1+win, ...]
-        lower = cand - 1 + win                       # 0-based start of follow-up
-        upper = np.minimum(n, cand - 1 + win + follow)  # pre_dry exclusive upper
+        if params.followup_anchor == "onset_day":
+            lower = cand - 1
+        else:
+            lower = cand - 1 + win
+        upper = np.minimum(n, full_end)
         has_dry_spell = np.where(
             lower < upper,
             (pre_dry[upper] - pre_dry[lower]) > 0,
@@ -624,11 +655,13 @@ def _find_onset_core(series, n, wsum, aux1, aux2, thresh,
     else:  # window_sum
         pre_bad        = aux1
         last_win_start = aux2   # 0-based index of last valid sum_window start
-        # Follow-up starts right after the trigger window (0-based: cand-1+win)
-        # and ends at full_end (already clamped to n). We check rolling windows
-        # of length sum_window whose start falls in that range.
+        # Check rolling-window starts from the configured anchor through
+        # full_end (already clamped to n).
         sw = params.sum_window
-        c_lower = cand - 1 + win                              # 0-based start of follow-up
+        if params.followup_anchor == "onset_day":
+            c_lower = cand - 1
+        else:
+            c_lower = cand - 1 + win
         c_upper = np.minimum(last_win_start + 1,              # pre_bad is length last_win_start+2
                              np.maximum(0, full_end - sw + 1))  # exclusive upper for pre_bad query
         # Clamp both to valid pre_bad indices [0, len(pre_bad)-1]

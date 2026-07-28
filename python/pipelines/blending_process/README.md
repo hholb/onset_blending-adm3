@@ -74,6 +74,8 @@ Located in `specs/2025_blend/*.yml`. Key fields:
 | `forecast_models[].name` | Model name — drives all output column names downstream |
 | `forecast_models[].variants` | Onset start-date variants to compute (earliest date an onset can count, e.g. `fixed_cutoff`) |
 | `forecast_models[].rain_predictors` | List of `{ agg, window }` dicts (or legacy strings) |
+| `forecast_models[].rain_day_max` | Exact model rainfall horizon. An explicit value activates strict `1..N` column/value validation; omission uses the legacy `day_max + 10` minimum and permits later columns. |
+| `forecast_models[].rain_horizon_policy` | Optional compatibility override. `exact` is the default with explicit `rain_day_max`; `truncate` validates `1..N` but permits and ignores later rain columns. |
 
 ### `cv_models*.yml`
 
@@ -127,9 +129,10 @@ models:
 
 1. Add a `{ agg, window }` entry to `rain_predictors` under the relevant model in the connect spec:
    ```yaml
+   rain_day_max: 15
    rain_predictors:
-     - { agg: diff, window: 3 }
-     - { agg: min,  window: 7 }   # new predictor
+     - { agg: diff, window: 5 }
+     - { agg: min,  window: 10 }
    ```
 2. Add the corresponding `_qx` term to the formula in `cv_models*.yml`:
    ```yaml
@@ -138,6 +141,12 @@ models:
 3. Re-run Stage 0, then Stage 1.
 
 The output column name is built automatically as `{agg}_{model}_{window}day_week{w}` (e.g. `min_ngcm_7day_week1`), except for `diff` which omits the window: `diff_{model}_week{w}`.
+
+Only complete rolling windows are used. With `rain_day_max: 15` and a
+five-day window, week 1 uses start days 1–7, week 2 uses 8–11, and later weeks
+are unavailable (`NaN`). Configure the same explicit `rain_day_max` under
+`options` in the model's raw-data spec to validate every ensemble member before
+aggregation.
 
 ## Changing a Model Name
 

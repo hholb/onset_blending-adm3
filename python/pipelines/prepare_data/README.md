@@ -148,6 +148,16 @@ In addition to the general requirements:
 - **Lead-day dimension**: A dimension for forecast lead days (e.g., `day`), specified via `input.wide_day_dim`. Values should be positive integers.
 - **Ensemble dimension** (optional): A `number` dimension for ensemble members. The spec can filter to a maximum number of members via `filter.max_number`.
 - **Day range**: The spec's `options.min_day` and `options.max_day` control which lead days are kept. The file should contain at least days in `[min_day, max_day + window - 1]`.
+- **Fixed rainfall horizon** (optional): setting `options.rain_day_max: N` activates strict validation. By default, the NetCDF lead coordinate must be exactly `1..N`, and every retained issue date, ensemble member, and spatial cell must have finite rainfall throughout that range. Use the same `rain_day_max` for the model in the connect spec. Omitting it preserves legacy raw-input behavior. Set `options.rain_horizon_policy: truncate` only when later source days intentionally exist but features must stop at `N`; days `1..N` are still validated strictly.
+
+Example for a forecast system with exactly 15 available days:
+
+```yaml
+options:
+  min_day: 1
+  max_day: 15
+  rain_day_max: 15
+```
 
 ### Ground Truth NetCDF Requirements (`type: "ground_truth_rainfall"`)
 

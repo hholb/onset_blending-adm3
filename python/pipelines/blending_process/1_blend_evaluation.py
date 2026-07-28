@@ -12,6 +12,7 @@
 # ==============================================================================
 
 import argparse
+import json
 import os
 import sys
 import pickle
@@ -24,10 +25,12 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 
 import re
 from python.pipelines._shared.misc import coalesce, interval_bins
+from python.prepare_data.nc_utils import ensure_id_col
 from python.blending_process.blend_evaluation_utils import (
     _present_weeks,
     build_formulas_from_spec,
     print_formula_summary,
+    apply_formula_sample_support,
     compute_cv_global,
     compute_cv_local,
     compute_cv_neighbors,
@@ -75,6 +78,8 @@ def main():
     parser.add_argument("--work_dir", default=None,
                         help="If provided, input pkl is read directly from this directory, "
                              "overriding pipeline_input_dir in the spec.")
+    parser.add_argument("--input_path", default=None,
+                        help="Read the connector pickle at this exact path (highest priority).")
     parser.add_argument("--results_dir", default=None,
                         help="If provided, all outputs are written to this directory, "
                              "overriding pipeline_output_dir in the spec.")
@@ -110,11 +115,12 @@ def main():
     #dissemination_cells = pd.read_csv("Monsoon_Data/dissemination_cells.csv")
     #dissemination_cells = pd.read_csv("Monsoon_Data/dissemination_cells_box1.csv")
     dissemination_csv = spec["cell"].get("dissemination", "")
-    dissemination_cells = pd.read_csv(dissemination_csv)
-    dissemination_cells["id"] = dissemination_cells["adm3_name"].astype(str)
+    dissemination_cells = ensure_id_col(pd.read_csv(dissemination_csv))
+    dissemination_cells["id"] = dissemination_cells["id"].astype(str)
 
     # Load data
     input_file = input_rds_from_cutoff(cutoff_mode)
+    input_override = spec.get("run", {}).get("input_rds_override")
     #input_path = os.path.join("Monsoon_Data/Processed_Data/2025_pipeline_input", input_file)
     # pipeline_input_dir = spec["run"].get("pipeline_input_dir", "")   # default: no subfolder
     # input_path = os.path.join(
@@ -123,7 +129,11 @@ def main():
     #     input_file,
     # )
 
-    if args.work_dir:
+    if args.input_path:
+        input_path = args.input_path
+    elif input_override:
+        input_path = input_override
+    elif args.work_dir:
         input_path = os.path.join(args.work_dir, input_file)
     else:
         pipeline_input_dir = spec["run"].get("pipeline_input_dir", "")
@@ -229,27 +239,26 @@ def main():
 #    # --- END DIAGNOSTIC ---
 
 
-    # Drop rows with NaN in any feature column to ensure consistent n
-    # across blended models and raw/calibrated forecast evaluation
-    feature_prefixes = ("prob_clim", "diff_", "min_", "max_")
-    feature_cols = [c for c in wide_df.columns
-                    if any(c.startswith(p) for p in feature_prefixes)]
-    wide_df = wide_df.dropna(subset=feature_cols).copy()
-    print(f"After feature NaN filter: {len(wide_df)} rows")
-
-#    # Drop rows with NaN in any formula feature column so n is consistent
-#    # across blended models and raw/calibrated forecasts
-#    all_feature_cols = set()
-#    for formula_str in build_formulas_from_spec(spec, cutoff_mode).values():
-#        all_feature_cols.update(_parse_formula_cols(formula_str))
-#    all_feature_cols = [c for c in all_feature_cols if c in wide_df.columns]
-#    wide_df = wide_df.dropna(subset=all_feature_cols).copy()
-#    print(f"After feature NaN filter: {len(wide_df)} rows")
-
-    print(f"Loaded {len(wide_df)} rows from {input_path}")
-
-    # Build formulas from spec
+    # Build formulas before selecting sample support. Only predictors actually
+    # referenced by enabled formulas may determine the common evaluation rows.
     formulas = build_formulas_from_spec(spec, cutoff_mode)
+    wide_df, support = apply_formula_sample_support(wide_df, formulas)
+    print(
+        "Formula sample support "
+        f"({support['policy']}): {support['rows_before']} -> "
+        f"{support['rows_after']} rows "
+        f"({support['rows_excluded']} excluded)"
+    )
+    if support["nonfinite_by_column"]:
+        print(f"Non-finite formula predictors: {support['nonfinite_by_column']}")
+    support_path = os.path.join(
+        path_box, f"formula_sample_support{output_tag}.json"
+    )
+    with open(support_path, "w") as handle:
+        json.dump(support, handle, indent=2)
+    print(f"Wrote formula sample-support diagnostics: {support_path}")
+
+    print(f"Loaded {len(wide_df)} supported rows from {input_path}")
     print(f"Formulas: {list(formulas.keys())}")
     print_formula_summary(spec, cutoff_mode)
 

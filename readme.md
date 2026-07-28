@@ -331,14 +331,17 @@ The onset definition is fully configurable from the yml `options.onset_definitio
 ### Trigger (both modes)
 
 A candidate day `d` passes the trigger if:
-- All days in the window `[d, d+win-1]` are wet: `rain >= wet_day_min_mm`
+- `trigger_rule: all_days_wet` requires every day in `[d, d+win-1]` to be wet;
+  `trigger_rule: first_day_wet` requires only day `d` to be wet.
+- `wet_day_comparison` selects inclusive `gte` or strict `gt` comparison with
+  `wet_day_min_mm`.
 - The rolling sum over those `win` days exceeds `thresh` (per-cell value from `thresholds_df.csv`)
 
 ### Dry-spell veto modes
 
-**`consecutive_dry`** (new definition): no run of `>= min_dry_days` consecutive dry days (`rain < dry_day_min_mm`) within `follow_days` days after the trigger window.
+**`consecutive_dry`** (new definition): no run of `>= min_dry_days` consecutive dry days (`rain < dry_day_min_mm`) in the configured follow-up interval.
 
-**`window_sum`** (original Moron-Robertson definition): no rolling window of `sum_window` days with total rainfall `< sum_min_mm` within `follow_days` days after the trigger window.
+**`window_sum`** (original Moron-Robertson dry-spell check): no rolling window of `sum_window` days with total rainfall `< sum_min_mm` in the configured follow-up interval. `followup_anchor: after_trigger` starts the interval after the trigger window; `followup_anchor: onset_day` starts it on candidate day `d`.
 
 The first candidate day that passes both the trigger and the veto is returned as the onset date. If the first candidate is vetoed, the search continues to the next trigger candidate (option A behaviour). Setting `follow_days: 0` disables the veto entirely.
 
@@ -349,7 +352,10 @@ options:
   window: 3                        # trigger window length (days)
   onset_definition:
     wet_day_min_mm: 1.0            # minimum mm/day to count as wet
+    trigger_rule: all_days_wet     # "all_days_wet" | "first_day_wet"
+    wet_day_comparison: gte        # "gte" | "gt"
     follow_days: 21                # days after trigger window to check
+    followup_anchor: after_trigger # "after_trigger" | "onset_day"
 
     dry_spell:
       mode: consecutive_dry        # "consecutive_dry" | "window_sum"
@@ -371,16 +377,17 @@ options:
   window: 5
   onset_definition:
     wet_day_min_mm: 1.0
+    trigger_rule: first_day_wet
+    wet_day_comparison: gt
     follow_days: 30
+    followup_anchor: onset_day
     dry_spell:
       mode: window_sum
       sum_window: 10
       sum_min_mm: 5.0
 ```
 
-All parameters are optional — if `onset_definition` is omitted entirely, the `consecutive_dry` mode is used with `win=5`, `follow_days=21`, `min_dry_days=7`.
-
-**Current default** (as set in all raw data specs): `follow_days: 0`, which disables the dry-spell veto entirely. Only the trigger condition is checked — the first day of a wet spell where all `window` days are wet and the accumulation exceeds the threshold is returned as onset. Set `follow_days` to a non-zero value (e.g. `21` for the Ethiopia/ICPAC definition) to re-enable the veto.
+All parameters are optional. If `onset_definition` is omitted, the backward-compatible Python defaults are `all_days_wet`, `gte`, `consecutive_dry`, `follow_days=21`, `followup_anchor=after_trigger`, and `min_dry_days=7`. Setting `follow_days: 0` disables the veto.
 
 ### Short series behaviour
 

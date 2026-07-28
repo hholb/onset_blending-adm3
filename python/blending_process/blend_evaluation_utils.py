@@ -388,8 +388,8 @@ def fit_platt_weights_export(df, prob_cols, training_years,
                               outcome_col="outcome", year_col="year"):
     """Fit one-vs-rest Platt calibration weights on training years.
 
-    IMPORTANT: matches R glm(y ~ p, ...) which uses raw probability as predictor,
-    NOT logit(p). sklearn is used with raw p as the feature.
+    Exported weights are consumed as expit(intercept + slope * logit(p)) by
+    apply_platt_5, matching R's glm(y ~ logit_p, ...) export/application pair.
     """
     df_train = df[df[year_col].isin(training_years)].copy()
     weights_rows = []
@@ -403,8 +403,7 @@ def fit_platt_weights_export(df, prob_cols, training_years,
             weights_rows.append({"bin": bin_name, "intercept": 0.0, "slope": 1.0})
             continue
 
-        # Match R: use raw probability p as the predictor (not logit(p))
-        X = p_raw[ok].reshape(-1, 1)
+        X = logit(p_raw[ok]).reshape(-1, 1)
         clf = LogisticRegression(solver="lbfgs", C=1e9, max_iter=1000, tol=1e-5)
         clf.fit(X, y[ok])
         weights_rows.append({
@@ -648,6 +647,100 @@ def _parse_formula_cols(formula_str):
         rhs = formula_str
     cols = [t.strip() for t in re.split(r"[+\-\*:\(\)]", rhs)]
     return [c for c in cols if c and not c.isdigit() and c != "1"]
+
+
+def validate_formula_feature_support(data, formulas):
+    """
+    Validate that every enabled formula feature exists and has finite support.
+
+    Connect-stage rainfall-horizon metadata is used, when available, to turn
+    an all-missing short-horizon predictor into a precise constructibility
+    error before any model fitting starts.
+    """
+    feature_map = {
+        model_name: list(dict.fromkeys(_parse_formula_cols(formula)))
+        for model_name, formula in formulas.items()
+    }
+    unavailable = data.attrs.get("unavailable_rain_predictors", {})
+    problems = []
+
+    for model_name, columns in feature_map.items():
+        missing = [column for column in columns if column not in data.columns]
+        if missing:
+            problems.append(
+                f"Formula '{model_name}' is missing predictor columns: "
+                f"{', '.join(missing)}"
+            )
+
+        for column in columns:
+            if column not in data.columns:
+                continue
+            numeric = pd.to_numeric(data[column], errors="coerce").to_numpy(
+                dtype=float
+            )
+            if np.isfinite(numeric).any():
+                continue
+
+            details = unavailable.get(column)
+            if details:
+                problems.append(
+                    f"Formula '{model_name}': {column} cannot be constructed "
+                    f"under rain_day_max={details['rain_day_max']} "
+                    f"(window={details['window']}, week={details['week']}; "
+                    "no complete start days)."
+                )
+            else:
+                problems.append(
+                    f"Formula '{model_name}': {column} has no finite values "
+                    "and cannot be used for fitting."
+                )
+
+    if problems:
+        raise ValueError(
+            "Formula feature validation failed before model fitting:\n- "
+            + "\n- ".join(problems)
+        )
+    return feature_map
+
+
+def apply_formula_sample_support(data, formulas):
+    """
+    Apply common-complete support using only predictors in enabled formulas.
+
+    Returns the filtered DataFrame and diagnostics. Predictors that exist in
+    the connector output but are unused by all formulas do not affect support.
+    """
+    feature_map = validate_formula_feature_support(data, formulas)
+    required = list(dict.fromkeys(
+        column
+        for columns in feature_map.values()
+        for column in columns
+    ))
+    keep = np.ones(len(data), dtype=bool)
+    excluded_by_column = {}
+    for column in required:
+        numeric = pd.to_numeric(data[column], errors="coerce").to_numpy(
+            dtype=float
+        )
+        finite = np.isfinite(numeric)
+        excluded_by_column[column] = int((~finite).sum())
+        keep &= finite
+
+    filtered = data.loc[keep].copy()
+    diagnostics = {
+        "policy": "common_complete",
+        "required_columns": required,
+        "rows_before": int(len(data)),
+        "rows_after": int(len(filtered)),
+        "rows_excluded": int((~keep).sum()),
+        "nonfinite_by_column": {
+            column: count
+            for column, count in excluded_by_column.items()
+            if count
+        },
+    }
+    filtered.attrs["formula_sample_support"] = diagnostics
+    return filtered, diagnostics
 
 
 def compute_cv_global(formula_str, data_train, holdout_years,

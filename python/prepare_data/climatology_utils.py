@@ -22,6 +22,7 @@
 # ==============================================================================
 
 import os
+from functools import lru_cache
 import pickle
 import warnings
 import numpy as np
@@ -299,14 +300,22 @@ def compute_d0(t, season_start_md):
     return (pd.Timestamp(t).date() - season_start).days
 
 
-def _kde_cdf(kde, x_vals):
-    """Approximate CDF from a gaussian_kde by numerical integration on a grid."""
-    x_min = kde.dataset.min() - 3 * kde.factor * kde.dataset.std()
-    x_max = kde.dataset.max() + 3 * kde.factor * kde.dataset.std()
-    grid = np.linspace(x_min, x_max, 2000)
+@lru_cache(maxsize=512)
+def _kde_cdf(kde, x_vals=None):
+    """Approximate R density()+approxfun(rule=2) CDF construction."""
+    data = kde.dataset.flatten()
+    bandwidth = kde.factor * np.std(data, ddof=1)
+    x_min = data.min() - 3 * bandwidth
+    x_max = data.max() + 3 * bandwidth
+    grid = np.linspace(x_min, x_max, 512)
     pdf_vals = kde.evaluate(grid)
     cdf_vals = np.cumsum(pdf_vals) / np.sum(pdf_vals)
-    cdf_fn = interp1d(grid, cdf_vals, bounds_error=False, fill_value=(0.0, 1.0))
+    cdf_fn = interp1d(
+        grid,
+        cdf_vals,
+        bounds_error=False,
+        fill_value=(cdf_vals[0], cdf_vals[-1]),
+    )
     return cdf_fn
 
 
