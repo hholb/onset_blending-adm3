@@ -22,15 +22,15 @@ exit.
 
 Usage (run from repo root)
 --------------------------
-    python predict/run_training.py \\
+    python python/run_training.py \\
         --model_single    aifs \\
         --model_ens       aifs_ens \\
-        --aifs_spec       aifs \\
-        --aifs_ens_spec   aifs_ens \\
-        --clim_spec       ref_rain_fixed_cutoff \\
-        --combine_spec    combine_template_fixed_cutoff \\
-        --connect_spec    connect_fixed_cutoff \\
-        --blend_spec      cv_models_fixed_cutoff \\
+        --aifs_spec       aifs_2026 \\
+        --aifs_ens_spec   aifs_ens_2026 \\
+        --clim_spec       ref_rain_fixed_cutoff_2026 \\
+        --combine_spec    combine_template_fixed_cutoff_2026 \\
+        --connect_spec    connect_fixed_cutoff_2026 \\
+        --blend_spec      cv_models_fixed_cutoff_2026 \\
         --work_dir        Monsoon_Data/Processed_Data/training \\
         --results_dir     Monsoon_Data/results/dry_spell_aifs_aifs_ens \\
         [--aifs_nc_file       /path/to/aifs.nc] \\
@@ -38,7 +38,7 @@ Usage (run from repo root)
         [--aifs_nc_folder     /path/to/aifs/nc/files] \\
         [--aifs_ens_nc_folder /path/to/aifs_ens/nc/files] \\
         [--gt_path            Monsoon_Data/Processed_Data/Models/dry_spell/imd_clim_mok_date_wide.pkl] \\
-        [--blend_input        Monsoon_Data/Processed_Data/training/cv_data_clim_mok_date_new_pipeline.pkl] \\
+        [--blend_input        Monsoon_Data/Processed_Data/training/cv_data_fixed_cutoff_new_pipeline.pkl] \\
         [--skip_to STEP] \\
         [--stop_at STEP] \\
         [--dry_run]
@@ -69,7 +69,6 @@ Notes
 --results_dir
     Directory where 1_blend_evaluation.py writes its outputs (coefs, cv_preds,
     summary csvs). Overrides run.pipeline_output_dir in the blend spec.
-    Defaults to Monsoon_Data/results/<pipeline_output_dir from blend spec yml>.
 
 --skip_to N
     Skip steps 1..N-1 and start from step N (1-indexed).
@@ -92,6 +91,7 @@ import yaml
 import re
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+DEFAULT_CONNECTOR_ARTIFACT = "cv_data_fixed_cutoff_new_pipeline.pkl"
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
@@ -160,6 +160,64 @@ def log(msg, level="INFO"):
 def abort(msg):
     log(msg, level="ERROR")
     sys.exit(1)
+
+
+def resolve_connector_artifact(work_dir, blend_input=None):
+    """Return the exact connector-output / blend-evaluator-input path."""
+    return blend_input or os.path.join(work_dir, DEFAULT_CONNECTOR_ARTIFACT)
+
+
+def configure_forecast_source(forecasts, model_name, template_name, source_path):
+    """
+    Point a combine-spec forecast entry at its processed artifact.
+
+    Prefer the model key already declared by the selected spec (for example,
+    ``ngcm``). If the spec is a generic template, rename its role key (for
+    example, ``aifs_ens``) to the requested model before updating the source.
+    """
+    if not isinstance(forecasts, dict):
+        raise ValueError("Combine spec 'forecasts' must be a mapping.")
+
+    if model_name in forecasts:
+        selected_name = model_name
+    elif template_name in forecasts:
+        forecasts[model_name] = forecasts.pop(template_name)
+        selected_name = model_name
+    else:
+        available = ", ".join(sorted(forecasts)) or "<none>"
+        raise KeyError(
+            f"Combine spec has no forecast entry for model '{model_name}' "
+            f"or template role '{template_name}'. Available keys: {available}"
+        )
+
+    sources = forecasts[selected_name].get("sources")
+    if (
+        not isinstance(sources, list)
+        or not sources
+        or not isinstance(sources[0], dict)
+    ):
+        raise ValueError(
+            f"Combine forecast '{selected_name}' must define at least one "
+            "'sources' mapping."
+        )
+
+    sources[0]["file"] = source_path
+    return selected_name
+
+
+def build_blend_eval_cmd(spec_id, work_dir, input_path, results_dir, cores=None):
+    """Build Step 7 with an explicit connector artifact handoff."""
+    cmd = [
+        sys.executable,
+        "python/pipelines/blending_process/1_blend_evaluation.py",
+        "--spec_id", spec_id,
+        "--work_dir", work_dir,
+        "--input_path", input_path,
+        "--results_dir", results_dir,
+    ]
+    if cores is not None:
+        cmd += ["--cores", str(cores)]
+    return cmd
 
 
 def check_output_exists(path, step_name):
@@ -250,8 +308,8 @@ def main():
                              "input.gt_path in the clim spec AND ground_truth_wide_rds "
                              "in the combine spec.")
     parser.add_argument("--blend_input",    default=None,
-                        help="Path to the wide pipeline pkl for 1_blend_evaluation.py. "
-                             "Defaults to <work_dir>/cv_data_clim_mok_date_new_pipeline.pkl")
+                        help="Exact connector output / blend-evaluator input pickle path. "
+                             "Defaults to <work_dir>/cv_data_fixed_cutoff_new_pipeline.pkl")
 
     # ── Optional ─────────────────────────────────────────────────────────
     parser.add_argument("--cores",          type=int, default=None,
@@ -338,13 +396,12 @@ def main():
     cs["output"]["basename"]                          = args.combine_spec
     cs["input"]["climatologies"]["clim"]["rds"]       = clim_rds
     cs["input"]["climatologies"]["clim_unc"]["rds"]   = clim_unc_rds
-    cs["forecasts"]["aifs_ens"]["sources"][0]["file"] = aifs_ens_pkl
-    cs["forecasts"]["aifs"]["sources"][0]["file"]     = aifs_pkl
-
-    if args.model_single != "aifs":
-        cs["forecasts"][args.model_single] = cs["forecasts"].pop("aifs")
-    if args.model_ens != "aifs_ens":
-        cs["forecasts"][args.model_ens] = cs["forecasts"].pop("aifs_ens")
+    configure_forecast_source(
+        cs["forecasts"], args.model_ens, "aifs_ens", aifs_ens_pkl
+    )
+    configure_forecast_source(
+        cs["forecasts"], args.model_single, "aifs", aifs_pkl
+    )
 
     if args.gt_path:
         cs["input"]["ground_truth_wide_rds"] = args.gt_path
@@ -360,9 +417,7 @@ def main():
     # ── Patch connect spec ────────────────────────────────────────────────
     combine_basename   = f"{args.combine_spec}_combined_wide.pkl"
     connect_input_rds  = os.path.join(work_dir, combine_basename)
-    connect_output_rds = os.path.join(work_dir, "cv_data_clim_mok_date_new_pipeline.pkl")
-    if args.blend_input:
-        connect_output_rds = args.blend_input
+    connect_output_rds = resolve_connector_artifact(work_dir, args.blend_input)
 
     connect_spec_path = os.path.join("specs", "2025_blend", f"{args.connect_spec}.yml")
     with open(connect_spec_path) as f:
@@ -432,15 +487,13 @@ def main():
     TOTAL = 7
 
     # ── Build steps list ──────────────────────────────────────────────────
-    blend_eval_cmd = [
-        sys.executable,
-        "python/pipelines/blending_process/1_blend_evaluation.py",
-        "--spec_id", blend_spec,
-        "--work_dir",    work_dir,
-        "--results_dir", args.results_dir,
-    ]
-    if args.cores is not None:
-        blend_eval_cmd += ["--cores", str(args.cores)]
+    blend_eval_cmd = build_blend_eval_cmd(
+        blend_spec,
+        work_dir,
+        connect_output_rds,
+        args.results_dir,
+        cores=args.cores,
+    )
 
     steps = [
         (1, "Process IMD ground truth nc files", [
@@ -449,13 +502,13 @@ def main():
             "--spec_id", clim_spec,
         ], ref_rain_pkl),
 
-        (2, "Process aifs nc files", [
+        (2, f"Process {args.model_single} nc files", [
             sys.executable,
             "python/pipelines/prepare_data/1_process_raw_nc_files.py",
             "--spec_id", aifs_spec,
         ], aifs_pkl),
 
-        (3, "Process aifs_ens nc files", [
+        (3, f"Process {args.model_ens} nc files", [
             sys.executable,
             "python/pipelines/prepare_data/1_process_raw_nc_files.py",
             "--spec_id", aifs_ens_spec,
@@ -486,6 +539,7 @@ def main():
     log(f"Starting training pipeline")
     log(f"Work dir    : {work_dir}")
     log(f"Results dir : {args.results_dir}")
+    log(f"Connector → evaluator artifact: {connect_output_rds}")
     if args.aifs_nc_file:
         log(f"aifs nc_file override        : {args.aifs_nc_file}")
     elif args.aifs_nc_folder:

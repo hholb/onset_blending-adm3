@@ -1,7 +1,6 @@
 mode: "fixed_cutoff"
-input_rds: "Monsoon_Data/Processed_Data/2026/combine_template_clim_mok_date_2026_ngcm_combined_wide.pkl"
-#output_rds: "Monsoon_Data/Processed_Data/2025_pipeline_input/cv_data_clim_mok_date_new_pipeline.pkl"
-output_rds: "Monsoon_Data/Processed_Data/2026/cv_data_clim_mok_date_new_pipeline_2026.pkl"
+input_rds: "Monsoon_Data/Processed_Data/2026/combine_template_fixed_cutoff_2026_ngcm_combined_wide.pkl"
+output_rds: "Monsoon_Data/Processed_Data/2026/cv_data_fixed_cutoff_new_pipeline_2026_ngcm.pkl"
 day_max: 28
 days_per_bin: 7
 n_bins: 4
