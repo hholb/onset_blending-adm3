@@ -7,36 +7,29 @@ before proceeding to the next step.
 
 Steps
 -----
-1. 1_process_raw_nc_files.py  --spec_id <clim_spec>
-2. 1_process_raw_nc_files.py  --spec_id <aifs_spec>
-3. 1_process_raw_nc_files.py  --spec_id <aifs_ens_spec>
-4. 2_build_climatology.py     --spec_id <clim_spec>
-5. 3_combine_datasets.py      --spec_id <combine_spec>
-6. 0_connect_prepare_data_to_2025_pipeline.py --spec_id <connect_spec>
-7. 1_blend_evaluation.py      --spec_id <blend_spec>
+1. Process the ground-truth rainfall specification.
+2. Process one raw rainfall specification per configured forecast.
+3. Build climatology.
+4. Combine datasets.
+5. Connect/prepare the blend input.
+6. Evaluate the blend.
 
-When --aifs_nc_folder, --aifs_ens_nc_folder, --gt_path are supplied, the script
-patches the relevant yml fields before running each step by writing temporary
-spec files (suffixed _op) into the specs/ directories. These are cleaned up on
-exit.
+The script patches the relevant YAML fields before running each stage by
+writing temporary specifications (suffixed _op) into the existing spec
+directories. These are cleaned up on exit. With two forecasts, the historical
+seven-step numbering is preserved.
 
 Usage (run from repo root)
 --------------------------
     python python/run_training.py \\
-        --model_single    aifs \\
-        --model_ens       aifs_ens \\
-        --aifs_spec       aifs_2026 \\
-        --aifs_ens_spec   aifs_ens_2026 \\
+        --forecast        aifs aifs_2026 \\
+        --forecast        ngcm ngcm_2026 \\
         --clim_spec       ref_rain_fixed_cutoff_2026 \\
-        --combine_spec    combine_template_fixed_cutoff_2026 \\
-        --connect_spec    connect_fixed_cutoff_2026 \\
-        --blend_spec      cv_models_fixed_cutoff_2026 \\
+        --combine_spec    combine_template_fixed_cutoff_2026_ngcm \\
+        --connect_spec    connect_fixed_cutoff_2026_ngcm \\
+        --blend_spec      cv_models_fixed_cutoff_2026_ngcm \\
         --work_dir        Monsoon_Data/Processed_Data/training \\
-        --results_dir     Monsoon_Data/results/dry_spell_aifs_aifs_ens \\
-        [--aifs_nc_file       /path/to/aifs.nc] \\
-        [--aifs_ens_nc_file   /path/to/aifs_ens.nc] \\
-        [--aifs_nc_folder     /path/to/aifs/nc/files] \\
-        [--aifs_ens_nc_folder /path/to/aifs_ens/nc/files] \\
+        --results_dir     Monsoon_Data/results/dry_spell_aifs_ngcm \\
         [--gt_path            Monsoon_Data/Processed_Data/Models/dry_spell/imd_clim_mok_date_wide.pkl] \\
         [--blend_input        Monsoon_Data/Processed_Data/training/cv_data_fixed_cutoff_new_pipeline.pkl] \\
         [--skip_to STEP] \\
@@ -45,14 +38,20 @@ Usage (run from repo root)
 
 Notes
 -----
+--forecast MODEL SPEC_ID
+    Repeat once per forecast source. MODEL is the name already used by the
+    selected combine, connect, and blend specs. SPEC_ID identifies the raw-data
+    YAML under specs/raw_data. The existing model_single/model_ens and
+    aifs_spec/aifs_ens_spec arguments remain available as a legacy alternative.
+
 --aifs_nc_file / --aifs_ens_nc_file
-    Point to a specific NetCDF file. Overrides both input.nc_folder (set to the
-    file's parent directory) and input.file_regex (set to match the exact filename)
-    in the aifs / aifs_ens yml specs. Takes priority over --aifs_nc_folder /
-    --aifs_ens_nc_folder.
+    Legacy-interface overrides. Point to a specific NetCDF file and override
+    both input.nc_folder and input.file_regex. These cannot be combined with
+    --forecast.
 
 --aifs_nc_folder / --aifs_ens_nc_folder
-    Override the input.nc_folder field in the aifs / aifs_ens yml specs.
+    Legacy-interface input.nc_folder overrides. These cannot be combined with
+    --forecast.
 
 --gt_path
     Path to the historical ground truth wide pkl. Simultaneously overrides:
@@ -62,9 +61,9 @@ Notes
 
 --work_dir
     Working directory for all intermediate files (processed nc outputs,
-    climatology pkls, combined wide pkl, connect output pkl). Patched into
-    output.out_dir in aifs/aifs_ens/clim specs, output.out_dir in combine spec,
-    and input_rds/output_rds in connect spec.
+    climatology pkls, combined wide pkl, connect output pkl). Patched into all
+    raw forecast and climatology specs, the combine spec, and the connect
+    input/output handoff.
 
 --results_dir
     Directory where 1_blend_evaluation.py writes its outputs (coefs, cv_preds,
@@ -85,7 +84,9 @@ import sys
 import argparse
 import subprocess
 import atexit
+from dataclasses import dataclass
 from datetime import datetime
+from typing import Optional
 
 import yaml
 import re
@@ -95,6 +96,8 @@ DEFAULT_CONNECTOR_ARTIFACT = "cv_data_fixed_cutoff_new_pipeline.pkl"
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
+from python.rain_horizon_utils import resolve_rain_day_max  # noqa: E402
+
 os.chdir(REPO_ROOT)
 
 # ---------------------------------------------------------------------------
@@ -102,6 +105,20 @@ os.chdir(REPO_ROOT)
 # ---------------------------------------------------------------------------
 
 _temp_spec_files = []   # paths to clean up on exit
+
+
+@dataclass
+class ForecastJob:
+    model: str
+    spec_id: str
+    template_name: Optional[str] = None
+    nc_file: Optional[str] = None
+    nc_folder: Optional[str] = None
+    runtime_spec_id: Optional[str] = None
+    artifact_path: Optional[str] = None
+    rain_day_max: Optional[int] = None
+    rain_horizon_policy: str = "legacy"
+
 
 def _cleanup_temp_specs():
     for path in _temp_spec_files:
@@ -162,6 +179,209 @@ def abort(msg):
     sys.exit(1)
 
 
+def load_yaml_spec(spec_id, spec_type):
+    """Load one maintained YAML specification and require a mapping."""
+    path = os.path.join("specs", spec_type, f"{spec_id}.yml")
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Base spec not found: {path}")
+    with open(path) as f:
+        spec = yaml.safe_load(f)
+    if not isinstance(spec, dict):
+        raise ValueError(f"Spec must contain a YAML mapping: {path}")
+    return spec
+
+
+def write_temp_spec(base_spec_id, spec_type, spec):
+    """Write an already-resolved specification using the existing _op convention."""
+    new_spec_id = f"{base_spec_id}_op"
+    path = os.path.join("specs", spec_type, f"{new_spec_id}.yml")
+    with open(path, "w") as f:
+        yaml.dump(spec, f, default_flow_style=False, allow_unicode=True)
+    _temp_spec_files.append(path)
+    log(f"Patched spec written: {path}")
+    return new_spec_id
+
+
+def normalize_forecast_jobs(args):
+    """Normalize the new repeated interface or the complete legacy interface."""
+    forecast_pairs = args.forecast or []
+    legacy_names = [
+        "model_single", "model_ens", "aifs_spec", "aifs_ens_spec",
+        "aifs_nc_file", "aifs_ens_nc_file",
+        "aifs_nc_folder", "aifs_ens_nc_folder",
+    ]
+    supplied_legacy = [name for name in legacy_names if getattr(args, name)]
+
+    if forecast_pairs and supplied_legacy:
+        raise ValueError(
+            "--forecast cannot be combined with legacy forecast arguments."
+        )
+
+    if forecast_pairs:
+        jobs = [
+            ForecastJob(model=model, spec_id=spec_id)
+            for model, spec_id in forecast_pairs
+        ]
+    else:
+        required = [
+            args.model_single, args.model_ens,
+            args.aifs_spec, args.aifs_ens_spec,
+        ]
+        if not all(required):
+            raise ValueError(
+                "Provide --forecast MODEL SPEC_ID at least once, or provide the "
+                "complete legacy model/spec argument set."
+            )
+        jobs = [
+            ForecastJob(
+                model=args.model_single,
+                spec_id=args.aifs_spec,
+                template_name="aifs",
+                nc_file=args.aifs_nc_file,
+                nc_folder=args.aifs_nc_folder,
+            ),
+            ForecastJob(
+                model=args.model_ens,
+                spec_id=args.aifs_ens_spec,
+                template_name="aifs_ens",
+                nc_file=args.aifs_ens_nc_file,
+                nc_folder=args.aifs_ens_nc_folder,
+            ),
+        ]
+
+    model_names = [job.model for job in jobs]
+    if len(model_names) != len(set(model_names)):
+        raise ValueError("Forecast model names must be unique.")
+
+    return jobs
+
+
+def resolve_model_entries(entries, jobs, context):
+    """Apply legacy role aliases and return entries for the requested models."""
+    names = [entry.get("name") for entry in entries]
+    duplicates = sorted({
+        name for name in names if name is not None and names.count(name) > 1
+    })
+    if duplicates:
+        raise ValueError(
+            f"{context} contains duplicate names: " + ", ".join(duplicates)
+        )
+
+    by_name = {entry["name"]: entry for entry in entries}
+    for job in jobs:
+        if job.model in by_name:
+            continue
+        if job.template_name and job.template_name in by_name:
+            entry = by_name.pop(job.template_name)
+            entry["name"] = job.model
+            by_name[job.model] = entry
+
+    missing = [job.model for job in jobs if job.model not in by_name]
+    if missing:
+        raise ValueError(
+            f"{context} has no entry for: " + ", ".join(missing)
+        )
+
+    return by_name
+
+
+def reconcile_forecast_horizon(
+    raw_spec, connect_entry, model_name, probability_day_max
+):
+    """Resolve one explicit rainfall-horizon contract into raw and connect specs."""
+    raw_options = raw_spec.setdefault("options", {})
+
+    def explicit_contract(config):
+        if config.get("rain_day_max") is None:
+            return None
+        return resolve_rain_day_max(config, probability_day_max)
+
+    raw_contract = explicit_contract(raw_options)
+    connect_contract = explicit_contract(connect_entry)
+
+    if raw_contract and connect_contract and raw_contract != connect_contract:
+        raise ValueError(
+            f"Rainfall-horizon mismatch for forecast '{model_name}': raw spec "
+            f"resolves to {raw_contract}, connect spec resolves to "
+            f"{connect_contract}."
+        )
+
+    resolved = raw_contract or connect_contract
+    if resolved is None:
+        return None, "legacy"
+
+    rain_day_max, policy = resolved
+    raw_options["rain_day_max"] = rain_day_max
+    raw_options["rain_horizon_policy"] = policy
+    connect_entry["rain_day_max"] = rain_day_max
+    connect_entry["rain_horizon_policy"] = policy
+    return rain_day_max, policy
+
+
+def configure_blend_spec_models(spec, jobs):
+    """Apply legacy two-slot aliases inside the selected blend spec."""
+    alias_map = {
+        job.template_name: job.model
+        for job in jobs
+        if job.template_name and job.template_name != job.model
+    }
+
+    for entries in (
+        spec.get("extras", {}).get("forecasts", []),
+        spec.get("mme", {}).get("blend_models", []),
+    ):
+        for entry in entries:
+            name = entry.get("name")
+            if name in alias_map:
+                entry["name"] = alias_map[name]
+
+    formulas = spec.get("models", {}).get("formulas", {}).values()
+    for formula in formulas:
+        if not formula.get("enabled"):
+            continue
+        text = formula["text"]
+        for template_name, model_name in sorted(
+            alias_map.items(), key=lambda item: len(item[0]), reverse=True
+        ):
+            text = text.replace(f"_{template_name}_", f"_{model_name}_")
+        formula["text"] = text
+
+
+def validate_blend_spec_models(spec, jobs):
+    """Require every requested forecast model to appear in the blend spec."""
+    requested = [job.model for job in jobs]
+    declared = {
+        entry.get("name")
+        for entries in (
+            spec.get("extras", {}).get("forecasts", []),
+            spec.get("mme", {}).get("blend_models", []),
+        )
+        for entry in entries
+    }
+
+    formula_models = set()
+    formulas = spec.get("models", {}).get("formulas", {}).values()
+    for formula in formulas:
+        if not formula.get("enabled"):
+            continue
+        tokens = re.findall(r"[A-Za-z_][A-Za-z0-9_]*", formula["text"])
+        for token in tokens:
+            for model in sorted(requested, key=len, reverse=True):
+                if re.search(rf"(?:^|_){re.escape(model)}(?:_|$)", token):
+                    formula_models.add(model)
+                    break
+
+    missing = [
+        model for model in requested
+        if model not in declared and model not in formula_models
+    ]
+    if missing:
+        raise ValueError(
+            "blend spec has no enabled formula, extras forecast, or MME entry "
+            "for: " + ", ".join(missing)
+        )
+
+
 def resolve_connector_artifact(work_dir, blend_input=None):
     """Return the exact connector-output / blend-evaluator-input path."""
     return blend_input or os.path.join(work_dir, DEFAULT_CONNECTOR_ARTIFACT)
@@ -180,14 +400,20 @@ def configure_forecast_source(forecasts, model_name, template_name, source_path)
 
     if model_name in forecasts:
         selected_name = model_name
-    elif template_name in forecasts:
+    elif template_name and template_name in forecasts:
         forecasts[model_name] = forecasts.pop(template_name)
         selected_name = model_name
     else:
         available = ", ".join(sorted(forecasts)) or "<none>"
+        if template_name:
+            expected = (
+                f"model '{model_name}' or legacy template role '{template_name}'"
+            )
+        else:
+            expected = f"model '{model_name}'"
         raise KeyError(
-            f"Combine spec has no forecast entry for model '{model_name}' "
-            f"or template role '{template_name}'. Available keys: {available}"
+            f"Combine spec has no forecast entry for {expected}. "
+            f"Available keys: {available}"
         )
 
     sources = forecasts[selected_name].get("sources")
@@ -206,7 +432,7 @@ def configure_forecast_source(forecasts, model_name, template_name, source_path)
 
 
 def build_blend_eval_cmd(spec_id, work_dir, input_path, results_dir, cores=None):
-    """Build Step 7 with an explicit connector artifact handoff."""
+    """Build the final evaluation command with an explicit artifact handoff."""
     cmd = [
         sys.executable,
         "python/pipelines/blending_process/1_blend_evaluation.py",
@@ -259,30 +485,38 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
-    # ── Required ─────────────────────────────────────────────────────────
-    parser.add_argument("--model_single",   required=True,
-                        help="Name of the deterministic forecast model, e.g. 'aifs'. "
-                             "Overrides 'aifs' key in combine, connect, and blend specs.")
-    parser.add_argument("--model_ens",      required=True,
-                        help="Name of the ensemble forecast model, e.g. 'aifs_ens'. "
-                             "Overrides 'aifs_ens' key in combine, connect, and blend specs.")
+    # ── Forecast sources ─────────────────────────────────────────────────
+    parser.add_argument(
+        "--forecast",
+        action="append",
+        nargs=2,
+        metavar=("MODEL", "SPEC_ID"),
+        help=(
+            "Forecast model name and raw-data spec ID. Repeat once per source, "
+            "for example: --forecast aifs aifs_2026 --forecast ngcm ngcm_2026"
+        ),
+    )
 
-    parser.add_argument("--aifs_spec",      required=True,
-                        help="Spec ID for step 2: process aifs nc files, e.g. aifs")
-    parser.add_argument("--aifs_ens_spec",  required=True,
-                        help="Spec ID for step 3: process aifs_ens nc files, e.g. aifs_ens")
+    # Legacy two-slot interface. These remain supported but are mutually
+    # exclusive with --forecast.
+    parser.add_argument("--model_single",   default=None,
+                        help="Legacy deterministic forecast model name.")
+    parser.add_argument("--model_ens",      default=None,
+                        help="Legacy ensemble/second forecast model name.")
+    parser.add_argument("--aifs_spec",      default=None,
+                        help="Legacy raw-data spec for --model_single.")
+    parser.add_argument("--aifs_ens_spec",  default=None,
+                        help="Legacy raw-data spec for --model_ens.")
+
+    # ── Required pipeline specs and paths ────────────────────────────────
     parser.add_argument("--clim_spec",      required=True,
-                        help="Spec ID for step 4: build climatology, "
-                             "e.g. ref_rain_fixed_cutoff")
+                        help="Raw-data/climatology spec ID.")
     parser.add_argument("--combine_spec",   required=True,
-                        help="Spec ID for step 5: combine datasets, "
-                             "e.g. combine_template_fixed_cutoff")
+                        help="Combine-stage spec ID.")
     parser.add_argument("--connect_spec",   required=True,
-                        help="Spec ID for step 6: connect/prepare pipeline input, "
-                             "e.g. connect_fixed_cutoff")
+                        help="Connect-stage spec ID.")
     parser.add_argument("--blend_spec",     required=True,
-                        help="Spec ID for step 7: blend evaluation, "
-                             "e.g. cv_models_fixed_cutoff")
+                        help="Blend-evaluation spec ID.")
     parser.add_argument("--work_dir",       required=True,
                         help="Working directory for all intermediate files")
     parser.add_argument("--results_dir",    required=True,
@@ -292,17 +526,15 @@ def main():
 
     # ── yml field overrides ───────────────────────────────────────────────
     parser.add_argument("--aifs_nc_file",   default=None,
-                        help="Path to a specific aifs NetCDF file. Overrides both "
-                             "input.nc_folder and input.file_regex in the aifs spec. "
-                             "Takes priority over --aifs_nc_folder.")
+                        help="Legacy first-slot NetCDF-file override. Takes "
+                             "priority over --aifs_nc_folder.")
     parser.add_argument("--aifs_ens_nc_file", default=None,
-                        help="Path to a specific aifs_ens NetCDF file. Overrides both "
-                             "input.nc_folder and input.file_regex in the aifs_ens spec. "
-                             "Takes priority over --aifs_ens_nc_folder.")
+                        help="Legacy second-slot NetCDF-file override. Takes "
+                             "priority over --aifs_ens_nc_folder.")
     parser.add_argument("--aifs_nc_folder", default=None,
-                        help="Override input.nc_folder in the aifs spec yml")
+                        help="Legacy first-slot input.nc_folder override.")
     parser.add_argument("--aifs_ens_nc_folder", default=None,
-                        help="Override input.nc_folder in the aifs_ens spec yml")
+                        help="Legacy second-slot input.nc_folder override.")
     parser.add_argument("--gt_path",        default=None,
                         help="Path to historical ground truth wide pkl. Overrides "
                              "input.gt_path in the clim spec AND ground_truth_wide_rds "
@@ -322,169 +554,120 @@ def main():
                         help="Print commands without executing them")
     args = parser.parse_args()
 
+    try:
+        forecast_jobs = normalize_forecast_jobs(args)
+    except ValueError as exc:
+        parser.error(str(exc))
+
     # ── Derived paths ─────────────────────────────────────────────────────
     work_dir = args.work_dir
 
     os.makedirs(work_dir,      exist_ok=True)
     os.makedirs(args.results_dir, exist_ok=True)
 
-    # ── Patch aifs spec ───────────────────────────────────────────────────
-    aifs_spec = args.aifs_spec
-    if args.aifs_nc_file:
-        nc_file = os.path.abspath(args.aifs_nc_file)
-        aifs_spec = write_patched_spec(
-            args.aifs_spec, "raw_data",
-            [("input.nc_folder",  os.path.dirname(nc_file)),
-             ("input.file_regex", f"^{re.escape(os.path.basename(nc_file))}$"),
-             ("output.basename",  args.aifs_spec),
-             ("output.out_dir",   work_dir),]
-        )
-    elif args.aifs_nc_folder:
-        aifs_spec = write_patched_spec(
-            args.aifs_spec, "raw_data",
-            [("input.nc_folder",  args.aifs_nc_folder),
-             ("output.basename",  args.aifs_spec),
-             ("output.out_dir",   work_dir),]
+    # ── Resolve connect model entries and rainfall-horizon contracts ──────
+    cs_connect = load_yaml_spec(args.connect_spec, "2025_blend")
+    connect_entries = resolve_model_entries(
+        cs_connect.get("forecast_models"),
+        forecast_jobs,
+        "connect forecast_models",
+    )
+    probability_day_max = cs_connect.get("day_max")
+
+    # ── Patch one raw-data spec per forecast source ───────────────────────
+    for job in forecast_jobs:
+        raw_spec = load_yaml_spec(job.spec_id, "raw_data")
+        job.rain_day_max, job.rain_horizon_policy = reconcile_forecast_horizon(
+            raw_spec,
+            connect_entries[job.model],
+            job.model,
+            probability_day_max,
         )
 
-    # ── Patch aifs_ens spec ───────────────────────────────────────────────
-    aifs_ens_spec = args.aifs_ens_spec
-    if args.aifs_ens_nc_file:
-        nc_file = os.path.abspath(args.aifs_ens_nc_file)
-        aifs_ens_spec = write_patched_spec(
-            args.aifs_ens_spec, "raw_data",
-            [("input.nc_folder",  os.path.dirname(nc_file)),
-             ("input.file_regex", f"^{re.escape(os.path.basename(nc_file))}$"),
-             ("output.basename",  args.aifs_ens_spec),
-             ("output.out_dir",   work_dir),]
+        output = raw_spec.setdefault("output", {})
+        output["basename"] = job.spec_id
+        output["out_dir"] = work_dir
+
+        if job.nc_file:
+            nc_file = os.path.abspath(job.nc_file)
+            input_spec = raw_spec.setdefault("input", {})
+            input_spec["nc_folder"] = os.path.dirname(nc_file)
+            input_spec["file_regex"] = (
+                f"^{re.escape(os.path.basename(nc_file))}$"
+            )
+        elif job.nc_folder:
+            raw_spec.setdefault("input", {})["nc_folder"] = job.nc_folder
+
+        job.runtime_spec_id = write_temp_spec(
+            job.spec_id, "raw_data", raw_spec
         )
-    elif args.aifs_ens_nc_folder:
-        aifs_ens_spec = write_patched_spec(
-            args.aifs_ens_spec, "raw_data",
-            [("input.nc_folder",  args.aifs_ens_nc_folder),
-             ("output.basename",  args.aifs_ens_spec),
-             ("output.out_dir",   work_dir),]
+        job.artifact_path = os.path.join(
+            work_dir, f"{job.spec_id}_wide.pkl"
         )
 
     # ── Patch clim spec (also used for step 1: process IMD nc files) ─────
-    clim_spec = args.clim_spec
-
     clim_patches = [
         ("output.out_dir",             work_dir),
         ("paths.climatology_out_dir",  work_dir),
         ("output.basename",            args.clim_spec),
-        ("input.gt_path",              args.gt_path or os.path.join(work_dir, f"{args.clim_spec}_wide.pkl")),
+        (
+            "input.gt_path",
+            args.gt_path
+            or os.path.join(work_dir, f"{args.clim_spec}_wide.pkl"),
+        ),
     ]
     clim_spec = write_patched_spec(args.clim_spec, "raw_data", clim_patches)
 
     # ── Patch combine spec ────────────────────────────────────────────────
     # Read clim spec for climatology output filenames
-    aifs_pkl     = os.path.join(work_dir, f"{args.aifs_spec}_wide.pkl")
-    aifs_ens_pkl = os.path.join(work_dir, f"{args.aifs_ens_spec}_wide.pkl")
+    clim_spec_raw = load_yaml_spec(args.clim_spec, "raw_data")
+    clim_rds = os.path.join(
+        work_dir,
+        clim_spec_raw["climatologies"]["clim"]["out_stem"] + ".pkl",
+    )
+    clim_unc_rds = os.path.join(
+        work_dir,
+        clim_spec_raw["climatologies"]["clim_unc"]["out_stem"] + ".pkl",
+    )
 
-    clim_spec_raw_path = os.path.join("specs", "raw_data", f"{args.clim_spec}.yml")
-    with open(clim_spec_raw_path) as f:
-        clim_spec_raw = yaml.safe_load(f)
-    clim_rds     = os.path.join(work_dir, clim_spec_raw["climatologies"]["clim"]["out_stem"]     + ".pkl")
-    clim_unc_rds = os.path.join(work_dir, clim_spec_raw["climatologies"]["clim_unc"]["out_stem"] + ".pkl")
-
-    combine_spec_path = os.path.join("specs", "combine", f"{args.combine_spec}.yml")
-    with open(combine_spec_path) as f:
-        cs = yaml.safe_load(f)
+    cs = load_yaml_spec(args.combine_spec, "combine")
 
     cs["output"]["out_dir"]                           = work_dir
     cs["output"]["basename"]                          = args.combine_spec
     cs["input"]["climatologies"]["clim"]["rds"]       = clim_rds
     cs["input"]["climatologies"]["clim_unc"]["rds"]   = clim_unc_rds
-    configure_forecast_source(
-        cs["forecasts"], args.model_ens, "aifs_ens", aifs_ens_pkl
-    )
-    configure_forecast_source(
-        cs["forecasts"], args.model_single, "aifs", aifs_pkl
-    )
+    for job in forecast_jobs:
+        configure_forecast_source(
+            cs.get("forecasts"),
+            job.model,
+            job.template_name,
+            job.artifact_path,
+        )
 
     if args.gt_path:
         cs["input"]["ground_truth_wide_rds"] = args.gt_path
 
-    combine_spec_op      = f"{args.combine_spec}_op"
-    combine_spec_op_path = os.path.join("specs", "combine", f"{combine_spec_op}.yml")
-    with open(combine_spec_op_path, "w") as f:
-        yaml.dump(cs, f, default_flow_style=False, allow_unicode=True)
-    _temp_spec_files.append(combine_spec_op_path)
-    combine_spec = combine_spec_op
-    log(f"Patched spec written: {combine_spec_op_path}")
+    combine_spec = write_temp_spec(args.combine_spec, "combine", cs)
 
     # ── Patch connect spec ────────────────────────────────────────────────
     combine_basename   = f"{args.combine_spec}_combined_wide.pkl"
     connect_input_rds  = os.path.join(work_dir, combine_basename)
     connect_output_rds = resolve_connector_artifact(work_dir, args.blend_input)
 
-    connect_spec_path = os.path.join("specs", "2025_blend", f"{args.connect_spec}.yml")
-    with open(connect_spec_path) as f:
-        cs_connect = yaml.safe_load(f)
-
     cs_connect["input_rds"]  = connect_input_rds
     cs_connect["output_rds"] = connect_output_rds
 
-    for entry in cs_connect["forecast_models"]:
-        if entry["name"] == "aifs_ens":
-            entry["name"] = args.model_ens
-        elif entry["name"] == "aifs":
-            entry["name"] = args.model_single
-
-    connect_spec_op      = f"{args.connect_spec}_op"
-    connect_spec_op_path = os.path.join("specs", "2025_blend", f"{connect_spec_op}.yml")
-    with open(connect_spec_op_path, "w") as f:
-        yaml.dump(cs_connect, f, default_flow_style=False, allow_unicode=True)
-    _temp_spec_files.append(connect_spec_op_path)
-    connect_spec = connect_spec_op
-    log(f"Patched spec written: {connect_spec_op_path}")
+    connect_spec = write_temp_spec(args.connect_spec, "2025_blend", cs_connect)
 
     # ── Patch blend spec ──────────────────────────────────────────────────
-    blend_spec_path = os.path.join("specs", "2025_blend", f"{args.blend_spec}.yml")
-    with open(blend_spec_path) as f:
-        cs_blend = yaml.safe_load(f)
-
-    # pipeline_input_dir and pipeline_output_dir are used by 1_blend_evaluation.py
-#    cs_blend["run"]["pipeline_input_dir"]  = work_dir
-#    cs_blend["run"]["pipeline_output_dir"] = args.results_dir
-
-    # rename in mme.blend_models list
-    for entry in cs_blend.get("mme", {}).get("blend_models", []):
-        if entry["name"] == "aifs_ens":
-            entry["name"] = args.model_ens
-        elif entry["name"] == "aifs":
-            entry["name"] = args.model_single
-
-    # rename in extras.forecasts list
-    for entry in cs_blend.get("extras", {}).get("forecasts", []):
-        if entry["name"] == "aifs_ens":
-            entry["name"] = args.model_ens
-        elif entry["name"] == "aifs":
-            entry["name"] = args.model_single
-
-    # substitute model names in formula text
-    for model_name, formula in cs_blend["models"]["formulas"].items():
-        if formula.get("enabled"):
-            formula["text"] = (
-                formula["text"]
-                .replace("diff_aifs_ens_qx", f"diff_{args.model_ens}_qx")
-                .replace("diff_aifs_qx",     f"diff_{args.model_single}_qx")
-            )
-
-    blend_spec_op      = f"{args.blend_spec}_op"
-    blend_spec_op_path = os.path.join("specs", "2025_blend", f"{blend_spec_op}.yml")
-    with open(blend_spec_op_path, "w") as f:
-        yaml.dump(cs_blend, f, default_flow_style=False, allow_unicode=True)
-    _temp_spec_files.append(blend_spec_op_path)
-    blend_spec = blend_spec_op
-    log(f"Patched spec written: {blend_spec_op_path}")
+    cs_blend = load_yaml_spec(args.blend_spec, "2025_blend")
+    configure_blend_spec_models(cs_blend, forecast_jobs)
+    validate_blend_spec_models(cs_blend, forecast_jobs)
+    blend_spec = write_temp_spec(args.blend_spec, "2025_blend", cs_blend)
 
     # ── Expected output paths ─────────────────────────────────────────────
     ref_rain_pkl     = os.path.join(work_dir, f"{args.clim_spec}_wide.pkl")
     connect_pkl = connect_output_rds
-
-    TOTAL = 7
 
     # ── Build steps list ──────────────────────────────────────────────────
     blend_eval_cmd = build_blend_eval_cmd(
@@ -495,6 +678,31 @@ def main():
         cores=args.cores,
     )
 
+    forecast_steps = []
+    for step_num, job in enumerate(forecast_jobs, start=2):
+        runtime_spec_id = job.runtime_spec_id
+        artifact_path = job.artifact_path
+        if runtime_spec_id is None or artifact_path is None:
+            raise RuntimeError(
+                f"Forecast job {job.model!r} has not been fully configured."
+            )
+        forecast_steps.append((
+            step_num,
+            f"Process {job.model} nc files",
+            [
+                sys.executable,
+                "python/pipelines/prepare_data/1_process_raw_nc_files.py",
+                "--spec_id", runtime_spec_id,
+            ],
+            artifact_path,
+        ))
+
+    climatology_step = len(forecast_jobs) + 2
+    combine_step = climatology_step + 1
+    connect_step = combine_step + 1
+    blend_step = connect_step + 1
+    total_steps = blend_step
+
     steps = [
         (1, "Process IMD ground truth nc files", [
             sys.executable,
@@ -502,37 +710,27 @@ def main():
             "--spec_id", clim_spec,
         ], ref_rain_pkl),
 
-        (2, f"Process {args.model_single} nc files", [
-            sys.executable,
-            "python/pipelines/prepare_data/1_process_raw_nc_files.py",
-            "--spec_id", aifs_spec,
-        ], aifs_pkl),
+        *forecast_steps,
 
-        (3, f"Process {args.model_ens} nc files", [
-            sys.executable,
-            "python/pipelines/prepare_data/1_process_raw_nc_files.py",
-            "--spec_id", aifs_ens_spec,
-        ], aifs_ens_pkl),
-
-        (4, "Build climatology", [
+        (climatology_step, "Build climatology", [
             sys.executable,
             "python/pipelines/prepare_data/2_build_climatology.py",
             "--spec_id", clim_spec,
         ], clim_rds),
 
-        (5, "Combine datasets", [
+        (combine_step, "Combine datasets", [
             sys.executable,
             "python/pipelines/prepare_data/3_combine_datasets.py",
             "--spec_id", combine_spec,
         ], None),
 
-        (6, "Connect/prepare pipeline input", [
+        (connect_step, "Connect/prepare pipeline input", [
             sys.executable,
             "python/pipelines/blending_process/0_connect_prepare_data_to_2025_pipeline.py",
             "--spec_id", connect_spec,
         ], connect_pkl),
 
-        (7, "Blend evaluation", blend_eval_cmd, None),
+        (blend_step, "Blend evaluation", blend_eval_cmd, None),
     ]
 
     # ── Run ───────────────────────────────────────────────────────────────
@@ -540,14 +738,22 @@ def main():
     log(f"Work dir    : {work_dir}")
     log(f"Results dir : {args.results_dir}")
     log(f"Connector → evaluator artifact: {connect_output_rds}")
-    if args.aifs_nc_file:
-        log(f"aifs nc_file override        : {args.aifs_nc_file}")
-    elif args.aifs_nc_folder:
-        log(f"aifs nc_folder override      : {args.aifs_nc_folder}")
-    if args.aifs_ens_nc_file:
-        log(f"aifs_ens nc_file override    : {args.aifs_ens_nc_file}")
-    elif args.aifs_ens_nc_folder:
-        log(f"aifs_ens nc_folder override  : {args.aifs_ens_nc_folder}")
+    log("Forecast sources:")
+    for job in forecast_jobs:
+        if job.rain_day_max is None:
+            horizon = "legacy"
+        else:
+            horizon = (
+                f"{job.rain_day_max} days ({job.rain_horizon_policy})"
+            )
+        log(
+            f"  {job.model}: spec={job.spec_id}, artifact={job.artifact_path}, "
+            f"rain_horizon={horizon}"
+        )
+        if job.nc_file:
+            log(f"    nc_file override   : {job.nc_file}")
+        elif job.nc_folder:
+            log(f"    nc_folder override : {job.nc_folder}")
     if args.gt_path:
         log(f"gt_path override (clim+combine): {args.gt_path}")
     if args.skip_to > 1:
@@ -560,14 +766,17 @@ def main():
 
     for step_num, name, cmd, expected_output in steps:
         if step_num < args.skip_to:
-            log(f"── Step {step_num}/{TOTAL}: {name} [SKIPPED] ──")
+            log(f"── Step {step_num}/{total_steps}: {name} [SKIPPED] ──")
             continue
 
         if args.stop_at is not None and step_num > args.stop_at:
-            log(f"── Step {step_num}/{TOTAL}: {name} [SKIPPED — stop_at={args.stop_at}] ──")
+            log(
+                f"── Step {step_num}/{total_steps}: {name} "
+                f"[SKIPPED — stop_at={args.stop_at}] ──"
+            )
             continue
 
-        run_step(step_num, TOTAL, name, cmd, expected_output, args.dry_run)
+        run_step(step_num, total_steps, name, cmd, expected_output, args.dry_run)
 
     if not args.dry_run:
         log(f"Pipeline complete.")

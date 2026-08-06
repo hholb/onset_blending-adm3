@@ -591,6 +591,16 @@ def nc_read_forecast_wide(nc_path, var_name, dim_rename_map, spec,
             )
 
         day_vals = dim_vals[dim_names[day_idx]]
+        day_vals_num = []
+        for dv in day_vals:
+            try:
+                day_vals_num.append(int(dv))
+            except (TypeError, ValueError):
+                day_vals_num.append(None)
+
+        min_day = spec.get("options", {}).get("min_day")
+        max_day = spec.get("options", {}).get("max_day")
+
         strict_rain_day_max = spec.get("options", {}).get("rain_day_max")
         if strict_rain_day_max is not None:
             _, horizon_policy = resolve_rain_day_max(
@@ -602,21 +612,17 @@ def nc_read_forecast_wide(nc_path, var_name, dim_rename_map, spec,
                 },
                 probability_day_max=1,
             )
+            validation_day_vals = [
+                value for value, day in zip(day_vals, day_vals_num)
+                if day is not None and (min_day is None or day >= int(min_day))
+            ]
             validate_day_coordinate(
-                day_vals,
+                validation_day_vals,
                 strict_rain_day_max,
                 context=f"NetCDF file {os.path.basename(nc_path)}",
                 allow_extra=horizon_policy == "truncate",
             )
-        day_vals_num = []
-        for dv in day_vals:
-            try:
-                day_vals_num.append(int(dv))
-            except (TypeError, ValueError):
-                day_vals_num.append(None)
 
-        min_day = spec.get("options", {}).get("min_day")
-        max_day = spec.get("options", {}).get("max_day")
         keep = np.ones(len(day_vals), dtype=bool)
         if min_day is not None:
             keep &= np.array([(x is not None and x >= int(min_day)) for x in day_vals_num])
