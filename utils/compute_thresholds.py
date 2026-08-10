@@ -35,6 +35,7 @@ import pandas as pd
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from python.prepare_data.onset_utils import threshold_quantile_accumulation
+from python.prepare_data.spatial_id_utils import ensure_spatial_id_col
 
 
 def _md_to_doy_mask(times, season_start, season_end):
@@ -70,6 +71,12 @@ def main():
     p = argparse.ArgumentParser(description="Compute per-unit onset thresholds from a rule.")
     p.add_argument("--long-csv", required=True, help="Tidy daily rainfall CSV.")
     p.add_argument("--id-col", default="adm3_name", help="Unit id column (default adm3_name).")
+    p.add_argument("--lat-col", default="lat", help="Latitude column used when --id-col is absent.")
+    p.add_argument("--lon-col", default="lon", help="Longitude column used when --id-col is absent.")
+    p.add_argument("--grid-id-decimal-digits", type=int, default=None,
+                   help="Optional explicit decimal precision for generated grid IDs.")
+    p.add_argument("--grid-id-format", choices=("trimmed", "fixed"), default=None,
+                   help="Generated grid-ID number format (requires explicit digits).")
     p.add_argument("--value-col", default="precip", help="Rainfall column (default precip).")
     p.add_argument("--window", type=int, required=True, help="Accumulation window (days).")
     p.add_argument("--q", type=float, required=True, help="Quantile in [0,1], e.g. 0.9.")
@@ -78,13 +85,32 @@ def main():
     p.add_argument("--out", required=True, help="Output thresholds CSV path.")
     args = p.parse_args()
 
-    long_df = pd.read_csv(args.long_csv)
-    for c in (args.id_col, "time", args.value_col):
+    long_df = pd.read_csv(args.long_csv, dtype=str)
+    id_col = args.id_col
+    if id_col not in long_df.columns and {
+        args.lat_col, args.lon_col
+    }.issubset(long_df.columns):
+        long_df = long_df.rename(
+            columns={args.lat_col: "lat", args.lon_col: "lon"}
+        )
+        geometry = {}
+        if args.grid_id_decimal_digits is not None:
+            geometry["grid_id_decimal_digits"] = args.grid_id_decimal_digits
+        if args.grid_id_format is not None:
+            geometry["grid_id_format"] = args.grid_id_format
+        long_df = ensure_spatial_id_col(
+            long_df,
+            spec={"geometry": geometry},
+            context="threshold-builder grid IDs",
+        )
+        id_col = "id"
+
+    for c in (id_col, "time", args.value_col):
         if c not in long_df.columns:
             raise SystemExit(f"Input missing required column '{c}'. Found: {long_df.columns.tolist()}")
 
     out = compute_thresholds(
-        long_df, args.id_col, args.value_col, args.window, args.q,
+        long_df, id_col, args.value_col, args.window, args.q,
         season_start=args.season_start, season_end=args.season_end,
     )
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)

@@ -15,6 +15,7 @@ from sklearn.metrics import roc_auc_score
 from scipy.special import logit, expit
 
 from ..pipelines._shared.misc import interval_bins, rps_bins, assign_lead_bin
+from ..prepare_data.spatial_id_utils import ensure_spatial_id_col
 
 # Default 4-week layout; the functions below accept n_bins / explicit bins to
 # generalize to any number of forecast bins.
@@ -62,19 +63,7 @@ def ensure_id(df):
 
     Raises if none of those are available.
     """
-    if "id" in df.columns:
-        return df
-    df = df.copy()
-    if "adm3_name" in df.columns:
-        df["id"] = df["adm3_name"].astype(str).str.strip()
-    elif "lat" in df.columns and "lon" in df.columns:
-        df["id"] = df["lat"].astype(str) + "_" + df["lon"].astype(str)
-    else:
-        raise ValueError(
-            "Cannot build 'id': need one of 'id', 'adm3_name', or 'lat'+'lon'. "
-            f"Found columns: {df.columns.tolist()}"
-        )
-    return df
+    return ensure_spatial_id_col(df, context="evaluation spatial IDs")
 
 
 def read_onsets(path):
@@ -83,7 +72,7 @@ def read_onsets(path):
     """
     if not os.path.exists(path):
         raise FileNotFoundError(f"Onset file missing: {path}")
-    df = pd.read_csv(path)
+    df = pd.read_csv(path, dtype=str)
     df["true_onset"] = pd.to_datetime(
         df["true_onset"].astype(str).replace("NaT", pd.NA),
         errors="coerce",

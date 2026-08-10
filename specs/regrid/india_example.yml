@@ -18,6 +18,11 @@ geometry:
   crs: EPSG:4326                 # grid CRS; the shapefile is reprojected to this
   grid_lat_var: latitude         # optional (auto-detected: latitude/lat)
   grid_lon_var: longitude
+  # Optional grid-cell ID contract (only relevant without a shapefile).
+  # Existing supplied weight IDs take precedence; otherwise these values are
+  # used, or a collision-free precision is inferred when they are omitted.
+  # grid_id_decimal_digits: 2
+  # grid_id_format: fixed         # fixed or trimmed
 
 # Restrict/renormalize each unit to the cells that actually have ground-truth
 # data, and apply that same footprint to the forecasts (default true). Set false

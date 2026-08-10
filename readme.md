@@ -415,7 +415,7 @@ Each variant has its own connect and CV spec in `specs/2025_blend/`.
 ## Domain / spatial filtering
 
 The modelling domain is set in the raw-data spec's `filter:` block, with two composable restrictions:
-- **`dissemination_cells_file`** — a CSV of `adm3_name` values; keeps only those units (the base domain).
+- **`dissemination_cells_file`** — a CSV keyed by configured `filter.id_col`, `id`, legacy `adm3_name`, or separate `lat`/`lon`; keeps only those units (the base domain).
 - **`bbox`** — an optional *further* restriction `{lat_min, lat_max, lon_min, lon_max}` (any subset of keys), applied on top. Defaults to no bbox restriction (all dissemination cells). Unit lat/lon is taken from `lat`/`lon` columns, an id of the form `<lat>_<lon>` (grid-cell units), or a `filter.centroids_file` (`adm3_name` + lat/lon). For admin (shapefile) units, the regrid step (0) writes a suitable centroids CSV automatically — set `filter.centroids_file` to that file.
 
 ---
@@ -524,7 +524,9 @@ The core pipeline keys on an abstract `id` and never touches lat/lon, so moving 
 3. drops the no-data cells and renormalizes each unit's weights to **sum to 1** (a conservative area-weighted average over only the cells with data);
 4. applies that footprint to **both the ground truth and every forecast family**, so forecast and ground truth share one spatial footprint.
 
-**Target units** are set by the spec: with a `geometry.shapefile` the target is the shapefile's admin (political) units; **without a geometry block** the target is the **ground-truth grid cells** themselves (id `"<lat>_<lon>"`), i.e. forecasts are regridded to match the ground-truth grid. **Different forecast grids:** if a forecast's grid matches the ground truth it reuses the same weights; if it differs, it is regridded onto "the unit **minus** the parts where ground-truth data didn't exist" (unit ∩ coverage).
+**Target units** are set by the spec: with a `geometry.shapefile` the target is the shapefile's admin (political) units; **without `geometry.shapefile`** the target is the **ground-truth grid cells** themselves (id `"<lat>_<lon>"`), i.e. forecasts are regridded to match the ground-truth grid. **Different forecast grids:** if a forecast's grid matches the ground truth it reuses the same weights; if it differs, it is regridded onto "the unit **minus** the parts where ground-truth data didn't exist" (unit ∩ coverage).
+
+For grid-cell targets, an existing weight-table ID convention is authoritative. Otherwise set `geometry.grid_id_decimal_digits` and optionally `geometry.grid_id_format: fixed|trimmed`; if neither is supplied, the pipeline infers the least precise collision-free convention from the coordinates. The same formatter is used for raw data, lat/lon threshold tables, and dissemination-cell inputs.
 
 **`clip_to_coverage`** (default **true**) toggles steps 2–4; set it false for a plain per-dataset regrid (the older woreda behavior, where `remap_nc` renormalizes over non-NaN cells per timestep with no shared footprint). This step supersedes the standalone `utils/remap.py` / `remap_weights*.py` weight-builders.
 

@@ -57,6 +57,10 @@ from python.prepare_data.geometry_utils import (
     grids_equal, build_coverage_geom, coverage_missing_fraction,
     build_weights_to_coverage, build_grid_cell_units, unit_centroids, CANON_REGION_KEY,
 )
+from python.prepare_data.spatial_id_utils import (
+    ensure_spatial_id_col,
+    resolve_grid_id_convention,
+)
 from utils.remap_nc import batch_aggregate_to_adm3_matrix
 
 _QLABELS = ["min", "p05", "p25", "p50", "p75", "p95", "max"]
@@ -73,15 +77,36 @@ def _list_nc(folder, regex):
     )
 
 
-def _read_dissemination_ids(path):
+def _read_dissemination_ids(path, spec=None, convention=None):
     if not path:
         return None
     if not os.path.exists(path):
         print(f"[regrid] WARNING: dissemination_cells_file not found: {path}")
         return None
-    dc = pd.read_csv(path)
-    col = "adm3_name" if "adm3_name" in dc.columns else dc.columns[0]
-    return set(dc[col].astype(str).str.strip())
+    dc = pd.read_csv(path, dtype=str)
+    configured_id_col = (spec or {}).get("dissemination_id_col")
+    if configured_id_col:
+        if configured_id_col not in dc.columns:
+            raise ValueError(
+                f"dissemination_id_col '{configured_id_col}' not found. "
+                f"Found: {dc.columns.tolist()}"
+            )
+        dc = dc.rename(columns={configured_id_col: "id"})
+    elif not any(column in dc.columns for column in ("id", "adm3_name")) \
+            and not {"lat", "lon"}.issubset(dc.columns):
+        fallback_col = dc.columns[0]
+        print(
+            "[regrid] WARNING: dissemination file has no explicit spatial key; "
+            f"using first column '{fallback_col}' as a legacy fallback."
+        )
+        dc = dc.rename(columns={fallback_col: "id"})
+    dc = ensure_spatial_id_col(
+        dc,
+        spec=spec,
+        convention=convention,
+        context="regrid dissemination IDs",
+    )
+    return set(dc["id"])
 
 
 def write_coverage_report(missing_df, dissem_ids, out_path, eps=1e-6):
@@ -146,15 +171,41 @@ def main(spec_id):
     if need_compute:
         if not gt.get("value_col"):
             raise ValueError("ground_truth.value_col is required when weights are computed.")
-        valid = grid_valid_cells(gt_files, gt["value_col"], cfg.get("grid_lat_var"), cfg.get("grid_lon_var"))
         gt_lats, gt_lons = grid_coords_of(gt_files[0], cfg)
+        grid_id_convention = None
+        if not cfg.get("shapefile"):
+            established_target_ids = None
+            if gt_win:
+                existing_weights = pd.read_csv(
+                    gt_win, usecols=[CANON_REGION_KEY], dtype=str
+                )
+                established_target_ids = existing_weights[CANON_REGION_KEY]
+            grid_id_convention = resolve_grid_id_convention(
+                spec=cfg,
+                lat=np.repeat(gt_lats, len(gt_lons)),
+                lon=np.tile(gt_lons, len(gt_lats)),
+                authoritative_ids=established_target_ids,
+                context="ground-truth grid",
+            )
+        valid = grid_valid_cells(gt_files, gt["value_col"], cfg.get("grid_lat_var"), cfg.get("grid_lon_var"))
         coverage = build_coverage_geom(valid, get_half_delta(gt_lats), get_half_delta(gt_lons))
         if cfg.get("shapefile"):
             units = load_admin_geometry(cfg)
             mode = f"shapefile ({os.path.basename(cfg['shapefile'])})"
         else:
-            units = build_grid_cell_units(gt_files[0], cfg, valid_cells=(valid if clip else None))
+            units = build_grid_cell_units(
+                gt_files[0],
+                cfg,
+                valid_cells=(valid if clip else None),
+                convention=grid_id_convention,
+            )
             mode = "ground-truth grid cells (no shapefile)"
+            print(
+                "[regrid] grid ID convention: "
+                f"digits={grid_id_convention.decimal_digits}, "
+                f"format={grid_id_convention.number_format} "
+                f"({grid_id_convention.source})"
+            )
         print(f"[regrid] target units: {mode} | clip_to_coverage={clip}")
 
     # --- Ground-truth weights (supplied or computed) ---
@@ -193,7 +244,11 @@ def main(spec_id):
     # --- Missing-fraction diagnostics (only when geometry was computed) ---
     if coverage is not None and units is not None:
         missing_df = coverage_missing_fraction(units, coverage)
-        dissem_ids = _read_dissemination_ids(spec.get("dissemination_cells_file"))
+        dissem_ids = _read_dissemination_ids(
+            spec.get("dissemination_cells_file"),
+            spec=spec,
+            convention=grid_id_convention,
+        )
         report_out = spec.get("report_out") or os.path.join(ref_dir, f"regrid_coverage_report_{spec_id}.csv")
         rows, per_unit = write_coverage_report(missing_df, dissem_ids, report_out)
         print(f"[regrid] coverage report: {report_out} (per-unit: {per_unit})")

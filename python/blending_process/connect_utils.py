@@ -29,6 +29,7 @@ from scipy.special import logit, expit
 from ..pipelines._shared.misc import coalesce, assign_lead_bin
 from ..pipelines._shared.read_spec import load_spec
 from ..prepare_data.onset_utils import read_onset_params
+from ..prepare_data.spatial_id_utils import ensure_spatial_id_col
 from ..rain_horizon_utils import (
     resolve_rain_day_max,
     validate_rain_horizon_frame,
@@ -297,14 +298,9 @@ def make_cv_rds_from_daylevel(spec):
     if not isinstance(raw, pd.DataFrame):
         raw = pd.DataFrame(raw)
 
-    if "id" not in raw.columns:
-        if "adm3_name" in raw.columns:
-            raw = raw.copy()
-            raw["id"] = raw["adm3_name"].astype(str)
-        else:
-            raise ValueError("Expected an 'id' column (adm3_name string).")
-
-    raw = raw.copy()
+    raw = ensure_spatial_id_col(
+        raw, spec=spec, context="connector spatial IDs"
+    )
     raw["time"] = pd.to_datetime(raw["time"]).dt.date
     raw["year"] = pd.to_datetime(raw["time"]).dt.year
 

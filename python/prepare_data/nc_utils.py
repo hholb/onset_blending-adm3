@@ -33,6 +33,14 @@ from .onset_utils import (
     roll_sum_na_rm_left, roll_sum_na_propagate_left,
     find_onset_precomp,
 )
+from .spatial_id_utils import (
+    GridIdConvention,
+    ensure_spatial_id_col,
+    format_grid_ids,
+    normalize_id_series,
+    resolve_grid_id_convention,
+    validate_expected_source_ids,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -256,54 +264,62 @@ def nc_time_to_dates(time_num, time_units):
 # ---------------------------------------------------------------------------
 
 def _format_coord_component(value):
-    """Format a coordinate like R's format(..., scientific=FALSE, trim=TRUE)."""
+    """Format one coordinate for callers of the former private helper."""
     value = float(value)
     if not np.isfinite(value):
         return None
     return np.format_float_positional(value, trim="-")
 
 
-def _latlon_ids(lat, lon):
-    ids = []
-    for la, lo in zip(lat, lon):
-        la_s = _format_coord_component(la)
-        lo_s = _format_coord_component(lo)
-        ids.append(f"{la_s}_{lo_s}" if la_s is not None and lo_s is not None else None)
-    return ids
+def _latlon_ids(lat, lon, spec=None, convention=None):
+    convention = convention or resolve_grid_id_convention(
+        spec=spec, lat=lat, lon=lon, context="latitude/longitude IDs"
+    )
+    return format_grid_ids(lat, lon, convention)
 
-def ensure_id_col(df, id_col="id"):
+def ensure_id_col(df, id_col="id", spec=None, convention=None,
+                  force_latlon=False, context="spatial data"):
     """
     Ensure the DataFrame has an `id` column.
     For adm3-based data, rename `adm3_name` to `id`. For legacy gridded data,
     construct the same `<lat>_<lon>` key used by the R pipeline.
     """
-    df = df.copy()
-    if id_col in df.columns:
-        return df
-    if "adm3_name" in df.columns:
-        df[id_col] = df["adm3_name"].astype(str)
-    elif "lat" in df.columns and "lon" in df.columns:
-        df[id_col] = _latlon_ids(df["lat"].values, df["lon"].values)
-    else:
-        raise ValueError(
-            "Cannot create id column: need 'id', 'adm3_name', or both 'lat' and 'lon'."
-        )
-    return df
+    return ensure_spatial_id_col(
+        df,
+        id_col=id_col,
+        spec=spec,
+        convention=convention,
+        force_latlon=force_latlon,
+        context=context,
+    )
 
 
 # Keep the old name as an alias so callers that import it directly still work.
-def add_id_from_latlon(df, lat_col="lat", lon_col="lon", id_col="id"):
+def add_id_from_latlon(df, lat_col="lat", lon_col="lon", id_col="id",
+                       spec=None, convention=None):
     """Backward-compatible explicit lat/lon-to-id helper."""
     if id_col in df.columns:
         return df.copy()
     if lat_col not in df.columns or lon_col not in df.columns:
-        return ensure_id_col(df, id_col=id_col)
+        return ensure_id_col(df, id_col=id_col, spec=spec,
+                             convention=convention)
     out = df.copy()
-    out[id_col] = _latlon_ids(out[lat_col].values, out[lon_col].values)
+    coords = out[[lat_col, lon_col]].rename(
+        columns={lat_col: "lat", lon_col: "lon"}
+    )
+    coords = ensure_spatial_id_col(
+        coords,
+        id_col=id_col,
+        spec=spec,
+        convention=convention,
+        force_latlon=True,
+        context="latitude/longitude IDs",
+    )
+    out[id_col] = coords[id_col].to_numpy()
     return out
 
 
-def prep_thresholds_id(thr_df):
+def prep_thresholds_id(thr_df, spec=None, convention=None):
     """
     Normalize thresholds DataFrame to be keyed by id (adm3_name).
 
@@ -322,20 +338,30 @@ def prep_thresholds_id(thr_df):
     thr_df.columns = thr_df.columns.str.lower()
     if "id" not in thr_df.columns:
         if "adm3_name" in thr_df.columns:
-            thr_df["id"] = thr_df["adm3_name"].astype(str)
+            thr_df["id"] = normalize_id_series(
+                thr_df["adm3_name"], context="threshold IDs"
+            )
         elif "lat" in thr_df.columns and "lon" in thr_df.columns:
-            thr_df = add_id_from_latlon(thr_df)
+            thr_df = add_id_from_latlon(
+                thr_df, spec=spec, convention=convention
+            )
         else:
             raise ValueError(
                 "Thresholds table must have 'id', 'adm3_name', or ('lat', 'lon')."
             )
+    thr_df["id"] = normalize_id_series(thr_df["id"], context="threshold IDs")
     thr_df["onset_thresh"] = thr_df["onset_thresh"].astype(float)
     return thr_df[["id", "onset_thresh"]].drop_duplicates().set_index("id")
 
 
-def attach_thresholds_id(df, thr_df):
+def attach_thresholds_id(df, thr_df, spec=None, convention=None):
     """Left-join onset_thresh from thr_df by id."""
-    df = ensure_id_col(df)
+    df = ensure_id_col(df, spec=spec, convention=convention)
+    convention = convention or resolve_grid_id_convention(
+        spec=spec,
+        authoritative_ids=df["id"],
+        context="rainfall/threshold ID handoff",
+    )
     if thr_df is None:
         df["onset_thresh"] = np.nan
         return df
@@ -343,7 +369,7 @@ def attach_thresholds_id(df, thr_df):
     if isinstance(thr_df, (int, float, np.floating, np.integer)):
         df["onset_thresh"] = float(thr_df)
         return df
-    thr_idx = prep_thresholds_id(thr_df)
+    thr_idx = prep_thresholds_id(thr_df, spec=spec, convention=convention)
     if isinstance(thr_idx, (int, float)):
         df["onset_thresh"] = float(thr_idx)
         return df
@@ -376,14 +402,24 @@ def _resolve_unit_latlon(df, filt):
     if cf:
         if not os.path.exists(cf):
             raise FileNotFoundError(f"filter.centroids_file not found: {cf}")
-        c = pd.read_csv(cf)
-        keyc = "adm3_name" if "adm3_name" in c.columns else c.columns[0]
+        c = pd.read_csv(cf, dtype=str)
+        keyc = filt.get("centroids_id_col")
+        if keyc and keyc not in c.columns:
+            raise ValueError(
+                f"filter.centroids_id_col '{keyc}' not found. "
+                f"Found: {c.columns.tolist()}"
+            )
+        if not keyc:
+            keyc = next(
+                (x for x in ("id", "adm3_name") if x in c.columns),
+                c.columns[0],
+            )
         latc = next((x for x in ("lat", "center_lat", "latitude") if x in c.columns), None)
         lonc = next((x for x in ("lon", "center_lon", "longitude") if x in c.columns), None)
         if not latc or not lonc:
             raise ValueError("filter.centroids_file must have lat/lon (or center_lat/center_lon).")
         c = c.rename(columns={keyc: "id", latc: "_lat", lonc: "_lon"})
-        c["id"] = c["id"].astype(str).str.strip()
+        c["id"] = normalize_id_series(c["id"], context="centroid IDs")
         m = df[["id"]].merge(c[["id", "_lat", "_lon"]].drop_duplicates("id"), on="id", how="left")
         return m["_lat"].astype(float).values, m["_lon"].astype(float).values
 
@@ -425,8 +461,8 @@ def filter_by_dissemination_cells(df, spec):
     Restrict the domain to the modelling units of interest. Two independent,
     composable restrictions read from spec['filter']:
 
-      - dissemination_cells_file : keep only ids listed in that CSV's adm3_name
-        column (the base domain when set).
+      - dissemination_cells_file : keep only ids listed in a configured `id_col`,
+        canonical `id`, legacy `adm3_name`, or `lat`/`lon` columns.
       - bbox : an optional FURTHER restriction {lat_min, lat_max, lon_min,
         lon_max} (any subset of keys), applied on top of the dissemination set.
         Defaults to no bbox restriction (i.e. all dissemination cells).
@@ -434,19 +470,44 @@ def filter_by_dissemination_cells(df, spec):
     Returns df unchanged if neither is configured.
     """
     filt = spec.get("filter") or {}
-    df = ensure_id_col(df)
+    df = ensure_id_col(df, spec=spec, context="rainfall spatial IDs")
 
     dc_file = filt.get("dissemination_cells_file")
     if dc_file:
         if not os.path.exists(dc_file):
             raise FileNotFoundError(f"dissemination_cells_file not found: {dc_file}")
-        dc = pd.read_csv(dc_file)
-        if "adm3_name" not in dc.columns:
-            raise ValueError(
-                f"dissemination_cells_file must contain an 'adm3_name' column. "
-                f"Found: {dc.columns.tolist()}"
+        dc = pd.read_csv(dc_file, dtype=str)
+        configured_id_col = filt.get("id_col") or filt.get(
+            "dissemination_id_col"
+        )
+        if configured_id_col:
+            if configured_id_col not in dc.columns:
+                raise ValueError(
+                    f"Configured dissemination id_col '{configured_id_col}' "
+                    f"not found. Found: {dc.columns.tolist()}"
+                )
+            dc = dc.rename(columns={configured_id_col: "id"})
+        elif not any(
+            column in dc.columns for column in ("id", "adm3_name")
+        ) and not {"lat", "lon"}.issubset(dc.columns):
+            fallback_col = dc.columns[0]
+            print(
+                "  WARNING: dissemination_cells_file has no explicit spatial "
+                f"key; using first column '{fallback_col}' as a legacy fallback."
             )
-        valid_ids = set(dc["adm3_name"].astype(str).str.strip())
+            dc = dc.rename(columns={fallback_col: "id"})
+        convention = resolve_grid_id_convention(
+            spec=spec,
+            authoritative_ids=df["id"],
+            context="rainfall/dissemination ID handoff",
+        )
+        dc = ensure_id_col(
+            dc,
+            spec=spec,
+            convention=convention,
+            context="dissemination cell IDs",
+        )
+        valid_ids = set(dc["id"])
         before = len(df)
         df = df[df["id"].isin(valid_ids)]
         print(f"  dissemination_cells filter: {before} -> {len(df)} rows "
@@ -491,19 +552,62 @@ def read_cell_transform(spec):
         raise ValueError("cell_transform_enabled=True but options.cell_transform_file is empty.")
     if not os.path.exists(f):
         raise FileNotFoundError(f"cell_transform_file not found: {f}")
-    w = pd.read_csv(f)
+    w = pd.read_csv(f, dtype={"source_id": str, "target_id": str})
     for col in ("target_id", "source_id", "weight"):
         if col not in w.columns:
             raise ValueError(f"Transform file must have: target_id, source_id, weight")
+    w["source_id"] = normalize_id_series(
+        w["source_id"], context="cell-transform source IDs"
+    )
+    w["target_id"] = normalize_id_series(
+        w["target_id"], context="cell-transform target IDs"
+    )
     w["weight"] = w["weight"].astype(float)
+    convention = resolve_grid_id_convention(
+        spec=spec,
+        authoritative_ids=w["source_id"].drop_duplicates(),
+        context=f"cell-transform file {os.path.basename(f)}",
+    )
+    if convention is not None:
+        w.attrs["source_id_convention"] = convention.as_dict()
+        print(
+            "  cell-transform source ID convention: "
+            f"digits={convention.decimal_digits}, "
+            f"format={convention.number_format} "
+            f"({convention.source})"
+        )
     return w
 
 
-def transform_forecast_wide(df, weights_df):
+def _prepare_transform_source_ids(df, weights_df, spec, context):
+    convention_data = weights_df.attrs.get("source_id_convention")
+    convention = (
+        GridIdConvention.from_dict(convention_data)
+        if convention_data else None
+    )
+    df, extra_ids, _ = validate_expected_source_ids(
+        df,
+        weights_df["source_id"].drop_duplicates(),
+        convention=convention,
+        spec=spec,
+        context=context,
+    )
+    if extra_ids and not weights_df.attrs.get("reported_extra_source_ids"):
+        print(
+            f"  cell-transform source coverage: {len(extra_ids)} raw grid "
+            "IDs are outside the supplied weights and will be ignored."
+        )
+        weights_df.attrs["reported_extra_source_ids"] = True
+    return df
+
+
+def transform_forecast_wide(df, weights_df, spec=None):
     """Apply cell transform to forecast wide-by-day DataFrame."""
     if weights_df is None:
         return df
-    df = ensure_id_col(df)
+    df = _prepare_transform_source_ids(
+        df, weights_df, spec, "forecast cell transform"
+    )
     day_cols = [c for c in df.columns if re.search(r"_day_\d+$", c)]
     if not day_cols:
         raise ValueError("No forecast day columns found to transform.")
@@ -520,11 +624,13 @@ def transform_forecast_wide(df, weights_df):
     return wide
 
 
-def transform_groundtruth_long(df, weights_df, value_col):
+def transform_groundtruth_long(df, weights_df, value_col, spec=None):
     """Apply cell transform to ground-truth long DataFrame."""
     if weights_df is None:
         return df
-    df = ensure_id_col(df)
+    df = _prepare_transform_source_ids(
+        df, weights_df, spec, "ground-truth cell transform"
+    )
     if value_col not in df.columns:
         raise ValueError(f"Value col not found: {value_col}")
     meta_cols = [c for c in df.columns if c not in ["id", value_col, "adm3_name"]]
@@ -849,7 +955,7 @@ def process_rainfall_forecast_id(df, spec, ref_onset_dt=None, thr_dt=None):
     Returns dict: {"wide": DataFrame}
     """
     df = df.copy()
-    df = ensure_id_col(df)
+    df = ensure_id_col(df, spec=spec, context="forecast spatial IDs")
     if "time" in df.columns:
         df["time"] = pd.to_datetime(df["time"]).dt.date
     if "year" in df.columns:
@@ -861,7 +967,7 @@ def process_rainfall_forecast_id(df, spec, ref_onset_dt=None, thr_dt=None):
     filter_cfg = spec.get("filter") or {}
     max_number = filter_cfg.get("max_number")
 
-    df = attach_thresholds_id(df, thr_dt)
+    df = attach_thresholds_id(df, thr_dt, spec=spec)
     df = attach_ref_onset(df, ref_onset_dt)
 
     if has_number and max_number is not None:
@@ -976,12 +1082,12 @@ def process_ground_truth_rainfall_id(df, spec, ref_onset_dt=None, thr_dt=None, v
     Returns dict: {"wide": DataFrame, "long": DataFrame}
     """
     df = df.copy()
-    df = ensure_id_col(df)
+    df = ensure_id_col(df, spec=spec, context="ground-truth spatial IDs")
     df["time"] = pd.to_datetime(df["time"]).dt.date
     df["year"] = df["year"].astype(int)
     df[value_col] = df[value_col].astype(float)
 
-    df = attach_thresholds_id(df, thr_dt)
+    df = attach_thresholds_id(df, thr_dt, spec=spec)
     df = attach_ref_onset(df, ref_onset_dt)
 
     cutoff_md = spec["options"]["cutoff_month_day"]
@@ -1141,7 +1247,7 @@ def run_single_pipeline(spec_id):
                     context="raw forecast before spatial transformation",
                 )
             if weights_df is not None: # in spec yml if cell_transform_enabled: false, it does nothing
-                dt = transform_forecast_wide(dt, weights_df)
+                dt = transform_forecast_wide(dt, weights_df, spec=spec)
             result = process_rainfall_forecast_id(dt, spec, ref_onset_dt=ref_onset_dt, thr_dt=thr_dt)
             wide_all.append(result["wide"])
 
@@ -1162,7 +1268,9 @@ def run_single_pipeline(spec_id):
             # filter_by_dissemination_cells and transform_forecast_wide sequence need swapped !!!!
             dt = filter_by_dissemination_cells(dt, spec)
             if weights_df is not None: # in spec yml if cell_transform_enabled: false, it does nothing
-                dt = transform_groundtruth_long(dt, weights_df, var_name.lower())
+                dt = transform_groundtruth_long(
+                    dt, weights_df, var_name.lower(), spec=spec
+                )
             result = process_ground_truth_rainfall_id(dt, spec, ref_onset_dt=ref_onset_dt, thr_dt=thr_dt,
                                                        value_col=var_name.lower())
             wide_all.append(result["wide"])

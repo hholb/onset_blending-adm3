@@ -20,6 +20,8 @@ import numpy as np
 import pandas as pd
 from datetime import date
 
+from .spatial_id_utils import normalize_id_series
+
 
 OnsetParams = collections.namedtuple("OnsetParams", [
     "win",                    # trigger window (days)
@@ -72,11 +74,12 @@ def read_ref_onset_dates(spec):
     if not os.path.exists(f):
         raise FileNotFoundError(f"ref_onset file not found: {f}")
 
-    tbl = pd.read_csv(f)
     ycol, dcol = cfg.get("year_col"), cfg.get("day_col")
     base_md = cfg.get("base_date")
     date_col = cfg.get("date_col")
     unit_col = cfg.get("unit_col")
+    read_dtypes = {unit_col: str} if unit_col else None
+    tbl = pd.read_csv(f, dtype=read_dtypes)
 
     if date_col and date_col in tbl.columns:
         tbl["ref_onset_date"] = pd.to_datetime(tbl[date_col], errors="coerce").dt.date
@@ -97,7 +100,7 @@ def read_ref_onset_dates(spec):
         if unit_col not in tbl.columns:
             raise ValueError(f"ref_onset unit_col '{unit_col}' not in file columns {tbl.columns.tolist()}")
         tbl = tbl.rename(columns={unit_col: "id"})
-        tbl["id"] = tbl["id"].astype(str).str.strip()
+        tbl["id"] = normalize_id_series(tbl["id"], context="reference-onset IDs")
         keys.append("id")
     if ycol and ycol in tbl.columns:
         tbl = tbl.rename(columns={ycol: "year"})
@@ -266,10 +269,20 @@ def _read_threshold_source(spec):
         return grid.drop_duplicates()
 
     # CSV/TSV
-    th = pd.read_csv(f)
+    th = pd.read_csv(f, dtype=str)
     tc = spec["thresholds"].get("thresh_col", "onset_thresh")
 
-    # adm3_name-based thresholds (new format)
+    id_col = spec["thresholds"].get("id_col")
+    if id_col:
+        if id_col not in th.columns:
+            raise ValueError(
+                f"Configured thresholds.id_col '{id_col}' not found. "
+                f"Found: {th.columns.tolist()}"
+            )
+        th = th.rename(columns={id_col: "id", tc: "onset_thresh"})
+        return th[["id", "onset_thresh"]].drop_duplicates()
+
+    # adm3_name-based thresholds (legacy format)
     adm3_col = spec["thresholds"].get("adm3_col", None)
     if adm3_col and adm3_col in th.columns:
         th = th.rename(columns={adm3_col: "id", tc: "onset_thresh"})

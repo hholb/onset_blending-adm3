@@ -22,6 +22,8 @@
 #     region_label:    Ethiopia       # used by the map/plot utilities
 #     grid_lat_var:    latitude       # NetCDF latitude coord (lat/latitude auto)
 #     grid_lon_var:    longitude
+#     grid_id_decimal_digits: 2       # optional deterministic <lat>_<lon> precision
+#     grid_id_format:  fixed           # optional: fixed or trimmed
 #
 # Function index
 #   get_geometry_cfg(spec)
@@ -35,6 +37,11 @@ import os
 import glob
 import numpy as np
 import pandas as pd
+
+from .spatial_id_utils import (
+    format_grid_ids,
+    resolve_grid_id_convention,
+)
 
 # Canonical internal names - the rest of the pipeline keys on these.
 CANON_REGION_KEY = "adm3_name"
@@ -59,6 +66,8 @@ def get_geometry_cfg(spec):
         "region_label":   g.get("region_label"),
         "grid_lat_var":   g.get("grid_lat_var"),   # None -> auto-detect
         "grid_lon_var":   g.get("grid_lon_var"),
+        "grid_id_decimal_digits": g.get("grid_id_decimal_digits"),
+        "grid_id_format": g.get("grid_id_format"),
     }
 
 
@@ -313,7 +322,8 @@ def unit_centroids(units_gdf):
     })
 
 
-def build_grid_cell_units(sample_nc, cfg, valid_cells=None, round_dp=5):
+def build_grid_cell_units(sample_nc, cfg, valid_cells=None, round_dp=5,
+                          convention=None):
     """
     Build "admin units" that ARE the ground-truth grid cells (id = "{lat}_{lon}").
     Used when no shapefile is provided: forecasts are then regridded to match the
@@ -322,8 +332,22 @@ def build_grid_cell_units(sample_nc, cfg, valid_cells=None, round_dp=5):
     """
     grid_gdf, _, _ = _grid_cell_gdf(sample_nc, cfg)
     g = grid_gdf.copy()
-    g[CANON_REGION_KEY] = [f"{round(la, round_dp)}_{round(lo, round_dp)}"
-                           for la, lo in zip(g["latitude"], g["longitude"])]
+    convention = convention or resolve_grid_id_convention(
+        spec=cfg,
+        lat=g["latitude"].values,
+        lon=g["longitude"].values,
+        context="target grid",
+    )
+    g[CANON_REGION_KEY] = format_grid_ids(
+        g["latitude"].values,
+        g["longitude"].values,
+        convention,
+    )
+    if g[CANON_REGION_KEY].duplicated().any():
+        raise ValueError(
+            "The selected grid-ID precision maps multiple target cells to "
+            "the same ID. Increase geometry.grid_id_decimal_digits."
+        )
     if valid_cells is not None:
         keep = [(round(la, round_dp), round(lo, round_dp)) in valid_cells
                 for la, lo in zip(g["latitude"], g["longitude"])]

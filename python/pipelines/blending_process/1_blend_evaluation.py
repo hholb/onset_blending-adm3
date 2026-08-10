@@ -26,6 +26,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 import re
 from python.pipelines._shared.misc import coalesce, interval_bins
 from python.prepare_data.nc_utils import ensure_id_col
+from python.prepare_data.spatial_id_utils import resolve_grid_id_convention
 from python.blending_process.blend_evaluation_utils import (
     _present_weeks,
     build_formulas_from_spec,
@@ -54,19 +55,6 @@ from python.blending_process.blend_evaluation_utils import (
     optimize_mme_weights,
     apply_mme_weights,
 )
-
-
-def format_coord(series):
-    """Format coordinate series consistently — int if whole numbers, else minimal decimal places."""
-#    if (series % 1 == 0).all():
-#        return series.astype(int).astype(str)
-#    else:
-#        for decimals in range(1, 10):
-#            rounded = series.round(decimals)
-#            if (rounded == series.round(10)).all():
-#                return rounded.map(lambda v: f"{v:.{decimals}f}")
-#        return series.map(lambda v: f"{v:.6f}")
-    return series.map(lambda v: f"{v:.2f}")
 
 
 def main():
@@ -111,13 +99,6 @@ def main():
     year_tag = make_year_tag(holdout_years)
     output_tag = f"{cutoff_tag}{year_tag}"
 
-    # Load dissemination cells
-    #dissemination_cells = pd.read_csv("Monsoon_Data/dissemination_cells.csv")
-    #dissemination_cells = pd.read_csv("Monsoon_Data/dissemination_cells_box1.csv")
-    dissemination_csv = spec["cell"].get("dissemination", "")
-    dissemination_cells = ensure_id_col(pd.read_csv(dissemination_csv))
-    dissemination_cells["id"] = dissemination_cells["id"].astype(str)
-
     # Load data
     input_file = input_rds_from_cutoff(cutoff_mode)
     input_override = spec.get("run", {}).get("input_rds_override")
@@ -145,6 +126,20 @@ def main():
 
     with open(input_path, "rb") as f:
         wide_df = pickle.load(f)
+
+    wide_df = ensure_id_col(wide_df, spec=spec, context="blend input IDs")
+    id_convention = resolve_grid_id_convention(
+        spec=spec,
+        authoritative_ids=wide_df["id"],
+        context="blend input/dissemination ID handoff",
+    )
+    dissemination_csv = spec["cell"].get("dissemination", "")
+    dissemination_cells = ensure_id_col(
+        pd.read_csv(dissemination_csv, dtype=str),
+        spec=spec,
+        convention=id_convention,
+        context="blend dissemination IDs",
+    )
 
     # Number of forecast week-bins, inferred from the connect-stage output
     # (prob_clim_week<n> columns). Drives all bin lists below so a spec with a
