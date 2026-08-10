@@ -224,6 +224,8 @@ def resolve_grid_id_convention(spec=None, lat=None, lon=None,
         )
     elif explicit is not None:
         convention = explicit
+    elif authoritative_ids is not None:
+        return None
     elif lat is not None and lon is not None:
         convention = infer_grid_id_convention(lat, lon)
     else:

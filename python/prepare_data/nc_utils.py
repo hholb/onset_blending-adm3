@@ -562,13 +562,25 @@ def read_cell_transform(spec):
     for col in ("target_id", "source_id", "weight"):
         if col not in w.columns:
             raise ValueError(f"Transform file must have: target_id, source_id, weight")
+    if w.empty:
+        raise ValueError("Cell-transform weights file must not be empty.")
     w["source_id"] = normalize_id_series(
         w["source_id"], context="cell-transform source IDs"
     )
     w["target_id"] = normalize_id_series(
         w["target_id"], context="cell-transform target IDs"
     )
-    w["weight"] = w["weight"].astype(float)
+    w["weight"] = pd.to_numeric(w["weight"], errors="coerce")
+    if not np.isfinite(w["weight"]).all() or (w["weight"] < 0).any():
+        raise ValueError("Cell-transform weights must be finite and non-negative.")
+    if w.duplicated(["source_id", "target_id"]).any():
+        raise ValueError("Cell-transform source_id/target_id pairs must be unique.")
+    zero_targets = w.groupby("target_id")["weight"].sum()
+    zero_targets = zero_targets[zero_targets <= 0]
+    if len(zero_targets):
+        sample = ", ".join(zero_targets.index.astype(str)[:10])
+        raise ValueError(f"Cell-transform targets have zero total weight: {sample}")
+    w = w.loc[w["weight"] > 0].copy()
     convention = resolve_grid_id_convention(
         spec=spec,
         authoritative_ids=w["source_id"].drop_duplicates(),
@@ -607,6 +619,22 @@ def _prepare_transform_source_ids(df, weights_df, spec, context):
     return df
 
 
+def _observed_weighted_mean(df, value_col, group_cols):
+    """Aggregate over finite source values and renormalize observed weights."""
+    values = pd.to_numeric(df[value_col], errors="coerce")
+    valid = np.isfinite(values) & np.isfinite(df["weight"])
+    work = df.assign(
+        _weighted_value=np.where(valid, values * df["weight"], 0.0),
+        _observed_weight=np.where(valid, df["weight"], 0.0),
+    )
+    out = work.groupby(group_cols, as_index=False, dropna=False)[
+        ["_weighted_value", "_observed_weight"]
+    ].sum()
+    out[value_col] = out["_weighted_value"].div(out["_observed_weight"])
+    out.loc[out["_observed_weight"] <= 0, value_col] = np.nan
+    return out[group_cols + [value_col]]
+
+
 def transform_forecast_wide(df, weights_df, spec=None):
     """Apply cell transform to forecast wide-by-day DataFrame."""
     if weights_df is None:
@@ -618,14 +646,18 @@ def transform_forecast_wide(df, weights_df, spec=None):
     if not day_cols:
         raise ValueError("No forecast day columns found to transform.")
 
-    meta_cols = [c for c in df.columns if c not in day_cols + ["id", "adm3_name"]]
+    spatial_cols = {"id", "adm3_name", "lat", "lon", "latitude", "longitude"}
+    meta_cols = [c for c in df.columns if c not in day_cols and c not in spatial_cols]
     long = df.melt(id_vars=["id"] + meta_cols, value_vars=day_cols,
                    var_name="day_col", value_name="rain")
     long = long.merge(weights_df.rename(columns={"source_id": "id"}), on="id", how="inner")
-    long["rain"] = long["weight"] * long["rain"]
-    trans = long.groupby(meta_cols + ["target_id", "day_col"], as_index=False)["rain"].sum()
+    trans = _observed_weighted_mean(
+        long, "rain", meta_cols + ["target_id", "day_col"]
+    )
     trans = trans.rename(columns={"target_id": "id"})
-    wide = trans.pivot_table(index=meta_cols + ["id"], columns="day_col", values="rain").reset_index()
+    wide = trans.pivot(
+        index=meta_cols + ["id"], columns="day_col", values="rain"
+    ).reset_index()
     wide.columns.name = None
     return wide
 
@@ -639,10 +671,12 @@ def transform_groundtruth_long(df, weights_df, value_col, spec=None):
     )
     if value_col not in df.columns:
         raise ValueError(f"Value col not found: {value_col}")
-    meta_cols = [c for c in df.columns if c not in ["id", value_col, "adm3_name"]]
+    spatial_cols = {"id", "adm3_name", "lat", "lon", "latitude", "longitude"}
+    meta_cols = [c for c in df.columns if c != value_col and c not in spatial_cols]
     x = df.merge(weights_df.rename(columns={"source_id": "id"}), on="id", how="inner")
-    x[value_col] = x["weight"] * x[value_col].astype(float)
-    trans = x.groupby(meta_cols + ["target_id"], as_index=False)[value_col].sum()
+    trans = _observed_weighted_mean(
+        x, value_col, meta_cols + ["target_id"]
+    )
     trans = trans.rename(columns={"target_id": "id"})
     return trans
 
@@ -1221,39 +1255,9 @@ def run_single_pipeline(spec_id):
                 print(f"  Skipping {nc_path}: variable '{var_name}' not found.")
                 continue
             dt["year"] = yr
-            # filter_by_dissemination_cells and transform_forecast_wide sequence need swapped !!!!
-            dt = filter_by_dissemination_cells(dt, spec)
-            strict_rain_day_max = spec.get("options", {}).get("rain_day_max")
-            if strict_rain_day_max is not None:
-                _, horizon_policy = resolve_rain_day_max(
-                    {
-                        "rain_day_max": strict_rain_day_max,
-                        "rain_horizon_policy": spec["options"].get(
-                            "rain_horizon_policy"
-                        ),
-                    },
-                    probability_day_max=1,
-                )
-                validation_dt = dt
-                max_number = (spec.get("filter") or {}).get("max_number")
-                if "number" in validation_dt.columns and max_number is not None:
-                    validation_dt = validation_dt[
-                        validation_dt["number"].astype(int) <= int(max_number)
-                    ]
-                validate_rain_horizon_frame(
-                    validation_dt,
-                    day_prefix=f"{wide_prefix}_day_",
-                    rain_day_max=strict_rain_day_max,
-                    model_name=spec_id,
-                    strict=True,
-                    allow_extra=horizon_policy == "truncate",
-                    key_columns=(
-                        "id", "lat", "lon", "time", "year", "number"
-                    ),
-                    context="raw forecast before spatial transformation",
-                )
             if weights_df is not None: # in spec yml if cell_transform_enabled: false, it does nothing
                 dt = transform_forecast_wide(dt, weights_df, spec=spec)
+            dt = filter_by_dissemination_cells(dt, spec)
             result = process_rainfall_forecast_id(dt, spec, ref_onset_dt=ref_onset_dt, thr_dt=thr_dt)
             wide_all.append(result["wide"])
 
@@ -1271,12 +1275,11 @@ def run_single_pipeline(spec_id):
                 print(f"  Skipping {nc_path}: variable '{var_name}' not found.")
                 continue
             dt["year"] = yr
-            # filter_by_dissemination_cells and transform_forecast_wide sequence need swapped !!!!
-            dt = filter_by_dissemination_cells(dt, spec)
             if weights_df is not None: # in spec yml if cell_transform_enabled: false, it does nothing
                 dt = transform_groundtruth_long(
                     dt, weights_df, var_name.lower(), spec=spec
                 )
+            dt = filter_by_dissemination_cells(dt, spec)
             result = process_ground_truth_rainfall_id(dt, spec, ref_onset_dt=ref_onset_dt, thr_dt=thr_dt,
                                                        value_col=var_name.lower())
             wide_all.append(result["wide"])

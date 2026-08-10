@@ -170,11 +170,14 @@ In addition to the general requirements:
 ### Optional: Cell Transform (Regridding)
 
 When `options.cell_transform_enabled: true`, a CSV weights file is required with columns:
-- `target_id`: Grid cell ID on the target grid (format `"lat_lon"`)
-- `source_id`: Grid cell ID on the source grid
-- `weight`: Linear combination weight (weights for a given `target_id` should sum to 1)
+- `target_id`: Stable ID of the target grid cell or administrative unit
+- `source_id`: Stable ID of the contributing source cell or unit
+- `weight`: Finite, non-negative overlap weight; zero-weight rows are ignored, each source/target pair must be unique, and every target must have positive total weight
 
-Thresholds must match the target grid when cell transform is enabled.
+The transform is applied before target/dissemination filtering. For each target,
+weights are renormalized over source cells with finite rainfall; if none are
+observed, the transformed rainfall remains missing. Thresholds must match the
+target units when cell transform is enabled.
 
 ---
 
