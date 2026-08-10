@@ -5,11 +5,21 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 
+from python.prepare_data.geometry_utils import normalize_regrid_weights
+
 
 def batch_aggregate_to_adm3_matrix(input_dir, mapping_csv_path, input_file=None):
     # 1. Load mapping
-    mapping = pd.read_csv(mapping_csv_path)
+    mapping = normalize_regrid_weights(
+        pd.read_csv(
+            mapping_csv_path,
+            dtype={"target_id": str, "adm3_name": str},
+        ),
+        context=f"regrid weights {mapping_csv_path}",
+    )
     mapping = mapping.rename(columns={'latitude': 'lat', 'longitude': 'lon'})
+    for column in ("lat", "lon", "weight"):
+        mapping[column] = pd.to_numeric(mapping[column], errors="raise")
 
     # 2. Prepare Weights Matrix
     weights_xr = mapping.set_index(['lat', 'lon', 'adm3_name'])['weight'].to_xarray().fillna(0)
@@ -122,7 +132,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--weight_file",
         required=True,
-        help="Path to the CSV mapping file (columns: lat, lon, adm3_name, weight).",
+        help="Path to the CSV mapping file (lat, lon, target_id or adm3_name, weight).",
     )
     parser.add_argument(
         "--input_file",

@@ -168,7 +168,7 @@ def infer_grid_id_convention_from_ids(ids):
     if all(value is None for value in parsed):
         return None
     if any(value is None for value in parsed):
-        raise ValueError("Established source IDs mix grid and non-grid formats.")
+        return None
 
     lat = [value[0] for value in parsed]
     lon = [value[1] for value in parsed]
@@ -241,6 +241,22 @@ def normalize_id_series(values, context="spatial IDs"):
     if invalid.any():
         raise ValueError(f"{context} contain missing or empty values.")
     return normalized.astype(str)
+
+
+def validate_id_coordinate_consistency(df, id_col="id", context="spatial IDs"):
+    """Reject one ID assigned to multiple coordinate pairs; allow exact repeats."""
+    if id_col not in df.columns or not {"lat", "lon"}.issubset(df.columns):
+        return
+    pairs = df[[id_col, "lat", "lon"]].copy()
+    pairs["lat"] = pd.to_numeric(pairs["lat"], errors="raise")
+    pairs["lon"] = pd.to_numeric(pairs["lon"], errors="raise")
+    pairs = pairs.drop_duplicates()
+    conflicts = pairs[id_col].duplicated(keep=False)
+    if conflicts.any():
+        sample = ", ".join(pairs.loc[conflicts, id_col].astype(str).unique()[:10])
+        raise ValueError(
+            f"{context}: an ID is assigned to multiple coordinate pairs: {sample}"
+        )
 
 
 def ensure_spatial_id_col(df, id_col="id", spec=None, convention=None,

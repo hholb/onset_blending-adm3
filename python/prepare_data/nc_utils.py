@@ -39,6 +39,7 @@ from .spatial_id_utils import (
     format_grid_ids,
     normalize_id_series,
     resolve_grid_id_convention,
+    validate_id_coordinate_consistency,
     validate_expected_source_ids,
 )
 
@@ -338,9 +339,7 @@ def prep_thresholds_id(thr_df, spec=None, convention=None):
     thr_df.columns = thr_df.columns.str.lower()
     if "id" not in thr_df.columns:
         if "adm3_name" in thr_df.columns:
-            thr_df["id"] = normalize_id_series(
-                thr_df["adm3_name"], context="threshold IDs"
-            )
+            thr_df["id"] = thr_df["adm3_name"]
         elif "lat" in thr_df.columns and "lon" in thr_df.columns:
             thr_df = add_id_from_latlon(
                 thr_df, spec=spec, convention=convention
@@ -351,7 +350,12 @@ def prep_thresholds_id(thr_df, spec=None, convention=None):
             )
     thr_df["id"] = normalize_id_series(thr_df["id"], context="threshold IDs")
     thr_df["onset_thresh"] = thr_df["onset_thresh"].astype(float)
-    return thr_df[["id", "onset_thresh"]].drop_duplicates().set_index("id")
+    thresholds = thr_df[["id", "onset_thresh"]].drop_duplicates()
+    conflicting_ids = thresholds["id"].duplicated(keep=False)
+    if conflicting_ids.any():
+        sample = ", ".join(thresholds.loc[conflicting_ids, "id"].unique()[:10])
+        raise ValueError(f"Threshold IDs have conflicting values: {sample}")
+    return thresholds.set_index("id")
 
 
 def attach_thresholds_id(df, thr_df, spec=None, convention=None):
@@ -507,6 +511,8 @@ def filter_by_dissemination_cells(df, spec):
             convention=convention,
             context="dissemination cell IDs",
         )
+        validate_id_coordinate_consistency(dc, context="dissemination cell IDs")
+        dc = dc.drop_duplicates("id")
         valid_ids = set(dc["id"])
         before = len(df)
         df = df[df["id"].isin(valid_ids)]

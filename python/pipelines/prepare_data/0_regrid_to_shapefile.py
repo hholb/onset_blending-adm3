@@ -55,11 +55,13 @@ from python.prepare_data.geometry_utils import (
     get_geometry_cfg, load_admin_geometry, build_grid_to_admin_weights,
     grid_valid_cells, restrict_weights_to_valid, grid_coords_of, get_half_delta,
     grids_equal, build_coverage_geom, coverage_missing_fraction,
-    build_weights_to_coverage, build_grid_cell_units, unit_centroids, CANON_REGION_KEY,
+    build_weights_to_coverage, build_grid_cell_units, unit_centroids,
+    normalize_regrid_weights, CANON_REGION_KEY,
 )
 from python.prepare_data.spatial_id_utils import (
     ensure_spatial_id_col,
     resolve_grid_id_convention,
+    validate_id_coordinate_consistency,
 )
 from utils.remap_nc import batch_aggregate_to_adm3_matrix
 
@@ -106,6 +108,7 @@ def _read_dissemination_ids(path, spec=None, convention=None):
         convention=convention,
         context="regrid dissemination IDs",
     )
+    validate_id_coordinate_consistency(dc, context="regrid dissemination IDs")
     return set(dc["id"])
 
 
@@ -176,8 +179,9 @@ def main(spec_id):
         if not cfg.get("shapefile"):
             established_target_ids = None
             if gt_win:
-                existing_weights = pd.read_csv(
-                    gt_win, usecols=[CANON_REGION_KEY], dtype=str
+                existing_weights = normalize_regrid_weights(
+                    pd.read_csv(gt_win, dtype=str),
+                    context="supplied ground-truth weights",
                 )
                 established_target_ids = existing_weights[CANON_REGION_KEY]
             grid_id_convention = resolve_grid_id_convention(

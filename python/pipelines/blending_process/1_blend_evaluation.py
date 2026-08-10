@@ -26,7 +26,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 import re
 from python.pipelines._shared.misc import coalesce, interval_bins
 from python.prepare_data.nc_utils import ensure_id_col
-from python.prepare_data.spatial_id_utils import resolve_grid_id_convention
+from python.prepare_data.spatial_id_utils import (
+    resolve_grid_id_convention,
+    validate_id_coordinate_consistency,
+)
 from python.blending_process.blend_evaluation_utils import (
     _present_weeks,
     build_formulas_from_spec,
@@ -133,13 +136,31 @@ def main():
         authoritative_ids=wide_df["id"],
         context="blend input/dissemination ID handoff",
     )
-    dissemination_csv = spec["cell"].get("dissemination", "")
+    cell_cfg = spec["cell"]
+    dissemination_csv = cell_cfg.get("dissemination", "")
+    dissemination_input = pd.read_csv(dissemination_csv, dtype=str)
+    dissemination_id_col = cell_cfg.get("id_col") or cell_cfg.get(
+        "dissemination_id_col"
+    )
+    if dissemination_id_col:
+        if dissemination_id_col not in dissemination_input.columns:
+            raise ValueError(
+                f"cell.id_col '{dissemination_id_col}' not found. "
+                f"Found: {dissemination_input.columns.tolist()}"
+            )
+        dissemination_input = dissemination_input.rename(
+            columns={dissemination_id_col: "id"}
+        )
     dissemination_cells = ensure_id_col(
-        pd.read_csv(dissemination_csv, dtype=str),
+        dissemination_input,
         spec=spec,
         convention=id_convention,
         context="blend dissemination IDs",
     )
+    validate_id_coordinate_consistency(
+        dissemination_cells, context="blend dissemination IDs"
+    )
+    dissemination_cells = dissemination_cells.drop_duplicates("id")
 
     # Number of forecast week-bins, inferred from the connect-stage output
     # (prob_clim_week<n> columns). Drives all bin lists below so a spec with a

@@ -526,11 +526,11 @@ The core pipeline keys on an abstract `id` and never touches lat/lon, so moving 
 
 **Target units** are set by the spec: with a `geometry.shapefile` the target is the shapefile's admin (political) units; **without `geometry.shapefile`** the target is the **ground-truth grid cells** themselves (id `"<lat>_<lon>"`), i.e. forecasts are regridded to match the ground-truth grid. **Different forecast grids:** if a forecast's grid matches the ground truth it reuses the same weights; if it differs, it is regridded onto "the unit **minus** the parts where ground-truth data didn't exist" (unit ∩ coverage).
 
-For grid-cell targets, an existing weight-table ID convention is authoritative. Otherwise set `geometry.grid_id_decimal_digits` and optionally `geometry.grid_id_format: fixed|trimmed`; if neither is supplied, the pipeline infers the least precise collision-free convention from the coordinates. The same formatter is used for raw data, lat/lon threshold tables, and dissemination-cell inputs.
+For shapefile targets, set `geometry.region_id_col` to the stable join key (for example `adm3_pcode` or `OBJECTID`) and optionally set `geometry.region_name_col` to a display label. The older `geometry.region_key_col` remains accepted as an alias for `region_id_col`. For grid-cell targets, an existing weight-table ID convention is authoritative. Otherwise set `geometry.grid_id_decimal_digits` and optionally `geometry.grid_id_format: fixed|trimmed`; if neither is supplied, the pipeline infers the least precise collision-free convention from the coordinates. The same formatter is used for raw data, lat/lon threshold tables, and dissemination-cell inputs.
 
 **`clip_to_coverage`** (default **true**) toggles steps 2–4; set it false for a plain per-dataset regrid (the older woreda behavior, where `remap_nc` renormalizes over non-NaN cells per timestep with no shared footprint). This step supersedes the standalone `utils/remap.py` / `remap_weights*.py` weight-builders.
 
-**Supplying your own weights.** Instead of computing weights, you can point the spec at precomputed weight CSVs (columns `latitude, longitude, adm3_name, weight`): a top-level `weights_in:` applies to everything, or a per-target `weights_in:` (under `ground_truth` or a `forecasts[]` entry) overrides it. When all weights are supplied, no shapefile overlay / coverage scan / report runs — the step just applies them. (The low-level `utils/remap.py apply --weights <csv>` does the same for a single file.)
+**Supplying your own weights.** Instead of computing weights, you can point the spec at precomputed weight CSVs (columns `latitude, longitude, target_id, weight`; legacy `adm3_name` is also accepted): a top-level `weights_in:` applies to everything, or a per-target `weights_in:` (under `ground_truth` or a `forecasts[]` entry) overrides it. When all weights are supplied, no shapefile overlay / coverage scan / report runs — the step just applies them. (The low-level `utils/remap.py apply --weights <csv>` does the same for a single file.)
 
 Regridding is applied to **rainfall** (raw NetCDF variables), never to onset probabilities — those are computed downstream. Each `<name>.nc` becomes `<name>_adm3.nc` alongside it; point the step-1 specs at those (`file_regex: '..._adm3\.nc$'`). A **coverage report** CSV lists, for all units and for the dissemination subset, how many units are affected by missing ground truth and the min/5/25/50/75/95/max quantiles of the missing-area fraction. When a shapefile is used, a **unit centroids** CSV (`adm3_name, lat, lon`) is also written (`centroids_out`), ready to use as `filter.centroids_file` for the bbox domain filter.
 
@@ -544,7 +544,8 @@ python utils/remap.py weights \
     --shapefile data/shapefile/admin.shp \
     --sample-nc Monsoon_Data/raw_nc/aifs \
     --out Monsoon_Data/grid_to_district_mapping.csv \
-    [--region-key adm3_name] [--parent-key adm2_name] [--crs EPSG:4326]
+    [--region-id adm3_pcode] [--region-name adm3_name] \
+    [--parent-key adm2_name] [--crs EPSG:4326]
 
 # 2. Aggregate gridded .nc files to *_adm3.nc using those weights
 python utils/remap.py apply \
@@ -552,7 +553,7 @@ python utils/remap.py apply \
     --input-dir Monsoon_Data/raw_nc/aifs
 ```
 
-A shapefile whose admin key column is not literally `adm3_name` is handled via `--region-key` (it is renamed to the canonical `adm3_name` on read). The reusable helpers live in `python/prepare_data/geometry_utils.py`.
+A shapefile whose stable key is not literally `adm3_name` is handled via `--region-id`; `--region-name` can retain a separate display label. `--region-key` remains a legacy alias for `--region-id`. The stable ID is carried through the existing internal `adm3_name` coordinate for backward compatibility. The reusable helpers live in `python/prepare_data/geometry_utils.py`.
 
 ### Output maps
 

@@ -14,7 +14,8 @@
 #                                   ground-truth grid. The spec decides which.
 geometry:
   shapefile: Monsoon_Data/reference/shapefiles/STATE_BOUNDARY.shp
-  region_key_col: STATE          # shapefile's admin key; renamed to canonical adm3_name on read
+  region_id_col: STATE           # stable shapefile key used for joins
+  # region_name_col: STATE_NAME  # optional display label, separate from the ID
   crs: EPSG:4326                 # grid CRS; the shapefile is reprojected to this
   grid_lat_var: latitude         # optional (auto-detected: latitude/lat)
   grid_lon_var: longitude
@@ -33,7 +34,7 @@ clip_to_coverage: true
 # top-level `weights_in` applies to everything; a per-target `weights_in` (under
 # ground_truth or a forecasts[] entry) overrides it. When all weights are
 # supplied, no shapefile overlay / coverage scan / report runs. The CSV must have
-# columns: latitude, longitude, adm3_name, weight.
+# columns: latitude, longitude, target_id, weight. Legacy adm3_name is accepted.
 # weights_in: Monsoon_Data/reference/my_weights.csv
 
 ground_truth:

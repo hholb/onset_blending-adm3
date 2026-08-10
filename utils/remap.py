@@ -16,7 +16,8 @@
 #         --shapefile data/shapefile/admin.shp \
 #         --sample-nc Monsoon_Data/raw_nc/aifs \
 #         --out Monsoon_Data/grid_to_district_mapping.csv \
-#         [--region-key adm3_name] [--parent-key adm2_name] [--crs EPSG:4326]
+#         [--region-id adm3_pcode] [--region-name adm3_name] \
+#         [--parent-key adm2_name] [--crs EPSG:4326]
 #
 #     # or drive everything from a spec yml that contains a `geometry:` block:
 #     python utils/remap.py weights --geometry-spec specs/geometry/eth.yml \
@@ -53,8 +54,14 @@ def _cfg_from_args(args):
 
     if getattr(args, "shapefile", None):
         base["shapefile"] = args.shapefile
-    if getattr(args, "region_key", None):
+    if getattr(args, "region_id", None):
+        base["region_id_col"] = args.region_id
+        base["region_key_col"] = args.region_id
+    elif getattr(args, "region_key", None):
+        base["region_id_col"] = args.region_key
         base["region_key_col"] = args.region_key
+    if getattr(args, "region_name", None):
+        base["region_name_col"] = args.region_name
     if getattr(args, "parent_key", None):
         base["parent_key_col"] = args.parent_key
     if getattr(args, "crs", None):
@@ -87,7 +94,9 @@ def build_parser():
     w.add_argument("--shapefile", default=None, help="Admin boundary shapefile.")
     w.add_argument("--sample-nc", required=True, help="Sample gridded .nc file or a directory of them.")
     w.add_argument("--out", required=True, help="Output weight CSV path.")
-    w.add_argument("--region-key", default=None, help="Shapefile admin key column (default adm3_name).")
+    w.add_argument("--region-id", default=None, help="Shapefile stable ID column (default adm3_name).")
+    w.add_argument("--region-name", default=None, help="Optional shapefile display-name column.")
+    w.add_argument("--region-key", default=None, help="Legacy alias for --region-id.")
     w.add_argument("--parent-key", default=None, help="Optional parent admin column (e.g. adm2_name).")
     w.add_argument("--crs", default=None, help="CRS (default EPSG:4326).")
     w.add_argument("--grid-lat-var", dest="grid_lat_var", default=None, help="NetCDF latitude coord name.")
@@ -95,7 +104,7 @@ def build_parser():
     w.set_defaults(func=cmd_weights)
 
     a = sub.add_parser("apply", help="Aggregate gridded .nc to *_adm3.nc using a weight table.")
-    a.add_argument("--weights", required=True, help="Weight CSV from `weights` (lat, lon, adm3_name, weight).")
+    a.add_argument("--weights", required=True, help="Weight CSV from `weights` (lat, lon, target_id or adm3_name, weight).")
     a.add_argument("--input-dir", default=None, help="Directory of .nc files to aggregate.")
     a.add_argument("--input-file", default=None, help="Single .nc file (instead of --input-dir).")
     a.set_defaults(func=cmd_apply)

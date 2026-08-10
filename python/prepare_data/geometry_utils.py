@@ -16,7 +16,9 @@
 # `geometry` config block (all keys optional except `shapefile`):
 #   geometry:
 #     shapefile:       path/to/admin.shp
-#     region_key_col:  adm3_name      # renamed to canonical `adm3_name` on read
+#     region_id_col:   adm3_pcode     # stable ID used for joins
+#     region_name_col: adm3_name      # optional display label
+#     region_key_col:  adm3_name      # legacy alias for region_id_col
 #     parent_key_col:  adm2_name      # optional (zone overlays / labels)
 #     crs:             EPSG:4326
 #     region_label:    Ethiopia       # used by the map/plot utilities
@@ -40,11 +42,13 @@ import pandas as pd
 
 from .spatial_id_utils import (
     format_grid_ids,
+    normalize_id_series,
     resolve_grid_id_convention,
 )
 
 # Canonical internal names - the rest of the pipeline keys on these.
 CANON_REGION_KEY = "adm3_name"
+CANON_REGION_NAME = "region_name"
 CANON_PARENT_KEY = "adm2_name"
 DEFAULT_CRS = "EPSG:4326"
 
@@ -53,14 +57,18 @@ def get_geometry_cfg(spec):
     """
     Extract the `geometry` config block from a spec dict, applying defaults.
 
-    Returns a dict with keys: shapefile, region_key_col, parent_key_col, crs,
-    region_label, grid_lat_var, grid_lon_var. `shapefile` may be None if the
-    spec has no geometry block (callers that need it should check).
+    `region_id_col` is the stable join key. The older `region_key_col` remains
+    an alias so existing specs continue to work unchanged.
     """
     g = dict((spec or {}).get("geometry") or {})
+    region_id_col = (
+        g.get("region_id_col") or g.get("region_key_col") or CANON_REGION_KEY
+    )
     return {
         "shapefile":      g.get("shapefile"),
-        "region_key_col": g.get("region_key_col", CANON_REGION_KEY),
+        "region_id_col":  region_id_col,
+        "region_name_col": g.get("region_name_col"),
+        "region_key_col": region_id_col,  # legacy internal alias
         "parent_key_col": g.get("parent_key_col"),  # optional
         "crs":            g.get("crs", DEFAULT_CRS),
         "region_label":   g.get("region_label"),
@@ -109,9 +117,9 @@ def standardize_grid_coords(ds, lat_var=None, lon_var=None):
 
 def load_admin_geometry(cfg):
     """
-    Read the admin-boundary shapefile named in cfg and return a GeoDataFrame
-    with the canonical `adm3_name` column (and `adm2_name` if parent_key_col is
-    given), reprojected to cfg["crs"].
+    Read an admin-boundary shapefile and adapt its stable region ID to the
+    existing internal `adm3_name` column. An optional display name is retained
+    separately as `region_name`.
 
     cfg : dict from get_geometry_cfg (or a raw geometry block).
     """
@@ -126,14 +134,25 @@ def load_admin_geometry(cfg):
 
     gdf = gpd.read_file(shp)
 
-    region_col = cfg.get("region_key_col", CANON_REGION_KEY)
+    region_col = (
+        cfg.get("region_id_col") or cfg.get("region_key_col") or CANON_REGION_KEY
+    )
     if region_col not in gdf.columns:
         raise ValueError(
-            f"Shapefile missing region key column '{region_col}'. "
-            f"Set geometry.region_key_col. Available: {gdf.columns.tolist()}"
+            f"Shapefile missing region ID column '{region_col}'. Set "
+            "geometry.region_id_col. "
+            f"Available: {gdf.columns.tolist()}"
         )
 
     keep = {region_col: CANON_REGION_KEY}
+    name_col = cfg.get("region_name_col")
+    if name_col and name_col not in gdf.columns:
+        raise ValueError(
+            f"Shapefile missing region name column '{name_col}'. "
+            f"Available: {gdf.columns.tolist()}"
+        )
+    if name_col and name_col != region_col:
+        keep[name_col] = CANON_REGION_NAME
     parent_col = cfg.get("parent_key_col")
     if parent_col:
         if parent_col not in gdf.columns:
@@ -145,7 +164,15 @@ def load_admin_geometry(cfg):
 
     cols = list(keep.keys()) + ["geometry"]
     gdf = gdf[cols].rename(columns=keep).reset_index(drop=True)
-    gdf[CANON_REGION_KEY] = gdf[CANON_REGION_KEY].astype(str).str.strip()
+    gdf[CANON_REGION_KEY] = normalize_id_series(
+        gdf[CANON_REGION_KEY], context="shapefile region IDs"
+    )
+    if name_col == region_col:
+        gdf[CANON_REGION_NAME] = gdf[CANON_REGION_KEY]
+    duplicate_ids = gdf[CANON_REGION_KEY].duplicated(keep=False)
+    if duplicate_ids.any():
+        sample = ", ".join(gdf.loc[duplicate_ids, CANON_REGION_KEY].unique()[:10])
+        raise ValueError(f"Shapefile region IDs must be unique; duplicates: {sample}")
 
     crs = cfg.get("crs", DEFAULT_CRS)
     if gdf.crs is None:
@@ -153,6 +180,44 @@ def load_admin_geometry(cfg):
     elif crs is not None and str(gdf.crs) != str(crs):
         gdf = gdf.to_crs(crs)
     return gdf
+
+
+def normalize_regrid_weights(weights_df, context="regrid weights"):
+    """Accept canonical `target_id` or legacy `adm3_name` weight tables."""
+    out = weights_df.copy()
+    if "target_id" not in out.columns and CANON_REGION_KEY not in out.columns:
+        raise ValueError(f"{context} must contain 'target_id' or '{CANON_REGION_KEY}'.")
+
+    if "target_id" in out.columns:
+        out["target_id"] = normalize_id_series(
+            out["target_id"], context=f"{context} target IDs"
+        )
+    if CANON_REGION_KEY in out.columns:
+        out[CANON_REGION_KEY] = normalize_id_series(
+            out[CANON_REGION_KEY], context=f"{context} legacy target IDs"
+        )
+    if {"target_id", CANON_REGION_KEY}.issubset(out.columns):
+        mismatch = out["target_id"] != out[CANON_REGION_KEY]
+        if mismatch.any():
+            raise ValueError(
+                f"{context}: 'target_id' and '{CANON_REGION_KEY}' disagree."
+            )
+    elif "target_id" in out.columns:
+        out[CANON_REGION_KEY] = out["target_id"]
+    else:
+        out["target_id"] = out[CANON_REGION_KEY]
+
+    lat_col = "latitude" if "latitude" in out.columns else "lat"
+    lon_col = "longitude" if "longitude" in out.columns else "lon"
+    required = [lat_col, lon_col, "weight"]
+    if any(column not in out.columns for column in required):
+        raise ValueError(f"{context} must contain latitude, longitude, and weight.")
+    duplicate_rows = out.duplicated([lat_col, lon_col, "target_id"], keep=False)
+    if duplicate_rows.any():
+        raise ValueError(
+            f"{context} contains duplicate latitude/longitude/target_id rows."
+        )
+    return out
 
 
 def _latlon_dim_names(ds, lat_var=None, lon_var=None):
@@ -315,11 +380,14 @@ def unit_centroids(units_gdf):
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")  # geographic-CRS centroid warning is fine here
         cen = units_gdf.geometry.centroid
-    return pd.DataFrame({
+    data = {
         CANON_REGION_KEY: units_gdf[CANON_REGION_KEY].values,
         "lat": np.asarray(cen.y.values, dtype=float),
         "lon": np.asarray(cen.x.values, dtype=float),
-    })
+    }
+    if CANON_REGION_NAME in units_gdf.columns:
+        data[CANON_REGION_NAME] = units_gdf[CANON_REGION_NAME].values
+    return pd.DataFrame(data)
 
 
 def build_grid_cell_units(sample_nc, cfg, valid_cells=None, round_dp=5,
@@ -380,6 +448,7 @@ def build_weights_to_coverage(sample_nc, cfg, coverage_geom, out_csv=None, admin
     denom = ov.groupby(CANON_REGION_KEY)["w"].transform("sum")
     ov["weight"] = ov["w"] / denom
     mapping = ov[["latitude", "longitude", CANON_REGION_KEY, "weight"]].reset_index(drop=True)
+    normalize_regrid_weights(mapping, context="generated coverage weights")
     if out_csv:
         os.makedirs(os.path.dirname(out_csv) or ".", exist_ok=True)
         mapping.to_csv(out_csv, index=False)
@@ -404,7 +473,8 @@ def build_grid_to_admin_weights(sample_nc, cfg, out_csv=None, admin_gdf=None):
         A `geometry` block (see get_geometry_cfg).
     out_csv : str or None
         If given, write the mapping CSV (columns: latitude, longitude,
-        adm3_name, weight).
+        adm3_name, weight). The legacy adm3_name column carries the stable
+        target ID and is accepted interchangeably with target_id on input.
 
     Returns
     -------
@@ -453,6 +523,7 @@ def build_grid_to_admin_weights(sample_nc, cfg, out_csv=None, admin_gdf=None):
     overlaid = overlaid[overlaid["weight"] > 1e-5]
 
     mapping = overlaid[["latitude", "longitude", CANON_REGION_KEY, "weight"]].reset_index(drop=True)
+    normalize_regrid_weights(mapping, context="generated grid-to-admin weights")
 
     if out_csv:
         os.makedirs(os.path.dirname(out_csv) or ".", exist_ok=True)
