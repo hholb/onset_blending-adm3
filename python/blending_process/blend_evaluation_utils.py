@@ -396,7 +396,9 @@ def fit_platt_weights_export(df, prob_cols, training_years,
 
     for bin_name in prob_cols:
         p_raw = np.clip(df_train[bin_name].values.astype(float), 1e-6, 1 - 1e-6)
-        y = (df_train[outcome_col].values == bin_name).astype(float)
+        outcome = df_train[outcome_col]
+        y = ((outcome == bin_name).astype(float)
+             .where(outcome.notna(), np.nan).to_numpy())
 
         ok = np.isfinite(p_raw) & ~np.isnan(y)
         if ok.sum() < 10 or len(np.unique(y[ok])) < 2:
@@ -439,7 +441,9 @@ def platt_cv_multibin(df, prob_cols, holdout_years, true_holdout_years=(),
         cal_mat = np.full((len(test), len(bins)), np.nan)
         for j, b in enumerate(bins):
             p_tr = np.clip(train[b].values.astype(float), 1e-6, 1 - 1e-6)
-            y_tr = (train[outcome_col].values == b).astype(float)
+            outcome = train[outcome_col]
+            y_tr = ((outcome == b).astype(float)
+                    .where(outcome.notna(), np.nan).to_numpy())
             ok = np.isfinite(p_tr) & ~np.isnan(y_tr)
             if ok.sum() < 10 or len(np.unique(y_tr[ok])) < 2:
                 cal_mat[:, j] = test[b].values.astype(float)
