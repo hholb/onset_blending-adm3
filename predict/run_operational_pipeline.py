@@ -84,6 +84,7 @@ import subprocess
 import textwrap
 import shutil
 import atexit
+import pickle
 from datetime import datetime
 
 import yaml
@@ -168,6 +169,46 @@ def check_output_exists(path, step_name):
             f"Check the step's logs above for errors."
         )
     log(f"Output verified: {path}")
+
+
+def required_probability_prefixes_from_coefs(coef_path, connect_spec):
+    """Return connector probability series used by the saved feature schema."""
+    with open(coef_path, "rb") as f:
+        bundle = pickle.load(f)
+
+    if isinstance(bundle, dict):
+        features = bundle.get("features")
+    elif hasattr(bundle, "columns") and "feature" in bundle.columns:
+        features = bundle["feature"].dropna().astype(str).unique().tolist()
+    else:
+        features = None
+    if not features:
+        raise ValueError(
+            f"Coefficient artifact has no saved feature schema: {coef_path}"
+        )
+
+    configured = {
+        f"{model['name']}_p_onset"
+        + ("" if variant is None else f"_{variant}")
+        for model in connect_spec.get("forecast_models", [])
+        for variant in [None] + list(model.get("variants") or [])
+    }
+    required = set()
+    for model in connect_spec.get("forecast_models", []):
+        pattern = re.compile(
+            rf"(?<![A-Za-z0-9_])"
+            rf"({re.escape(model['name'])}_p_onset(?:_[A-Za-z0-9_]+)?)"
+            rf"_week\d+"
+        )
+        for feature in features:
+            required.update(pattern.findall(str(feature)))
+    unknown = sorted(required - configured)
+    if unknown:
+        raise ValueError(
+            "Coefficient feature schema requires forecast probability series "
+            "not declared by connect forecast_models: " + ", ".join(unknown)
+        )
+    return sorted(required)
 
 
 def run_step(step_num, total, name, cmd, expected_output, dry_run):
@@ -470,6 +511,18 @@ def main():
     connect_spec = connect_spec_op
     log(f"Patched spec written: {connect_spec_op_path}")
 
+    coef_path = os.path.join(
+        args.coef_dir,
+        f"coefs_{args.blend_model}_global_{args.coef_tag}.pkl",
+    )
+    required_probability_prefixes = required_probability_prefixes_from_coefs(
+        coef_path, cs_connect
+    )
+    log(
+        "Required forecast probability series: "
+        + (", ".join(required_probability_prefixes) or "none (rainfall-only)")
+    )
+
 
     # ---------------------------------------------------------------------
     # patch blend spec
@@ -550,6 +603,8 @@ def main():
             "python/pipelines/blending_process/0_connect_prepare_data_to_2025_pipeline.py",
             #"--spec_id", args.connect_spec,
             "--spec_id", connect_spec,
+            "--required_probability_prefixes",
+            *required_probability_prefixes,
         ], connect_pkl),
 
         (6, "Apply blend model", [

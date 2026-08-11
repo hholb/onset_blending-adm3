@@ -271,7 +271,7 @@ def week_min_over_starts(roll_mat, week_start_days):
     return np.fmin.reduce(roll_mat[:, idx], axis=1)
 
 
-def make_cv_rds_from_daylevel(spec):
+def make_cv_rds_from_daylevel(spec, required_probability_prefixes=None):
     """
     Main converter: reads daily combined pickle, builds weekly bins, onset
     outcomes, climatology logits, rain-based predictors, and writes wide
@@ -280,6 +280,11 @@ def make_cv_rds_from_daylevel(spec):
     Parameters
     ----------
     spec : dict  parsed YAML spec with mode, input_rds, output_rds, etc.
+    required_probability_prefixes : iterable of str or None
+        Forecast probability series required by the downstream command, such
+        as ``aifs_p_onset_fixed_cutoff``.  ``None`` preserves the legacy
+        behavior in which every configured series is required.  An explicit
+        empty iterable permits missing unused forecast probability series.
 
     Returns
     -------
@@ -371,24 +376,70 @@ def make_cv_rds_from_daylevel(spec):
     else:
         clim_variant_logits = pd.DataFrame(index=raw.index)
 
-    # Forecast model week probabilities
+    # Forecast model week probabilities. Complete series are always retained
+    # for artifact compatibility. Missing series may be skipped only when a
+    # wrapper has supplied an explicit requirement set and the series is not
+    # used downstream.
+    required_probability_prefixes = (
+        None
+        if required_probability_prefixes is None
+        else set(required_probability_prefixes)
+    )
+    configured_probability_prefixes = {
+        f"{fm['name']}_p_onset"
+        + ("" if variant is None else f"_{variant}")
+        for fm in spec["forecast_models"]
+        for variant in [None] + list(fm.get("variants") or [])
+    }
+    if required_probability_prefixes is not None:
+        unknown = sorted(
+            required_probability_prefixes - configured_probability_prefixes
+        )
+        if unknown:
+            raise ValueError(
+                "Downstream requires forecast probability series not declared "
+                "by connect forecast_models: " + ", ".join(unknown)
+            )
+
     model_week_cols_list = {}
     for fm in spec["forecast_models"]:
         model_name = fm["name"]
-        model_week_cols_list[model_name] = sum_week_probs(
-            raw, model_name, day_max=day_max, days_per_bin=days_per_bin, n_bins=n_bins
-        )
-        for variant in (fm.get("variants") or []):
-            variant_key = f"{model_name}_{variant}"
-            model_week_cols_list[variant_key] = sum_week_probs_from_dayprefix(
+        for variant in [None] + list(fm.get("variants") or []):
+            out_prefix = f"{model_name}_p_onset" + (
+                "" if variant is None else f"_{variant}"
+            )
+            day_prefix = f"{out_prefix}_day_"
+            expected = [f"{day_prefix}{k}" for k in range(1, day_max + 1)]
+            missing = [col for col in expected if col not in raw.columns]
+            if missing:
+                is_required = (
+                    required_probability_prefixes is None
+                    or out_prefix in required_probability_prefixes
+                )
+                if is_required:
+                    raise ValueError(
+                        f"Missing required columns for {out_prefix}: "
+                        + ", ".join(missing)
+                    )
+                print(
+                    f"Skipping unused forecast probability series "
+                    f"'{out_prefix}'; missing {len(missing)} of "
+                    f"{day_max} daily columns."
+                )
+                continue
+            model_week_cols_list[out_prefix] = sum_week_probs_from_dayprefix(
                 raw,
-                day_prefix=f"{model_name}_p_onset_{variant}_day_",
-                out_prefix=f"{model_name}_p_onset_{variant}",
+                day_prefix=day_prefix,
+                out_prefix=out_prefix,
                 day_max=day_max,
                 days_per_bin=days_per_bin,
                 n_bins=n_bins,
             )
-    model_week_cols = pd.concat(model_week_cols_list.values(), axis=1)
+    model_week_cols = (
+        pd.concat(model_week_cols_list.values(), axis=1)
+        if model_week_cols_list
+        else pd.DataFrame(index=raw.index)
+    )
 
     # Unconditional climatology (has day_0 -> "earlier")
     unc = sum_week_probs_with_day0(raw, unc_prefix, day_max=day_max,

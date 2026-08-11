@@ -347,6 +347,68 @@ def configure_blend_spec_models(spec, jobs):
         formula["text"] = text
 
 
+def required_probability_prefixes_from_blend_spec(blend_spec, connect_spec):
+    """Return forecast probability series consumed by this training run."""
+    configured = {
+        f"{fm['name']}_p_onset"
+        + ("" if variant is None else f"_{variant}")
+        for fm in connect_spec.get("forecast_models", [])
+        for variant in [None] + list(fm.get("variants") or [])
+    }
+    extras = blend_spec.get("extras") or {}
+    variant_suffixes = extras.get("forecast_variants") or {
+        "base": "",
+        "ref_onset": "_ref",
+        "fixed_cutoff": "_fixed_cutoff",
+    }
+
+    def probability_prefix(name, variant):
+        if variant not in variant_suffixes:
+            raise ValueError(f"Unknown forecast probability variant: {variant}")
+        return f"{name}_p_onset{variant_suffixes[variant]}"
+
+    required = set()
+    enabled_formulas = [
+        formula["text"]
+        for formula in blend_spec.get("models", {}).get("formulas", {}).values()
+        if formula.get("enabled")
+    ]
+    for fm in connect_spec.get("forecast_models", []):
+        pattern = re.compile(
+            rf"(?<![A-Za-z0-9_])"
+            rf"({re.escape(fm['name'])}_p_onset(?:_[A-Za-z0-9_]+)?)"
+            rf"_(?:qx|week\d+)"
+        )
+        for formula in enabled_formulas:
+            required.update(pattern.findall(formula))
+
+    for forecast in extras.get("forecasts") or []:
+        if forecast.get("raw", False) or forecast.get("calibrated", False):
+            required.add(
+                probability_prefix(
+                    forecast["name"], forecast.get("variant", "base")
+                )
+            )
+
+    mme = blend_spec.get("mme") or {}
+    if mme.get("enabled", False):
+        for model in mme.get("blend_models") or []:
+            if model.get("source") == "forecast":
+                required.add(
+                    probability_prefix(
+                        model["name"], model.get("cal_variant", "base")
+                    )
+                )
+
+    unknown = sorted(required - configured)
+    if unknown:
+        raise ValueError(
+            "Blend spec requires forecast probability series not declared by "
+            "connect forecast_models: " + ", ".join(unknown)
+        )
+    return sorted(required)
+
+
 def validate_blend_spec_models(spec, jobs):
     """Require every requested forecast model to appear in the blend spec."""
     requested = [job.model for job in jobs]
@@ -663,6 +725,9 @@ def main():
     cs_blend = load_yaml_spec(args.blend_spec, "2025_blend")
     configure_blend_spec_models(cs_blend, forecast_jobs)
     validate_blend_spec_models(cs_blend, forecast_jobs)
+    required_probability_prefixes = required_probability_prefixes_from_blend_spec(
+        cs_blend, cs_connect
+    )
     blend_spec = write_temp_spec(args.blend_spec, "2025_blend", cs_blend)
 
     # ── Expected output paths ─────────────────────────────────────────────
@@ -728,6 +793,8 @@ def main():
             sys.executable,
             "python/pipelines/blending_process/0_connect_prepare_data_to_2025_pipeline.py",
             "--spec_id", connect_spec,
+            "--required_probability_prefixes",
+            *required_probability_prefixes,
         ], connect_pkl),
 
         (blend_step, "Blend evaluation", blend_eval_cmd, None),
@@ -738,6 +805,10 @@ def main():
     log(f"Work dir    : {work_dir}")
     log(f"Results dir : {args.results_dir}")
     log(f"Connector → evaluator artifact: {connect_output_rds}")
+    log(
+        "Required forecast probability series: "
+        + (", ".join(required_probability_prefixes) or "none (rainfall-only)")
+    )
     log("Forecast sources:")
     for job in forecast_jobs:
         if job.rain_day_max is None:

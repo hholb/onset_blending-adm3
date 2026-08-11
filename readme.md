@@ -185,6 +185,16 @@ application uses that saved formula and requires its Patsy design columns to
 match the saved feature schema exactly. Older bundles without a saved formula
 fall back to the current spec, but the same schema check still applies.
 
+The training and operational wrappers also resolve forecast-probability needs
+at runtime. A complete daily probability series is still aggregated for
+backward-compatible outputs. If a series is shorter than the configured
+probability horizon, the connector skips it only when no downstream formula,
+raw/calibrated evaluation, enabled MME, or saved operational feature requires
+it; otherwise it fails with the missing daily columns. This permits a
+short-horizon forecast to supply constructible rainfall predictors without
+claiming support for incomplete raw or Platt-calibrated probability products.
+No additional YAML option is required.
+
 ### Minimal example
 
 ```bash
