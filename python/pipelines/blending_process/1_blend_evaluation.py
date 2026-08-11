@@ -311,9 +311,11 @@ def main():
                         formula_str,
                         wide_df_allowed,
                         holdout_years,
+                        training_years=training_years,
                         true_holdout_years=true_holdout_years,
                         data_pred=wide_df,
                         save_coefs=True,                                     # ← NEW
+                        required_classes=interval_bins(N_BINS),
                     )
                     cv_preds = cv_preds.reset_index(drop=True)
 
@@ -332,8 +334,7 @@ def main():
                     continue
 
                 if cv_preds is None or cv_preds.empty:
-                    print(f"  No predictions for {model_name}/{method}")
-                    continue
+                    raise ValueError(f"No predictions for {model_name}/{method}.")
 
 #                print("\n cv_pred = ", cv_preds)
                 # Compute metrics
@@ -390,10 +391,7 @@ def main():
             #    continue
 
             except Exception as e:
-                import traceback
-                traceback.print_exc()
-                warnings.warn(f"Error in {model_name}/{method}: {e}")
-                continue
+                raise RuntimeError(f"Error in {model_name}/{method}: {e}") from e
 
     # --------------------------------------------------------------------------
     # Section 2: Climatology logit baselines

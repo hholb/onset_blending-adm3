@@ -747,13 +747,14 @@ def apply_formula_sample_support(data, formulas):
     return filtered, diagnostics
 
 
-def compute_cv_global(formula_str, data_train, holdout_years,
-                       true_holdout_years=(), data_pred=None, n_jobs=1, save_coefs=False):
+def compute_cv_global(formula_str, data_train, holdout_years, training_years,
+                       true_holdout_years=(), data_pred=None, n_jobs=1, save_coefs=False,
+                       required_classes=None):
     """Leave-one-year-out CV using multinomial logistic, pooling all cells.
 
     IMPORTANT: data_train should be restrict_to_allowed(wide_df, dissemination_cells)
-    and data_pred should be wide_df (all cells). This matches R behavior where
-    training uses only allowed cells but predictions are generated for all cells.
+    and data_pred should be wide_df (all cells). Training is restricted to the
+    spec-declared training_years; predictions are generated for all cells.
     """
 #    print("data_pred  =  ", data_pred)
 #    print("\ntrue_holdout_years  =  ", true_holdout_years)
@@ -769,7 +770,9 @@ def compute_cv_global(formula_str, data_train, holdout_years,
 
     for test_year in holdout_years:
         train = data_train[
-            (data_train["year"] != test_year) & (~data_train["year"].isin(true_holdout_years))
+            data_train["year"].isin(training_years)
+            & (data_train["year"] != test_year)
+            & (~data_train["year"].isin(true_holdout_years))
         ]
         test = data_pred[data_pred["year"] == test_year]
 #        print("XXX train , ", train)
@@ -777,8 +780,26 @@ def compute_cv_global(formula_str, data_train, holdout_years,
 #        print("XXX feature , ", feature_cols)
 #        import sys
 #        sys.exit()
-        if train.empty or test.empty:
-            continue
+        if test.empty:
+            raise ValueError(f"Global CV holdout year {test_year} has no test rows.")
+        if train.empty:
+            raise ValueError(
+                f"Global CV holdout year {test_year} has no training rows in "
+                f"training_years={sorted(set(training_years))}."
+            )
+        if required_classes is not None:
+            present_classes = {
+                value for value in train["outcome"].unique()
+                if isinstance(value, str)
+            }
+            missing_classes = [
+                value for value in required_classes if value not in present_classes
+            ]
+            if missing_classes:
+                raise ValueError(
+                    f"Global CV holdout year {test_year} training rows are missing "
+                    f"outcome classes: {', '.join(missing_classes)}."
+                )
         #preds = _fit_predict_multinom(train, test, feature_cols)
         #if preds is not None:
         #    result = pd.concat([test.reset_index(drop=True), preds.reset_index(drop=True)], axis=1)
@@ -826,10 +847,14 @@ def compute_cv_global(formula_str, data_train, holdout_years,
                     "scaler":   clf.scaler_,
                     "features": actual_features,
                 }
+        else:
+            raise ValueError(f"Global CV model fitting failed for holdout year {test_year}.")
 
     #return pd.concat(results, ignore_index=True) if results else pd.DataFrame()
     # NEW — final return:
-    cv_preds = pd.concat(results, ignore_index=True) if results else pd.DataFrame()
+    if not results:
+        raise ValueError("Global CV produced no fold predictions.")
+    cv_preds = pd.concat(results, ignore_index=True)
     #if save_coefs:                                                              # ← NEW
     #    return cv_preds, coefs_by_year                                         # ← NEW
     #return cv_preds                                                             # ← NEW (was a one-liner)
