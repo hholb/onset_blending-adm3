@@ -48,7 +48,8 @@ Input files
 2. The coef pickle (looked up automatically from --coef_dir):
    coefs_blended_model_global_clim_mok_date_2022_year2022.pkl  (historical)
    coefs_blended_model_global_final.pkl                         (future, via --coef_tag)
-   Contains fitted coefficients, scaler, and feature names.
+   Contains fitted coefficients, scaler, feature names, and (for new bundles)
+   the resolved training formula.
 
 3. The wide pickle (historical) or --input_path (future):
    Monsoon_Data/Processed_Data/2025_pipeline_input/cv_data_clim_mok_date_new_pipeline.pkl
@@ -92,7 +93,7 @@ from python.pipelines._shared.misc import coalesce
 # ---------------------------------------------------------------------------
 
 def load_coefs(coef_path):
-    """Load coefficient bundle (dict with coefs, scaler, features) from pickle.
+    """Load coefficient bundle (coefs, scaler, features, optional formula).
     Falls back gracefully if old-format bare DataFrame pickle is found.
     """
     if not os.path.exists(coef_path):
@@ -111,6 +112,55 @@ def load_coefs(coef_path):
             "features": list(obj["feature"].unique()),
         }
     return obj
+
+
+def resolve_application_formula(coef_bundle, spec, cutoff_mode, model_name,
+                                data):
+    """Prefer the saved training formula; support older bundles via the spec."""
+    saved_formula = coef_bundle.get("formula")
+    if saved_formula:
+        return saved_formula, "saved coefficient bundle"
+
+    formulas = build_formulas_from_spec(spec, cutoff_mode, data=data)
+    if model_name not in formulas:
+        raise ValueError(
+            f"Model '{model_name}' not found in spec formulas. "
+            f"Available: {list(formulas.keys())}"
+        )
+    return formulas[model_name], "current spec (legacy coefficient bundle)"
+
+
+def build_application_design_matrix(formula_str, data, feature_cols):
+    """Build a Patsy matrix and enforce the saved training feature schema."""
+    rhs = formula_str.split("~", 1)[1].strip() if "~" in formula_str else formula_str
+    design = patsy.dmatrix(
+        rhs,
+        data,
+        return_type="dataframe",
+        NA_action=patsy.NAAction(NA_types=[]),
+    ).drop(columns=["Intercept"], errors="ignore")
+
+    missing = [feature for feature in feature_cols if feature not in design]
+    unexpected = [feature for feature in design if feature not in feature_cols]
+    if missing or unexpected:
+        raise ValueError(
+            "Applied design matrix does not match the saved training schema. "
+            f"Missing: {missing}; unexpected: {unexpected}."
+        )
+
+    design = design.loc[:, feature_cols]
+    all_nonfinite = [
+        column for column in feature_cols
+        if not np.isfinite(
+            pd.to_numeric(design[column], errors="coerce").to_numpy(dtype=float)
+        ).any()
+    ]
+    if all_nonfinite:
+        raise ValueError(
+            "Saved model features have no finite values in the application "
+            f"data: {all_nonfinite}."
+        )
+    return design
 
 
 def apply_coefs(coef_df, wide_df, feature_cols, design_matrix=None):          # ← NEW: added design_matrix param
@@ -329,25 +379,19 @@ def main():
     print(f"Input rows for year {args.year}: {len(test_df)}")
 
     # ── Get formula ────────────────────────────────────────────────────
-    formulas = build_formulas_from_spec(spec, cutoff_mode)
-    if args.model not in formulas:
-        raise ValueError(
-            f"Model '{args.model}' not found in spec formulas. "
-            f"Available: {list(formulas.keys())}"
-        )
-    formula_str = formulas[args.model]
+    formula_str, formula_source = resolve_application_formula(
+        coef_bundle, spec, cutoff_mode, args.model, test_df
+    )
 
-    print(f"\nFormula: {formula_str}")
+    print(f"\nFormula ({formula_source}): {formula_str}")
     print(f"Feature columns ({len(feature_cols)}): {feature_cols}")
 
     # ── Build design matrix with patsy ────────────────────────────────
     # patsy expands interaction terms (a:b) that don't exist as raw columns,
     # matching exactly what was done during training. NA_action keeps NaN rows.
-    rhs = formula_str.split("~", 1)[1].strip() if "~" in formula_str else formula_str
-    X_df = patsy.dmatrix(rhs, test_df, return_type="dataframe",
-                         NA_action=patsy.NAAction(NA_types=[]))
-    X_df = X_df.drop(columns=["Intercept"], errors="ignore")
-    X_df = X_df.reindex(columns=feature_cols, fill_value=0.0)
+    X_df = build_application_design_matrix(
+        formula_str, test_df, feature_cols
+    )
 
     # ← NEW: apply the same StandardScaler fitted during training
     if scaler is not None:                                                    # ← NEW

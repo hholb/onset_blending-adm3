@@ -14,7 +14,7 @@ All pipeline behaviour is controlled by YAML spec files. You can point the pipel
 - **Different AI forecast models**: Create a new spec in `specs/raw_data/` modelled after `ngcm.yml` (for ensembles) or `aifs.yml`. The pipeline handles ensemble forecasts in NetCDF format with configurable dimension names and variable mappings. The `name` field under `forecast_models` in the connect spec controls all downstream column names and formula terms — changing it there propagates everywhere automatically.
 - **Different grid resolutions**: Not being used in the current version.
 - **Different onset definitions**: Edit `options.onset_definition` in your raw data spec (see [Onset Definition](#onset-definition) below). All numerical parameters — trigger window, wet-day threshold, accumulation threshold, follow-up period, and dry-spell check — are fully configurable from the yml. No code changes needed.
-- **Different blending model formulas**: Edit `models.formulas` in `specs/2025_blend/cv_models*.yml`. Formula terms use `_qx` as a shorthand that expands to `_week1` through `_week4` at runtime.
+- **Different blending model formulas**: Edit `models.formulas` in `specs/2025_blend/cv_models*.yml`. Formula terms use `_qx` as a shorthand that expands across the configured week bins for which each rain feature is constructible.
 - **Different forecast systems in the MME**: Not being used in the current version. Edit `mme.blend_models` in `specs/2025_blend/cv_models*.yml`.
 - **Different rain predictors**: Edit `rain_predictors` under each model in `specs/2025_blend/connect_*.yml`. Supports both legacy string format (`diff_5day`) and new dict format (`{ agg: diff, window: 5 }`). The dict format is preferred as it generalises to any window size without code changes.
 
@@ -179,6 +179,11 @@ Before running, ensure you have:
 - Trained blending model coef pkl from `1_blend_evaluation.py` (historical training)
 - Historical ground truth wide pkl (e.g. `ref_rain_fixed_cutoff_wide.pkl`) covering 2000–2022
 - All 2026 yml specs created in `specs/raw_data/`, `specs/combine/`, `specs/2025_blend/`, and `specs/connect/`
+
+New coefficient bundles store the resolved training formula. Operational
+application uses that saved formula and requires its Patsy design columns to
+match the saved feature schema exactly. Older bundles without a saved formula
+fall back to the current spec, but the same schema check still applies.
 
 ### Minimal example
 
@@ -479,7 +484,7 @@ Three aggregation types are available:
 | `max`  | `max_{model}_{N}day_week{w}` | Max rolling N-day sum over week |
 | `min`  | `min_{model}_{N}day_week{w}` | Min rolling N-day sum over week |
 
-Output column names (e.g. `diff_ngcm_week1`, `min_ngcm_7day_week1`) are constructed at runtime from the model name and window size, and must match formula terms in `cv_models*.yml` using the `_qx` shorthand, which expands to `_week1` through `_week4` at runtime.
+Output column names (e.g. `diff_ngcm_week1`, `min_ngcm_7day_week1`) are constructed at runtime from the model name and window size. In a formula, `_qx` expands across all configured bins and drops only terms whose rain features are marked structurally unavailable by the connector's `rain_day_max` metadata. Interactions containing an unavailable rain feature are dropped while their constructible main effects are retained. An explicitly written `_weekN` term remains required and raises an error if it is unavailable.
 
 ### Rain transform (feature-only)
 
@@ -507,7 +512,7 @@ forecast_models:
 
 Power/log transforms clip inputs at 0 (rainfall sums and thresholds are non-negative); NaNs (e.g. short-week sentinels) propagate unchanged.
 
-To add or remove a predictor: edit `rain_predictors` in the connect spec **and** add or remove the corresponding `_qx` term in the formula in `cv_models*.yml`. The two must stay in sync — a predictor present in the connect spec but absent from the formula is computed but silently unused; a formula term without a matching column will cause a runtime error.
+To add or remove a predictor: edit `rain_predictors` in the connect spec **and** add or remove the corresponding `_qx` term in the formula in `cv_models*.yml`. The two must stay in sync — a predictor present in the connect spec but absent from the formula is computed but silently unused; a formula term without a matching column will cause a runtime error. Formula-resolution diagnostics record the original, expanded, and resolved formula plus any dropped horizon-limited terms.
 
 ---
 
@@ -583,7 +588,7 @@ All pipeline behaviour is controlled by YAML specs. Spec files define input path
 ### Key spec sections (`cv_models*.yml`)
 
 - **`run.training_years` / `run.cv_holdout_years`**: Years used for cross-validated training and evaluation (currently 2019–2022).
-- **`models.formulas`**: Named multinomial logistic regression formulas. Terms with `_qx` are expanded to `_week1`–`_week4` at runtime by `expand_formula_str()`. Current active formulas:
+- **`models.formulas`**: Named multinomial logistic regression formulas. Terms with `_qx` are expanded to the configured week bins and resolved against connector rainfall-horizon metadata before fitting. Explicit `_weekN` terms are always strict. Current active formulas:
   - `ngcm_blend`: climatology × ngcm diff
   - `int_all`: climatology × ngcm diff × aifs diff (interaction)
   - `add_blend`: climatology + ngcm diff + aifs diff (additive)

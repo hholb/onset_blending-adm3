@@ -257,8 +257,14 @@ def main():
 
     # Build formulas before selecting sample support. Only predictors actually
     # referenced by enabled formulas may determine the common evaluation rows.
-    formulas = build_formulas_from_spec(spec, cutoff_mode)
+    formulas, formula_resolution = build_formulas_from_spec(
+        spec,
+        cutoff_mode,
+        data=wide_df,
+        return_resolution=True,
+    )
     wide_df, support = apply_formula_sample_support(wide_df, formulas)
+    support["formula_resolution"] = formula_resolution
     print(
         "Formula sample support "
         f"({support['policy']}): {support['rows_before']} -> "
@@ -276,7 +282,7 @@ def main():
 
     print(f"Loaded {len(wide_df)} supported rows from {input_path}")
     print(f"Formulas: {list(formulas.keys())}")
-    print_formula_summary(spec, cutoff_mode)
+    print_formula_summary(spec, cutoff_mode, formulas=formulas)
 
     # FIX Bug 1: restrict training to allowed cells; predict on all cells
     wide_df_allowed = restrict_to_allowed(wide_df, dissemination_cells)

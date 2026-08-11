@@ -22,7 +22,7 @@ Usage (run from repo root)
 
 Output
 ------
-    coefs_blended_model_global_final.pkl   <- coef bundle (coefs, scaler, features)
+    coefs_blended_model_global_final.pkl   <- coef bundle (coefs, scaler, features, formula)
     coefs_blended_model_global_final.csv   <- human-readable coefficient table
 
 Then to apply to a future year:
@@ -58,6 +58,7 @@ from python.blending_process.blend_evaluation_utils import (
     make_cutoff_tag,
     restrict_to_allowed,
     _make_multinom_clf,
+    validate_formula_feature_support,
 )
 from python.pipelines._shared.read_spec import load_spec
 
@@ -77,7 +78,7 @@ def fit_final_model(formula_str, train_df):
 
     Returns
     -------
-    bundle : dict with keys coefs, scaler, features
+    bundle : dict with keys coefs, scaler, features, formula
     """
     # Build design matrix via patsy (handles interaction terms)
     rhs  = formula_str.split("~", 1)[1].strip() if "~" in formula_str else formula_str
@@ -133,6 +134,7 @@ def fit_final_model(formula_str, train_df):
         "coefs":    coef_df,
         "scaler":   scaler,
         "features": feature_cols,
+        "formula":  formula_str,
     }
 
 
@@ -221,13 +223,16 @@ def main():
     print(f"  Training rows (allowed cells) : {len(train_df)}")
 
     # ── Get formula ────────────────────────────────────────────────────
-    formulas = build_formulas_from_spec(spec, cutoff_mode)
+    formulas = build_formulas_from_spec(spec, cutoff_mode, data=wide_df)
     if args.model not in formulas:
         raise ValueError(
             f"Model '{args.model}' not found in spec formulas. "
             f"Available: {list(formulas.keys())}"
         )
     formula_str = formulas[args.model]
+    validate_formula_feature_support(
+        train_df, {args.model: formula_str}
+    )
     print(f"\nFormula : {formula_str}")
 
     # ── Fit model on all training years ───────────────────────────────
