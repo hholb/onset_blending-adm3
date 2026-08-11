@@ -6,14 +6,14 @@ Converts raw NetCDF rainfall data (IMD ground truth, NeuralGCM and AIFS forecast
 
 ### Stage 0 (optional): `0_regrid_to_shapefile.py`
 
-Regrids gridded rainfall onto a shapefile's admin units before Stage 1 (spec in `specs/regrid/`). Builds grid→unit area weights, restricts them to cells that actually have ground-truth data (renormalized to sum to 1 per unit), and applies those **same** weights to both the ground truth and the forecasts so they share one spatial footprint. Regridding is applied to rainfall, not to probabilities. Writes `<name>_adm3.nc` beside each input; point the Stage-1 specs at those. See "Re-targeting to a New Geography" in the top-level README.
+Regrids gridded rainfall onto a shapefile's admin units before Stage 1 (spec in `specs/regrid/`). Builds grid→unit area weights, restricts them to cells that actually have ground-truth data (renormalized to sum to 1 per unit), and applies those **same** weights to both the ground truth and the forecasts so they share one spatial footprint. Regridding is applied to rainfall, not to probabilities. Source-to-target weights are compiled into a sparse matrix and applied in bounded value chunks. Writes `<name>_adm3.nc` beside each input; point the Stage-1 specs at those. See "Re-targeting to a New Geography" in the top-level README.
 
 ### Stage 1: `1_process_raw_nc_files.py`
 
 Reads raw NetCDF files, detects monsoon onset per grid cell using the configured onset definition, and writes wide-format pickle tables.
 
 - **Forecast systems** (e.g., `--spec_id ngcm`): Produces per-ensemble-member onset probabilities across lead days.
-- **Ground truth** (e.g., `--spec_id ref_rain_fixed_cutoff`): Produces observed onset dates and long/wide rainfall tables.
+- **Ground truth** (e.g., `--spec_id ref_rain_fixed_cutoff`): Produces observed onset dates and a wide rainfall table, plus an optional annotated daily-long table.
 
 The onset definition is fully configurable from the spec under `options.onset_definition`. Two dry-spell veto modes are supported: `consecutive_dry` (new definition) and `window_sum` (original Moron-Robertson definition). All numerical parameters — trigger window, wet-day threshold, accumulation threshold, follow-up period, and dry-spell check — are set in the yml. See [Onset Definition](#onset-definition) below.
 
@@ -48,7 +48,7 @@ python python/pipelines/prepare_data/3_combine_datasets.py --spec_id combine_tem
 
 ## Spec Files
 
-- **`specs/raw_data/*.yml`**: One per data source. Key fields: `type` (`ground_truth_rainfall` / `rainfall_forecast`), `input.nc_folder`, `output.out_dir`, `options.onset_definition`, `thresholds`, `ref_onset`, `paths.climatology_out_dir`, `climatologies`.
+- **`specs/raw_data/*.yml`**: One per data source. Key fields: `type` (`ground_truth_rainfall` / `rainfall_forecast`), `input.nc_folder`, `output.out_dir`, optional `output.write_long`, `options.onset_definition`, `thresholds`, `ref_onset`, `paths.climatology_out_dir`, `climatologies`.
 - **`specs/combine/*.yml`**: One per combination template. Key fields: `input.ground_truth_wide_rds`, `input.climatologies`, `forecasts`, `output.out_dir`.
 
 ---
@@ -176,8 +176,9 @@ When `options.cell_transform_enabled: true`, a CSV weights file is required with
 
 The transform is applied before target/dissemination filtering. For each target,
 weights are renormalized over source cells with finite rainfall; if none are
-observed, the transformed rainfall remains missing. Thresholds must match the
-target units when cell transform is enabled.
+observed, the transformed rainfall remains missing. The same sparse observed-weight
+engine is used for forecast and ground-truth transforms. Thresholds must match
+the target units when cell transform is enabled.
 
 ---
 
@@ -216,7 +217,11 @@ One row per (grid cell, year).
 | `onset_day` | float | Days from `cutoff_month_day` to onset (e.g., days since May 1) |
 | `cutoff_date` | date | Season start date for that year |
 
-#### Ground truth long table (`<spec_id>_long.pkl`)
+#### Ground truth long table (`<spec_id>_long.pkl`, optional)
+
+Set `output.write_long: false` to skip constructing and writing this diagnostic
+artifact. The default is `true` for backward compatibility. The wide onset
+table used by climatology and blending is still written.
 
 One row per (grid cell, day). Annotated daily rainfall series.
 

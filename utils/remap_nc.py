@@ -6,6 +6,10 @@ import pandas as pd
 import xarray as xr
 
 from python.prepare_data.geometry_utils import normalize_regrid_weights
+from python.prepare_data.sparse_transform_utils import (
+    compile_sparse_cell_transform,
+    sparse_observed_weighted_mean,
+)
 
 
 def batch_aggregate_to_adm3_matrix(input_dir, mapping_csv_path, input_file=None):
@@ -21,16 +25,10 @@ def batch_aggregate_to_adm3_matrix(input_dir, mapping_csv_path, input_file=None)
     for column in ("lat", "lon", "weight"):
         mapping[column] = pd.to_numeric(mapping[column], errors="raise")
 
-    # 2. Prepare Weights Matrix
-    weights_xr = mapping.set_index(['lat', 'lon', 'adm3_name'])['weight'].to_xarray().fillna(0)
-    weights_matrix = weights_xr.stack(pixel=['lat', 'lon'])
+    mapping['source_id'] = list(zip(mapping['lat'], mapping['lon']))
+    mapping['target_id'] = mapping['target_id'].astype(str)
 
-    # Per-adm3 weight sum (shape: adm3_name) — used for normalization.
-    # Must be computed per-adm3, NOT summed over everything (old bug: summed
-    # over pixel AND adm3_name together, giving a scalar that made all results NaN).
-    weight_sum_per_adm3 = weights_matrix.sum(dim='pixel')  # shape: (adm3_name,)
-
-    # 3. Process Files
+    # 2. Process files
     if input_file is not None:
         nc_files = [input_file]
     else:
@@ -40,6 +38,7 @@ def batch_aggregate_to_adm3_matrix(input_dir, mapping_csv_path, input_file=None)
         print("No new .nc files found to process.")
         return
 
+    transforms_by_grid = {}
     for file_path in nc_files:
         print(f"Processing: {os.path.basename(file_path)}...")
 
@@ -57,6 +56,19 @@ def batch_aggregate_to_adm3_matrix(input_dir, mapping_csv_path, input_file=None)
             if rename_ll:
                 ds = ds.rename(rename_ll)
 
+            source_ids = tuple(
+                (float(lat), float(lon))
+                for lat in ds['lat'].values
+                for lon in ds['lon'].values
+            )
+            transform = transforms_by_grid.get(source_ids)
+            if transform is None:
+                transform = compile_sparse_cell_transform(
+                    mapping,
+                    source_ids=source_ids,
+                    target_ids=tuple(sorted(mapping['target_id'].unique())),
+                )
+                transforms_by_grid[source_ids] = transform
             processed_vars = {}
 
             for var_name in ds.data_vars:
@@ -70,47 +82,28 @@ def batch_aggregate_to_adm3_matrix(input_dir, mapping_csv_path, input_file=None)
                     if fill_val is not None:
                         da = da.where(da != fill_val)
 
-                    # Stack spatial dims
-                    da_stacked = da.stack(pixel=['lat', 'lon'])  # (time, pixel)
-
-                    # For each pixel/adm3 pair, set weight to 0 where data is NaN
-                    # so NaN pixels don't contribute to either the sum or the
-                    # effective weight denominator.
-                    valid_mask = da_stacked.notnull()  # (time, pixel)
-
-#                    # Weighted sum of valid data: (time, adm3_name)
-#                    da_filled = da_stacked.fillna(0.0)
-#                    dist_sum = xr.dot(da_filled, weights_matrix, dims='pixel')
-#
-#                    # Effective weight sum per (time, adm3_name) — excludes NaN pixels
-#                    # Broadcast weights_matrix to (time, pixel) by multiplying with valid_mask
-#                    effective_weights = weights_matrix * valid_mask  # (time, pixel, adm3_name)
-#                    effective_weight_sum = effective_weights.sum(dim='pixel')  # (time, adm3_name)
-#
-#                    # Weighted average; NaN where no valid pixels contributed
-#                    result = xr.where(effective_weight_sum > 0,
-#                                      dist_sum / effective_weight_sum,
-#                                      np.nan)
-
-                    # 1. Weighted sum of valid data (You already do this efficiently)
-                    da_filled = da_stacked.fillna(0.0)
-                    dist_sum = xr.dot(da_filled, weights_matrix, dims='pixel')
-                    
-                    # 2. OPTIMIZED: Effective weight sum using xr.dot
-                    # We treat the boolean mask as 1s and 0s and dot it with the weights
-                    effective_weight_sum = xr.dot(valid_mask.astype(float), weights_matrix, dims='pixel')
-                    
-                    # 3. Weighted average
-                    result = xr.where(effective_weight_sum > 0,
-                                      dist_sum / effective_weight_sum,
-                                      np.nan)
-
-
-                    # Restore adm3_name coordinate (xr.where can drop it)
-                    result['adm3_name'] = weight_sum_per_adm3['adm3_name']
+                    other_dims = [dim for dim in da.dims if dim not in ('lat', 'lon')]
+                    ordered = da.transpose(*other_dims, 'lat', 'lon')
+                    other_shape = tuple(ordered.sizes[dim] for dim in other_dims)
+                    source_values = np.asarray(ordered.values, dtype=float).reshape(
+                        (-1, len(source_ids))
+                    ).T
+                    transformed = sparse_observed_weighted_mean(
+                        transform, source_values
+                    ).T.reshape(other_shape + (len(transform.target_ids),))
+                    result = xr.DataArray(
+                        transformed,
+                        dims=other_dims + ['adm3_name'],
+                        coords={
+                            **{dim: ordered.coords[dim] for dim in other_dims},
+                            'adm3_name': np.asarray(transform.target_ids, dtype=object),
+                        },
+                        attrs=da.attrs,
+                        name=var_name,
+                    )
                     processed_vars[var_name] = result
 
-            # 4. Reconstruct Dataset and save
+            # 3. Reconstruct dataset and save
             adm3_ds = xr.Dataset(processed_vars)
 
             base_name = os.path.splitext(file_path)[0]

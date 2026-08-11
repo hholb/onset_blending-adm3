@@ -15,6 +15,7 @@
 import os
 import re
 import pickle
+import warnings
 import numpy as np
 import pandas as pd
 from datetime import datetime, date, timedelta
@@ -41,6 +42,11 @@ from .spatial_id_utils import (
     resolve_grid_id_convention,
     validate_id_coordinate_consistency,
     validate_expected_source_ids,
+)
+from .sparse_transform_utils import (
+    compile_sparse_cell_transform,
+    sparse_observed_weighted_mean,
+    sparse_target_support,
 )
 
 
@@ -81,6 +87,8 @@ def validate_spec_single(spec):
                 raise ValueError("Missing options.window")
             if s.get("options", {}).get("cutoff_month_day") is None:
                 raise ValueError("Missing options.cutoff_month_day")
+            if not isinstance(s.get("output", {}).get("write_long", True), bool):
+                raise ValueError("output.write_long must be true or false")
         if not os.path.isdir(s["input"]["nc_folder"]):
             raise ValueError(f"input.nc_folder does not exist: {s['input']['nc_folder']}")
 
@@ -594,6 +602,11 @@ def read_cell_transform(spec):
             f"format={convention.number_format} "
             f"({convention.source})"
         )
+    w.attrs["sparse_transform"] = compile_sparse_cell_transform(
+        w,
+        source_ids=tuple(sorted(w["source_id"].unique())),
+        target_ids=tuple(sorted(w["target_id"].unique())),
+    )
     return w
 
 
@@ -635,19 +648,20 @@ def _observed_weighted_mean(df, value_col, group_cols):
     return out[group_cols + [value_col]]
 
 
-def transform_forecast_wide(df, weights_df, spec=None):
-    """Apply cell transform to forecast wide-by-day DataFrame."""
-    if weights_df is None:
-        return df
-    df = _prepare_transform_source_ids(
-        df, weights_df, spec, "forecast cell transform"
-    )
-    day_cols = [c for c in df.columns if re.search(r"_day_\d+$", c)]
-    if not day_cols:
-        raise ValueError("No forecast day columns found to transform.")
+def _get_sparse_transform(weights_df):
+    transform = weights_df.attrs.get("sparse_transform")
+    if transform is None:
+        transform = compile_sparse_cell_transform(
+            weights_df,
+            source_ids=tuple(sorted(weights_df["source_id"].unique())),
+            target_ids=tuple(sorted(weights_df["target_id"].unique())),
+        )
+        weights_df.attrs["sparse_transform"] = transform
+    return transform
 
-    spatial_cols = {"id", "adm3_name", "lat", "lon", "latitude", "longitude"}
-    meta_cols = [c for c in df.columns if c not in day_cols and c not in spatial_cols]
+
+def _transform_forecast_wide_pandas(df, weights_df, day_cols, meta_cols):
+    """Trusted pandas reference path for forecast cell transforms."""
     long = df.melt(id_vars=["id"] + meta_cols, value_vars=day_cols,
                    var_name="day_col", value_name="rain")
     long = long.merge(weights_df.rename(columns={"source_id": "id"}), on="id", how="inner")
@@ -662,8 +676,102 @@ def transform_forecast_wide(df, weights_df, spec=None):
     return wide
 
 
+def _transform_groundtruth_long_pandas(df, weights_df, value_col, meta_cols):
+    """Trusted pandas reference path for ground-truth cell transforms."""
+    x = df.merge(weights_df.rename(columns={"source_id": "id"}), on="id", how="inner")
+    trans = _observed_weighted_mean(
+        x, value_col, meta_cols + ["target_id"]
+    )
+    trans = trans.rename(columns={"target_id": "id"})
+    return trans
+
+
+def _transform_values_sparse(df, weights_df, value_cols, meta_cols,
+                             group_chunk_size=16):
+    """Transform one or more rainfall columns in bounded metadata-group chunks."""
+    transform = _get_sparse_transform(weights_df)
+    work = df[df["id"].isin(transform.source_index)].copy()
+    work["id"] = work["id"].astype(str)
+    group_id_col = "_transform_group_id"
+    if meta_cols:
+        work[group_id_col] = work.groupby(
+            meta_cols, sort=True, dropna=False
+        ).ngroup()
+        group_meta = work[[group_id_col] + meta_cols].drop_duplicates(group_id_col)
+    else:
+        work[group_id_col] = 0
+        group_meta = pd.DataFrame({group_id_col: [0]})
+    group_meta = group_meta.sort_values(group_id_col).reset_index(drop=True)
+
+    chunks = []
+    group_ids = group_meta[group_id_col].to_numpy()
+    n_source = len(transform.source_ids)
+    n_target = len(transform.target_ids)
+    n_value = len(value_cols)
+    for start in range(0, len(group_ids), int(group_chunk_size)):
+        chunk_ids = group_ids[start:start + int(group_chunk_size)]
+        rows = work[work[group_id_col].isin(chunk_ids)]
+        group_pos = rows[group_id_col].map(
+            {group_id: pos for pos, group_id in enumerate(chunk_ids)}
+        ).to_numpy(int)
+        source_pos = rows["id"].map(transform.source_index).to_numpy(int)
+        values = rows[value_cols].apply(pd.to_numeric, errors="coerce").to_numpy(float)
+
+        source_values = np.full((n_source, len(chunk_ids) * n_value), np.nan)
+        for value_pos in range(n_value):
+            output_pos = group_pos * n_value + value_pos
+            source_values[source_pos, output_pos] = values[:, value_pos]
+        transformed = sparse_observed_weighted_mean(transform, source_values)
+
+        present_sources = np.zeros((n_source, len(chunk_ids)), dtype=bool)
+        present_sources[source_pos, group_pos] = True
+        supported = sparse_target_support(transform, present_sources)
+
+        chunk_meta = group_meta.set_index(group_id_col).loc[chunk_ids].reset_index()
+        if meta_cols:
+            out = chunk_meta.loc[
+                chunk_meta.index.repeat(n_target), meta_cols
+            ].reset_index(drop=True)
+        else:
+            out = pd.DataFrame(index=np.arange(len(chunk_ids) * n_target))
+        out["id"] = np.tile(transform.target_ids, len(chunk_ids))
+        for value_pos, value_col in enumerate(value_cols):
+            out[value_col] = transformed[:, value_pos::n_value].T.reshape(-1)
+        chunks.append(out.loc[supported.T.reshape(-1)].reset_index(drop=True))
+
+    if not chunks:
+        return pd.DataFrame(columns=meta_cols + ["id"] + value_cols)
+    return pd.concat(chunks, ignore_index=True)[meta_cols + ["id"] + value_cols]
+
+
+def transform_forecast_wide(df, weights_df, spec=None):
+    """Apply a sparse cell transform to a forecast wide-by-day DataFrame."""
+    if weights_df is None:
+        return df
+    df = _prepare_transform_source_ids(
+        df, weights_df, spec, "forecast cell transform"
+    )
+    day_cols = [c for c in df.columns if re.search(r"_day_\d+$", c)]
+    if not day_cols:
+        raise ValueError("No forecast day columns found to transform.")
+    spatial_cols = {"id", "adm3_name", "lat", "lon", "latitude", "longitude"}
+    meta_cols = [c for c in df.columns if c not in day_cols and c not in spatial_cols]
+    relevant = df[df["id"].isin(set(weights_df["source_id"]))]
+    if relevant.duplicated(meta_cols + ["id"]).any():
+        warnings.warn(
+            "Duplicate source IDs within a forecast metadata group; using the "
+            "pandas cell-transform reference path.",
+            RuntimeWarning,
+        )
+        return _transform_forecast_wide_pandas(df, weights_df, day_cols, meta_cols)
+    out = _transform_values_sparse(df, weights_df, day_cols, meta_cols)
+    return out.sort_values(
+        meta_cols + ["id"], na_position="first"
+    ).reset_index(drop=True)
+
+
 def transform_groundtruth_long(df, weights_df, value_col, spec=None):
-    """Apply cell transform to ground-truth long DataFrame."""
+    """Apply a sparse cell transform to a ground-truth long DataFrame."""
     if weights_df is None:
         return df
     df = _prepare_transform_source_ids(
@@ -673,12 +781,17 @@ def transform_groundtruth_long(df, weights_df, value_col, spec=None):
         raise ValueError(f"Value col not found: {value_col}")
     spatial_cols = {"id", "adm3_name", "lat", "lon", "latitude", "longitude"}
     meta_cols = [c for c in df.columns if c != value_col and c not in spatial_cols]
-    x = df.merge(weights_df.rename(columns={"source_id": "id"}), on="id", how="inner")
-    trans = _observed_weighted_mean(
-        x, value_col, meta_cols + ["target_id"]
-    )
-    trans = trans.rename(columns={"target_id": "id"})
-    return trans
+    relevant = df[df["id"].isin(set(weights_df["source_id"]))]
+    if relevant.duplicated(meta_cols + ["id"]).any():
+        warnings.warn(
+            "Duplicate source IDs within a ground-truth metadata group; using "
+            "the pandas cell-transform reference path.",
+            RuntimeWarning,
+        )
+        return _transform_groundtruth_long_pandas(
+            df, weights_df, value_col, meta_cols
+        )
+    return _transform_values_sparse(df, weights_df, [value_col], meta_cols)
 
 
 # ---------------------------------------------------------------------------
@@ -1119,7 +1232,8 @@ def process_ground_truth_rainfall_id(df, spec, ref_onset_dt=None, thr_dt=None, v
     """
     Ground-truth pipeline: compute onset dates per (id, year).
 
-    Returns dict: {"wide": DataFrame, "long": DataFrame}
+    Returns dict: {"wide": DataFrame, "long": DataFrame or None}. The
+    annotated daily-long table is omitted when output.write_long is false.
     """
     df = df.copy()
     df = ensure_id_col(df, spec=spec, context="ground-truth spatial IDs")
@@ -1142,9 +1256,10 @@ def process_ground_truth_rainfall_id(df, spec, ref_onset_dt=None, thr_dt=None, v
     #win = int(spec["options"]["window"])
     onset_params = read_onset_params(spec)
     win = onset_params.win
+    write_long = spec.get("output", {}).get("write_long", True)
 
     wide_rows = []
-    long_rows = []
+    long_rows = [] if write_long else None
 
     for (cell_id, yr), g in df.groupby(["id", "year"]):
         series = g[value_col].values
@@ -1191,21 +1306,22 @@ def process_ground_truth_rainfall_id(df, spec, ref_onset_dt=None, thr_dt=None, v
             "cutoff_date": cutoff_date,
         })
 
-        ref_onset_date = g["ref_onset_date"].iloc[0]
-        for _, row in g.iterrows():
-            long_rows.append({
-                "id": cell_id,
-                "time": row["time"],
-                "year": yr,
-                value_col: row[value_col],
-                "onset_thresh": th,
-                "ref_onset_date": ref_onset_date,
-                "onset_date": onset_date,
-                "onset_flag": row["time"] == onset_date,
-            })
+        if write_long:
+            ref_onset_date = g["ref_onset_date"].iloc[0]
+            for _, row in g.iterrows():
+                long_rows.append({
+                    "id": cell_id,
+                    "time": row["time"],
+                    "year": yr,
+                    value_col: row[value_col],
+                    "onset_thresh": th,
+                    "ref_onset_date": ref_onset_date,
+                    "onset_date": onset_date,
+                    "onset_flag": row["time"] == onset_date,
+                })
 
     wide = pd.DataFrame(wide_rows)
-    long = pd.DataFrame(long_rows)
+    long = pd.DataFrame(long_rows) if write_long else None
     return {"wide": wide, "long": long}
 
 
@@ -1229,6 +1345,8 @@ def run_single_pipeline(spec_id):
     out_dir = spec["output"]["out_dir"]
     os.makedirs(out_dir, exist_ok=True)
     basename = spec["output"].get("basename", spec_id)
+    if spec["type"] == "ground_truth_rainfall" and not spec["output"].get("write_long", True):
+        print("Ground-truth long output disabled by output.write_long: false")
 
     var_name = get_value_var(spec)
     dim_rename_map = spec.get("dimensions", {}).get("rename") or {}
@@ -1283,7 +1401,8 @@ def run_single_pipeline(spec_id):
             result = process_ground_truth_rainfall_id(dt, spec, ref_onset_dt=ref_onset_dt, thr_dt=thr_dt,
                                                        value_col=var_name.lower())
             wide_all.append(result["wide"])
-            long_all.append(result["long"])
+            if result["long"] is not None:
+                long_all.append(result["long"])
 
     if wide_all:
         wide_out = pd.concat(wide_all, ignore_index=True)
