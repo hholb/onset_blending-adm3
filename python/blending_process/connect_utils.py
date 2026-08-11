@@ -306,10 +306,19 @@ def make_cv_rds_from_daylevel(spec):
 
     # The maintained R connector exposes numeric lat/lon downstream, deriving
     # them from the legacy "lat_lon" id when the combined table lacks columns.
-    id_parts = raw["id"].astype(str).str.split("_", n=1, expand=True)
+    id_text = raw["id"].astype(str)
+    id_parts = id_text.str.split("_", n=1, expand=True)
     parsed_lat = pd.to_numeric(id_parts[0], errors="coerce")
     parsed_lon = (pd.to_numeric(id_parts[1], errors="coerce")
-                  if id_parts.shape[1] > 1 else np.nan)
+                  if id_parts.shape[1] > 1
+                  else pd.Series(np.nan, index=raw.index))
+    is_grid_id = (
+        (id_text.str.count("_") == 1)
+        & parsed_lat.between(-90, 90)
+        & parsed_lon.between(-180, 360)
+    )
+    parsed_lat = parsed_lat.where(is_grid_id)
+    parsed_lon = parsed_lon.where(is_grid_id)
     if "lat" in raw.columns:
         raw["lat"] = pd.to_numeric(raw["lat"], errors="coerce").fillna(parsed_lat)
     else:
