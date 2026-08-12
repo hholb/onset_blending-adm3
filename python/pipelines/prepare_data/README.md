@@ -15,6 +15,12 @@ Reads raw NetCDF files, detects monsoon onset per grid cell using the configured
 - **Forecast systems** (e.g., `--spec_id ngcm`): Produces per-ensemble-member onset probabilities across lead days.
 - **Ground truth** (e.g., `--spec_id ref_rain_fixed_cutoff`): Produces observed onset dates and a wide rainfall table, plus an optional annotated daily-long table.
 
+When a spec selects multiple NetCDF files, `input.parallel: true` processes
+independent files in separate processes using up to `input.workers` workers.
+Results are collected in deterministic year/file order. Parallel execution is
+skipped for a single file or one worker; `input.parallel: false` retains the
+serial path.
+
 The onset definition is fully configurable from the spec under `options.onset_definition`. Two dry-spell veto modes are supported: `consecutive_dry` (new definition) and `window_sum` (original Moron-Robertson definition). All numerical parameters — trigger window, wet-day threshold, accumulation threshold, follow-up period, and dry-spell check — are set in the yml. See [Onset Definition](#onset-definition) below.
 
 ### Stage 2: `2_build_climatology.py`

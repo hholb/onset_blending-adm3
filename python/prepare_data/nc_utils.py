@@ -20,6 +20,7 @@ import numpy as np
 import pandas as pd
 from datetime import datetime, date, timedelta
 from itertools import product
+from multiprocessing import get_context
 
 from ..pipelines._shared.misc import coalesce
 from ..pipelines._shared.read_spec import load_spec, validate_spec
@@ -58,6 +59,14 @@ def validate_spec_single(spec):
     """Validate the YAML spec for required sections and fields."""
 
     def _type_check(s):
+        input_cfg = s.get("input", {})
+        parallel = input_cfg.get("parallel", False)
+        if not isinstance(parallel, bool):
+            raise ValueError("input.parallel must be true or false")
+        workers = input_cfg.get("workers", 5)
+        if isinstance(workers, bool) or not isinstance(workers, int) or workers < 1:
+            raise ValueError("input.workers must be a positive integer")
+
         if s["type"] == "rainfall_forecast":
             for nm in ("min_day", "max_day", "window"):
                 if s.get("options", {}).get(nm) is None:
@@ -1357,6 +1366,78 @@ def process_ground_truth_rainfall_id(df, spec, ref_onset_dt=None, thr_dt=None, v
 # Pipeline entrypoint
 # ---------------------------------------------------------------------------
 
+_PIPELINE_WORKER_CONTEXT = None
+
+
+def _initialize_pipeline_worker(context):
+    """Install read-only pipeline metadata once in each worker process."""
+    global _PIPELINE_WORKER_CONTEXT
+    _PIPELINE_WORKER_CONTEXT = context
+
+
+def _process_pipeline_file(task, context=None):
+    """Process one year/file using explicit or worker-initialized context."""
+    if context is None:
+        context = _PIPELINE_WORKER_CONTEXT
+    if context is None:
+        raise RuntimeError("Pipeline worker context has not been initialized.")
+
+    nc_path, yr = task
+    spec = context["spec"]
+    var_name = context["var_name"]
+    dim_rename_map = context["dim_rename_map"]
+    ref_onset_dt = context["ref_onset_dt"]
+    thr_dt = context["thr_dt"]
+    weights_df = context["weights_df"]
+    print(f"Processing year {yr}: {nc_path}")
+
+    if spec["type"] == "rainfall_forecast":
+        wide_prefix = spec["input"].get("wide_prefix") or var_name.lower()
+        day_dim = spec["input"].get("wide_day_dim", "day")
+        dt = nc_read_forecast_wide(
+            nc_path, var_name, dim_rename_map, spec,
+            day_dim=day_dim, prefix=wide_prefix,
+        )
+        if dt is None:
+            print(f"  Skipping {nc_path}: variable '{var_name}' not found.")
+            return None
+        dt["year"] = yr
+        if weights_df is not None:
+            dt = transform_forecast_wide(dt, weights_df, spec=spec)
+        dt = filter_by_dissemination_cells(dt, spec)
+        result = process_rainfall_forecast_id(
+            dt, spec, ref_onset_dt=ref_onset_dt, thr_dt=thr_dt
+        )
+
+    elif spec["type"] == "ground_truth_rainfall":
+        missing_rain_policy = (
+            spec.get("options", {}).get("missing_rain_policy")
+            or spec.get("input", {}).get("missing_rain_policy")
+            or "keep"
+        )
+        dt = nc_read_groundtruth_long(
+            nc_path, var_name, dim_rename_map,
+            missing_rain_policy=missing_rain_policy,
+        )
+        if dt is None:
+            print(f"  Skipping {nc_path}: variable '{var_name}' not found.")
+            return None
+        dt["year"] = yr
+        if weights_df is not None:
+            dt = transform_groundtruth_long(
+                dt, weights_df, var_name.lower(), spec=spec
+            )
+        dt = filter_by_dissemination_cells(dt, spec)
+        result = process_ground_truth_rainfall_id(
+            dt, spec, ref_onset_dt=ref_onset_dt, thr_dt=thr_dt,
+            value_col=var_name.lower(),
+        )
+    else:
+        raise ValueError(f"Unsupported raw-data type: {spec['type']}")
+
+    return yr, result["wide"], result.get("long")
+
+
 def run_single_pipeline(spec_id):
     """
     Main driver: load spec, process all NetCDF years, write outputs.
@@ -1382,55 +1463,44 @@ def run_single_pipeline(spec_id):
     thr_dt = read_thresholds(spec)
     weights_df = read_cell_transform(spec)
 
-    files_df = list_nc_files_with_year(spec)
+    files_df = list_nc_files_with_year(spec).sort_values(
+        ["year", "nc_path"]
+    ).reset_index(drop=True)
+    tasks = [
+        (row.nc_path, int(row.year))
+        for row in files_df.itertuples(index=False)
+    ]
+    context = {
+        "spec": spec,
+        "var_name": var_name,
+        "dim_rename_map": dim_rename_map,
+        "ref_onset_dt": ref_onset_dt,
+        "thr_dt": thr_dt,
+        "weights_df": weights_df,
+    }
 
-    wide_all = []
-    long_all = []
+    input_cfg = spec.get("input", {})
+    parallel = input_cfg.get("parallel", False)
+    workers = input_cfg.get("workers", 5) if parallel else 1
 
-    for _, row in files_df.iterrows():
-        nc_path = row["nc_path"]
-        yr = row["year"]
-        print(f"Processing year {yr}: {nc_path}")
+    if parallel and workers > 1 and len(tasks) > 1:
+        worker_count = min(workers, len(tasks))
+        print(
+            f"Processing {len(tasks)} files with {worker_count} workers "
+            "in year order."
+        )
+        with get_context("spawn").Pool(
+            processes=worker_count,
+            initializer=_initialize_pipeline_worker,
+            initargs=(context,),
+        ) as pool:
+            results = list(pool.imap(_process_pipeline_file, tasks))
+    else:
+        results = [_process_pipeline_file(task, context) for task in tasks]
 
-        if spec["type"] == "rainfall_forecast":
-            wide_prefix = spec["input"].get("wide_prefix") or var_name.lower()
-            day_dim = spec["input"].get("wide_day_dim", "day")
-            dt = nc_read_forecast_wide(nc_path, var_name, dim_rename_map, spec,
-                                       day_dim=day_dim, prefix=wide_prefix)
-            if dt is None:
-                print(f"  Skipping {nc_path}: variable '{var_name}' not found.")
-                continue
-            dt["year"] = yr
-            if weights_df is not None: # in spec yml if cell_transform_enabled: false, it does nothing
-                dt = transform_forecast_wide(dt, weights_df, spec=spec)
-            dt = filter_by_dissemination_cells(dt, spec)
-            result = process_rainfall_forecast_id(dt, spec, ref_onset_dt=ref_onset_dt, thr_dt=thr_dt)
-            wide_all.append(result["wide"])
-
-        elif spec["type"] == "ground_truth_rainfall":
-            missing_rain_policy = (
-                spec.get("options", {}).get("missing_rain_policy")
-                or spec.get("input", {}).get("missing_rain_policy")
-                or "keep"
-            )
-            dt = nc_read_groundtruth_long(
-                nc_path, var_name, dim_rename_map,
-                missing_rain_policy=missing_rain_policy,
-            )
-            if dt is None:
-                print(f"  Skipping {nc_path}: variable '{var_name}' not found.")
-                continue
-            dt["year"] = yr
-            if weights_df is not None: # in spec yml if cell_transform_enabled: false, it does nothing
-                dt = transform_groundtruth_long(
-                    dt, weights_df, var_name.lower(), spec=spec
-                )
-            dt = filter_by_dissemination_cells(dt, spec)
-            result = process_ground_truth_rainfall_id(dt, spec, ref_onset_dt=ref_onset_dt, thr_dt=thr_dt,
-                                                       value_col=var_name.lower())
-            wide_all.append(result["wide"])
-            if result["long"] is not None:
-                long_all.append(result["long"])
+    completed = [result for result in results if result is not None]
+    wide_all = [result[1] for result in completed]
+    long_all = [result[2] for result in completed if result[2] is not None]
 
     if wide_all:
         wide_out = pd.concat(wide_all, ignore_index=True)
