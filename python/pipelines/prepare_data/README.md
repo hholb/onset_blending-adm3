@@ -27,6 +27,12 @@ The onset definition is fully configurable from the spec under `options.onset_de
 
 Fits per-cell KDE climatology models from historical IMD onset dates and produces issue-date probability forecasts over lead days. Supports multiple training windows defined in the spec. One convention to note is that for unconditional climatology (`clim_unc`) a "day 0" forecast stores the probability that onset occurred before the forecast date.
 
+Compatible conditional and unconditional runs are built together automatically,
+sharing the KDE calculations while preserving the existing output tables and
+filenames. Set `climatology_runtime.workers` in the raw-data spec (or the
+`CLIM_WORKERS` environment variable) to process bounded cell chunks in parallel;
+temporary chunk files are removed when the run completes.
+
 ### Stage 3: `3_combine_datasets.py`
 
 Joins ground truth, climatology, and forecast system outputs into a single wide table per combination template. Aligns time/space grids, adds "plus" remainder bins, and optionally trims post-onset forecasts.

@@ -140,6 +140,8 @@ paths:
   # default stem used only you don't provide one for a specific climatology
   climatology_out_stem: "ref_rain_fixed_cutoff_clim_issue"
 
+climatology_runtime:
+  workers: 4
 
   # "test years" are years for which forecasts will be produced
   # based on the training years
