@@ -176,28 +176,36 @@ format used by `apply_blend_model.py`.
 
 ## Operational Forecasting (Single New Forecast Year)
 
-For generating a forecast for a new year (e.g. 2026), use `predict/run_operational_pipeline.py`. This runs all 8 pipeline steps in sequence with a single command, verifying that each step's output exists before proceeding to the next.
+For generating a forecast for a new year (e.g. 2026), use
+`predict/run_operational_pipeline.py`. Forecast sources are supplied with one
+repeatable `--forecast MODEL SPEC_ID` argument per model. With two forecasts,
+the wrapper preserves the historical eight-step numbering and verifies each
+declared output before continuing.
 
 ### What it does
 
 | Step | Script | Description |
 |------|--------|-------------|
-| 1 | `1_process_raw_nc_files.py` | Process aifs NetCDF → onset probabilities pkl |
-| 2 | `1_process_raw_nc_files.py` | Process aifs_ens NetCDF → onset probabilities pkl |
-| 3 | `2_build_climatology.py` | Build KDE climatology for the forecast year |
-| 4 | `3_combine_datasets.py` | Merge forecasts + climatology + ground truth into wide table |
-| 5 | `0_connect_prepare_data_to_2025_pipeline.py` | Convert daily → weekly bins, compute rain predictors |
-| 6 | `predict/apply_blend_model.py` | Apply trained blending model to produce predictions |
-| 7 | `predict/export_blend_output.py` | Extract blended + climatology probabilities → summary CSV |
-| 8 | `predict/run_maps.py` | Generate forecast maps from summary CSV |
+| 1 | `2_build_climatology.py` | Build KDE climatology for the forecast year |
+| 2..N+1 | `1_process_raw_nc_files.py` | Process each configured forecast NetCDF source |
+| N+2 | `3_combine_datasets.py` | Merge forecasts + climatology + ground truth into a wide table |
+| N+3 | `0_connect_prepare_data_to_2025_pipeline.py` | Convert daily inputs to weekly bins and rain predictors |
+| N+4 | `predict/apply_blend_model.py` | Apply the saved coefficient bundle |
+| N+5 | `predict/export_blend_output.py` | Extract blended + climatology probabilities to CSV |
+| N+6 | `predict/run_maps.py` | Generate forecast maps from the summary CSV |
+
+Here `N` is the number of `--forecast` arguments. Export and map generation
+still follow the existing Ethiopia-oriented output contract. For a new country,
+use `--stop_at N+4` to validate the generic workflow through model application;
+country-generic export and mapping are a separate extension.
 
 ### Prerequisites
 
 Before running, ensure you have:
-- Forecast NetCDF files for the new year (aifs and aifs_ens)
-- Trained blending model coef pkl from `1_blend_evaluation.py` (historical training)
+- A raw-data spec and forecast NetCDF files for every configured model
+- A final coefficient bundle produced by `predict/3_fit_final_model.py`
 - Historical ground truth wide pkl (e.g. `ref_rain_fixed_cutoff_wide.pkl`) covering 2000–2022
-- All 2026 yml specs created in `specs/raw_data/`, `specs/combine/`, `specs/2025_blend/`, and `specs/connect/`
+- Matching raw, combine, connect, and blend specs in their existing spec directories
 
 New coefficient bundles store the resolved training formula. Operational
 application uses that saved formula and requires its Patsy design columns to
@@ -220,26 +228,35 @@ No additional YAML option is required.
 python predict/run_operational_pipeline.py \
     --year 2026 \
     --issue_date 2026-06-09 \
-    --aifs_spec aifs_2026 \
-    --aifs_ens_spec aifs_ens_2026 \
+    --forecast aifs aifs_2026 \
+    --forecast ngcm ngcm_2026 \
     --clim_spec ref_rain_fixed_cutoff_2026 \
-    --combine_spec combine_template_fixed_cutoff_2026 \
-    --connect_spec connect_fixed_cutoff_2026 \
-    --blend_spec cv_models_fixed_cutoff_2026 \
-    --coef_dir Monsoon_Data/results/wet_spell_aifs_aifs_ens \
-    --coef_tag fixed_cutoff_2022_year2022 \
-    --blend_input Monsoon_Data/Processed_Data/2026/cv_data_fixed_cutoff_new_pipeline_2026.pkl \
+    --combine_spec combine_template_fixed_cutoff_2026_ngcm \
+    --connect_spec connect_fixed_cutoff_2026_ngcm \
+    --blend_spec cv_models_fixed_cutoff_2026_ngcm \
+    --coef_dir Monsoon_Data/results/training \
+    --coef_tag final \
     --work_dir Monsoon_Data/Processed_Data/2026
 ```
 
+Unless `--blend_input` is supplied, the connector output basename from the
+selected connect spec is placed in `work_dir` and passed unchanged to
+`apply_blend_model.py`. This preserves model-specific names such as the NGCM or
+GenCast connector artifacts.
+
 ### With yml field overrides
 
-Three frequently-changing inputs can be overridden directly from the command line without editing yml files. `--gt_path` controls the historical ground truth pkl and simultaneously patches both the clim spec (`input.gt_path`) and the combine spec (`ground_truth_wide_rds`) since both must point to the same file.
+The complete historical two-slot interface remains available for existing AIFS
+operations. Its NetCDF paths and historical ground truth can be overridden
+without editing YAML. `--gt_path` patches both the climatology spec
+(`input.gt_path`) and combine spec (`ground_truth_wide_rds`).
 
 ```bash
 python predict/run_operational_pipeline.py \
     --year 2026 \
     --issue_date 2026-06-09 \
+    --model_single aifs \
+    --model_ens aifs_ens \
     --aifs_spec aifs_2026 \
     --aifs_ens_spec aifs_ens_2026 \
     --clim_spec ref_rain_fixed_cutoff_2026 \
@@ -248,14 +265,15 @@ python predict/run_operational_pipeline.py \
     --blend_spec cv_models_fixed_cutoff_2026 \
     --coef_dir Monsoon_Data/results/wet_spell_aifs_aifs_ens \
     --coef_tag fixed_cutoff_2022_year2022 \
-    --blend_input Monsoon_Data/Processed_Data/2026/cv_data_fixed_cutoff_new_pipeline_2026.pkl \
     --work_dir Monsoon_Data/Processed_Data/2026 \
     --aifs_nc_folder /data/forecasts/aifs/2026 \
     --aifs_ens_nc_folder /data/forecasts/aifs_ens/2026 \
     --gt_path Monsoon_Data/Processed_Data/Models/wet_spell/ref_rain_fixed_cutoff_wide.pkl
 ```
 
-When any of these overrides are provided, the script writes a patched temp spec (e.g. `aifs_2026_op.yml`) into the relevant `specs/` subdirectory, passes that to the downstream script, and deletes the temp file on exit.
+The wrapper always writes runtime `_op.yml` copies so output paths, forecast
+artifacts, and model names are coherent without mutating the selected base
+specs. These temporary specs are deleted on exit.
 
 ### Resuming after a failure
 
@@ -284,23 +302,25 @@ python predict/run_operational_pipeline.py \
 |----------|----------|-------------|
 | `--year` | Yes | Forecast year, e.g. `2026` |
 | `--issue_date` | Yes | Forecast issue date, e.g. `2026-06-09` |
-| `--aifs_spec` | Yes | Spec ID for aifs `1_process_raw_nc_files`, e.g. `aifs_2026` |
-| `--aifs_ens_spec` | Yes | Spec ID for aifs_ens `1_process_raw_nc_files`, e.g. `aifs_ens_2026` |
+| `--forecast MODEL SPEC_ID` | Conditional | Repeat once per forecast; use this or the complete legacy argument set |
+| `--model_single`, `--model_ens` | Legacy | Model names for the historical two-slot interface |
+| `--aifs_spec`, `--aifs_ens_spec` | Legacy | Raw-data spec IDs for the historical two-slot interface |
 | `--clim_spec` | Yes | Spec ID for `2_build_climatology`, e.g. `ref_rain_fixed_cutoff_2026` |
 | `--combine_spec` | Yes | Spec ID for `3_combine_datasets`, e.g. `combine_template_fixed_cutoff_2026` |
 | `--connect_spec` | Yes | Spec ID for `0_connect_prepare_data_to_2025_pipeline` |
 | `--blend_spec` | Yes | Spec ID for `apply_blend_model` |
 | `--coef_dir` | Yes | Directory containing the trained blending model coef pkl |
 | `--coef_tag` | Yes | Coef tag passed to `apply_blend_model --coef_tag`, e.g. `fixed_cutoff_2022_year2022` |
-| `--blend_input` | Yes | Path to the wide pipeline pkl for `apply_blend_model --input_path` |
+| `--blend_input` | No | Explicit connector-output/application-input path; otherwise derived from the connect spec basename |
 | `--work_dir` | Yes | Output directory for all intermediate and final files |
 | `--aifs_nc_folder` | No | Override `input.nc_folder` in the aifs spec yml |
 | `--aifs_ens_nc_folder` | No | Override `input.nc_folder` in the aifs_ens spec yml |
 | `--gt_path` | No | Override ground truth pkl path in both the clim and combine specs |
-| `--map_output_path` | No | Output directory for maps (default: `predict/output/{year}/`) |
+| `--map_output_path` | No | Reserved for compatibility; maps currently use `work_dir` |
 | `--blend_model` | No | Blended model name (default: `blended_model`) |
 | `--region` | No | Region for map generation (default: `Ethiopia`) |
 | `--skip_to` | No | Skip to step N, 1-indexed (default: 1, run all) |
+| `--stop_at` | No | Stop after step N, 1-indexed |
 | `--dry_run` | No | Print commands without executing |
 
 ### Testing the Onset Detection Logic
