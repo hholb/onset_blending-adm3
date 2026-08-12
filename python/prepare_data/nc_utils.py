@@ -1029,6 +1029,102 @@ def nc_read_groundtruth_long(nc_path, var_name, dim_rename_map, add_year=True,
         ds.close()
 
 
+def nc_read_groundtruth_matrix(nc_path, var_name, dim_rename_map, spec,
+                               weights_df, year):
+    """Read a standard gridded ground-truth file as source-by-day rainfall.
+
+    Returns ``None`` for non-time/lat/lon variables so their existing long-table
+    path remains available. The retained day range begins at the configured
+    cutoff date; ``calendar_offset`` restores onset indices to the full file.
+    """
+    import netCDF4 as nc4
+
+    ds = nc4.Dataset(nc_path)
+    try:
+        if var_name not in ds.variables:
+            return None
+
+        variable = ds.variables[var_name]
+        dim_names = list(variable.dimensions)
+        rename = {
+            str(old).lower(): str(new).lower()
+            for old, new in (dim_rename_map or {}).items()
+        }
+        canonical_dims = [
+            rename.get(dim_name.lower(), dim_name.lower())
+            for dim_name in dim_names
+        ]
+        if sorted(canonical_dims) != ["lat", "lon", "time"]:
+            return None
+
+        time_axis = canonical_dims.index("time")
+        time_info = get_nc_time(ds)
+        time_values = time_info["values"]
+        if np.issubdtype(np.asarray(time_values).dtype, np.number):
+            dates = nc_time_to_dates(time_values, time_info["units"])
+        else:
+            dates = pd.DatetimeIndex(pd.to_datetime(time_values))
+        if not dates.is_monotonic_increasing:
+            return None
+
+        cutoff_date = pd.Timestamp(
+            f"{int(year)}-{spec['options']['cutoff_month_day']}"
+        )
+        retained = np.flatnonzero(dates >= cutoff_date)
+        if not len(retained):
+            return None
+        day_slice = slice(int(retained[0]), int(retained[-1]) + 1)
+        selectors = [slice(None)] * len(dim_names)
+        selectors[time_axis] = day_slice
+        raw = variable[tuple(selectors)]
+        selected_dates = dates[day_slice]
+
+        values = (
+            np.ma.filled(raw, np.nan)
+            if np.ma.isMaskedArray(raw)
+            else np.asarray(raw)
+        )
+        values = np.moveaxis(values, time_axis, -1)
+        source_values = values.reshape(-1, len(selected_dates)).astype(float)
+
+        spatial_dims = [
+            (dim_name, canonical_name)
+            for dim_name, canonical_name in zip(dim_names, canonical_dims)
+            if canonical_name != "time"
+        ]
+        coordinate_values = []
+        for dim_name, _ in spatial_dims:
+            if dim_name not in ds.variables:
+                return None
+            coordinate_values.append(np.asarray(ds[dim_name][:]).reshape(-1))
+        source_registry = pd.DataFrame(
+            product(*coordinate_values),
+            columns=[canonical_name for _, canonical_name in spatial_dims],
+        )
+        source_registry = _prepare_transform_source_ids(
+            source_registry,
+            weights_df,
+            spec,
+            "ground-truth matrix transform",
+        )
+        source_registry["_source_position"] = np.arange(len(source_registry))
+        source_positions = (
+            source_registry.set_index("id")
+            .loc[list(_get_sparse_transform(weights_df).source_ids), "_source_position"]
+            .to_numpy(int)
+        )
+        source_values = source_values[source_positions]
+        source_values[np.isnan(source_values)] = 0.0
+
+        return {
+            "source_values": source_values,
+            "dates": selected_dates,
+            "calendar_offset": int(retained[0]),
+        }
+    finally:
+        ds.close()
+
+
 # ---------------------------------------------------------------------------
 # Stage-2 onset helpers
 # ---------------------------------------------------------------------------
@@ -1362,6 +1458,78 @@ def process_ground_truth_rainfall_id(df, spec, ref_onset_dt=None, thr_dt=None, v
     return {"wide": wide, "long": long}
 
 
+def process_ground_truth_rainfall_matrix(matrix_data, spec, weights_df, year,
+                                         ref_onset_dt=None, thr_dt=None):
+    """Transform gridded rainfall and calculate target onsets without long tables."""
+    transform = _get_sparse_transform(weights_df)
+    target_values = sparse_observed_weighted_mean(
+        transform, matrix_data["source_values"]
+    )
+
+    units = pd.DataFrame({
+        "id": list(transform.target_ids),
+        "year": int(year),
+        "_target_position": np.arange(len(transform.target_ids)),
+    })
+    units = filter_by_dissemination_cells(units, spec).reset_index(drop=True)
+    target_values = target_values[
+        units["_target_position"].to_numpy(int)
+    ]
+    units = units.drop(columns="_target_position")
+    units = attach_thresholds_id(units, thr_dt, spec=spec)
+    units = attach_ref_onset(units, ref_onset_dt)
+
+    cutoff_date = pd.Timestamp(
+        f"{int(year)}-{spec['options']['cutoff_month_day']}"
+    ).date()
+    units["cutoff_date"] = cutoff_date
+    units["start_date"] = cutoff_date
+    has_ref = units["ref_onset_date"].notna()
+    units.loc[has_ref, "start_date"] = [
+        max(cutoff_date, ref_date)
+        for ref_date in units.loc[has_ref, "ref_onset_date"]
+    ]
+
+    dates = pd.DatetimeIndex(matrix_data["dates"])
+    start_days = np.searchsorted(
+        dates.values,
+        pd.to_datetime(units["start_date"]).values,
+        side="left",
+    ) + 1
+    start_days[start_days > len(dates)] = 9999
+    local_onsets = find_onsets_batch(
+        target_values,
+        pd.to_numeric(units["onset_thresh"], errors="coerce").to_numpy(float),
+        start_days,
+        read_onset_params(spec),
+        reject_if_short_followup=True,
+    )[0]
+
+    has_onset = np.isfinite(local_onsets)
+    onset_dates = np.full(len(units), None, dtype=object)
+    local_positions = local_onsets[has_onset].astype(int) - 1
+    onset_dates[has_onset] = dates.date[local_positions]
+    onset_days = np.full(len(units), np.nan)
+    onset_days[has_onset] = (
+        pd.to_datetime(onset_dates[has_onset]) - pd.Timestamp(cutoff_date)
+    ).days
+
+    full_onsets = np.where(
+        has_onset,
+        local_onsets + int(matrix_data["calendar_offset"]),
+        np.nan,
+    )
+    wide = pd.DataFrame({
+        "id": units["id"].to_numpy(),
+        "year": int(year),
+        "onset_idx": full_onsets,
+        "onset_date": onset_dates,
+        "onset_day": onset_days,
+        "cutoff_date": cutoff_date,
+    })
+    return {"wide": wide, "long": None}
+
+
 # ---------------------------------------------------------------------------
 # Pipeline entrypoint
 # ---------------------------------------------------------------------------
@@ -1415,6 +1583,22 @@ def _process_pipeline_file(task, context=None):
             or spec.get("input", {}).get("missing_rain_policy")
             or "keep"
         )
+        use_matrix_path = (
+            weights_df is not None
+            and not spec.get("output", {}).get("write_long", True)
+            and str(missing_rain_policy).lower() == "zero"
+        )
+        if use_matrix_path:
+            matrix_data = nc_read_groundtruth_matrix(
+                nc_path, var_name, dim_rename_map, spec, weights_df, yr
+            )
+            if matrix_data is not None:
+                result = process_ground_truth_rainfall_matrix(
+                    matrix_data, spec, weights_df, yr,
+                    ref_onset_dt=ref_onset_dt, thr_dt=thr_dt,
+                )
+                return yr, result["wide"], result.get("long")
+
         dt = nc_read_groundtruth_long(
             nc_path, var_name, dim_rename_map,
             missing_rain_policy=missing_rain_policy,
