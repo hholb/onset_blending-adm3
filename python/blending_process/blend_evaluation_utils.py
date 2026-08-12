@@ -15,6 +15,7 @@ import pickle
 import warnings
 import numpy as np
 import pandas as pd
+from multiprocessing import get_context
 from scipy.special import logit, expit
 from scipy.stats import ks_2samp
 from sklearn.linear_model import LogisticRegression
@@ -818,6 +819,94 @@ def apply_formula_sample_support(data, formulas):
     return filtered, diagnostics
 
 
+_GLOBAL_CV_WORKER_CONTEXT = None
+
+
+def _initialize_global_cv_worker(context):
+    """Install shared global-CV inputs once in each worker process."""
+    global _GLOBAL_CV_WORKER_CONTEXT
+    _GLOBAL_CV_WORKER_CONTEXT = context
+
+
+def _compute_global_cv_fold(test_year, context=None):
+    """Fit and predict one holdout year using explicit or worker context."""
+    if context is None:
+        context = _GLOBAL_CV_WORKER_CONTEXT
+    if context is None:
+        raise RuntimeError("Global CV worker context has not been initialized.")
+
+    data_train = context["data_train"]
+    data_pred = context["data_pred"]
+    training_years = context["training_years"]
+    true_holdout_years = context["true_holdout_years"]
+    required_classes = context["required_classes"]
+    feature_cols = context["feature_cols"]
+    formula_str = context["formula_str"]
+
+    train = data_train[
+        data_train["year"].isin(training_years)
+        & (data_train["year"] != test_year)
+        & (~data_train["year"].isin(true_holdout_years))
+    ]
+    test = data_pred[data_pred["year"] == test_year]
+    if test.empty:
+        raise ValueError(f"Global CV holdout year {test_year} has no test rows.")
+    if train.empty:
+        raise ValueError(
+            f"Global CV holdout year {test_year} has no training rows in "
+            f"training_years={sorted(set(training_years))}."
+        )
+    if required_classes is not None:
+        present_classes = {
+            value for value in train["outcome"].unique()
+            if isinstance(value, str)
+        }
+        missing_classes = [
+            value for value in required_classes if value not in present_classes
+        ]
+        if missing_classes:
+            raise ValueError(
+                f"Global CV holdout year {test_year} training rows are missing "
+                f"outcome classes: {', '.join(missing_classes)}."
+            )
+
+    preds, clf = _fit_predict_multinom(
+        train,
+        test,
+        feature_cols,
+        return_clf=True,
+        formula_str=formula_str,
+    )
+    if preds is None or clf is None:
+        raise ValueError(
+            f"Global CV model fitting failed for holdout year {test_year}."
+        )
+
+    result = pd.concat(
+        [test.reset_index(drop=True), preds.reset_index(drop=True)], axis=1
+    )
+    coef_artifact = None
+    if context["save_coefs"]:
+        rows = []
+        actual_features = clf.feature_names
+        for i, cls in enumerate(clf.classes_):
+            for j, feat in enumerate(actual_features):
+                rows.append({
+                    "test_year": test_year,
+                    "class": cls,
+                    "feature": feat,
+                    "coefficient": float(clf.coef_[i, j]),
+                    "intercept": float(clf.intercept_[i]),
+                })
+        coef_artifact = {
+            "coefs": pd.DataFrame(rows),
+            "scaler": clf.scaler_,
+            "features": actual_features,
+            "formula": formula_str,
+        }
+    return test_year, result, coef_artifact
+
+
 def compute_cv_global(formula_str, data_train, holdout_years, training_years,
                        true_holdout_years=(), data_pred=None, n_jobs=1, save_coefs=False,
                        required_classes=None):
@@ -832,105 +921,57 @@ def compute_cv_global(formula_str, data_train, holdout_years, training_years,
     if data_pred is None:
         data_pred = data_train
     feature_cols = _parse_formula_cols(formula_str)
+    if (
+        isinstance(n_jobs, bool)
+        or not isinstance(n_jobs, (int, np.integer))
+        or n_jobs < 1
+    ):
+        raise ValueError("n_jobs must be a positive integer.")
 
-    results = []
-#    data_train = data_pred # Bug!!!
-
-    # NEW — one line added before the loop:
-    coefs_by_year = {}
-
-    for test_year in holdout_years:
-        train = data_train[
-            data_train["year"].isin(training_years)
-            & (data_train["year"] != test_year)
-            & (~data_train["year"].isin(true_holdout_years))
-        ]
-        test = data_pred[data_pred["year"] == test_year]
-#        print("XXX train , ", train)
-#        print("XXX test , ", test)
-#        print("XXX feature , ", feature_cols)
-#        import sys
-#        sys.exit()
-        if test.empty:
-            raise ValueError(f"Global CV holdout year {test_year} has no test rows.")
-        if train.empty:
-            raise ValueError(
-                f"Global CV holdout year {test_year} has no training rows in "
-                f"training_years={sorted(set(training_years))}."
+    holdout_years = list(holdout_years)
+    context = {
+        "formula_str": formula_str,
+        "feature_cols": feature_cols,
+        "data_train": data_train,
+        "data_pred": data_pred,
+        "training_years": tuple(training_years),
+        "true_holdout_years": tuple(true_holdout_years),
+        "required_classes": (
+            tuple(required_classes) if required_classes is not None else None
+        ),
+        "save_coefs": bool(save_coefs),
+    }
+    worker_count = min(n_jobs, len(holdout_years))
+    if worker_count > 1:
+        print(
+            f"  Fitting {len(holdout_years)} global CV folds with "
+            f"{worker_count} workers."
+        )
+        with get_context("spawn").Pool(
+            processes=worker_count,
+            initializer=_initialize_global_cv_worker,
+            initargs=(context,),
+        ) as pool:
+            fold_results = list(
+                pool.imap(_compute_global_cv_fold, holdout_years)
             )
-        if required_classes is not None:
-            present_classes = {
-                value for value in train["outcome"].unique()
-                if isinstance(value, str)
-            }
-            missing_classes = [
-                value for value in required_classes if value not in present_classes
-            ]
-            if missing_classes:
-                raise ValueError(
-                    f"Global CV holdout year {test_year} training rows are missing "
-                    f"outcome classes: {', '.join(missing_classes)}."
-                )
-        #preds = _fit_predict_multinom(train, test, feature_cols)
-        #if preds is not None:
-        #    result = pd.concat([test.reset_index(drop=True), preds.reset_index(drop=True)], axis=1)
-        #    results.append(result)
+    else:
+        fold_results = [
+            _compute_global_cv_fold(test_year, context)
+            for test_year in holdout_years
+        ]
 
-        # NEW — inside loop:
-#        preds, clf = _fit_predict_multinom(train, test, feature_cols,
-#                                           return_clf=True)                     # ← NEW
-        preds, clf = _fit_predict_multinom(train, test, feature_cols, return_clf=True,
-                                   formula_str=formula_str)
-        if preds is not None:
-            result = pd.concat([test.reset_index(drop=True), preds.reset_index(drop=True)], axis=1)
-            results.append(result)
-
-#            if save_coefs and clf is not None:                                  # ← NEW
-#                rows = []                                                       # ← NEW
-#                for i, cls in enumerate(clf.classes_):                         # ← NEW
-#                    for j, feat in enumerate(feature_cols):                    # ← NEW
-#                        rows.append({                                           # ← NEW
-#                            "test_year":   test_year,                          # ← NEW
-#                            "class":       cls,                                 # ← NEW
-#                            "feature":     feat,                               # ← NEW
-#                            "coefficient": float(clf.coef_[i, j]),            # ← NEW
-#                            "intercept":   float(clf.intercept_[i]),           # ← NEW
-#                        })                                                      # ← NEW
-#                coefs_by_year[test_year] = pd.DataFrame(rows)                  # ← NEW
-
-
-            # AFTER
-            if save_coefs and clf is not None:
-                rows = []
-                actual_features = clf.feature_names   # ← use what clf actually saw
-                for i, cls in enumerate(clf.classes_):
-                    for j, feat in enumerate(actual_features):       # ← iterate over actual columns
-                        rows.append({
-                            "test_year":   test_year,
-                            "class":       cls,
-                            "feature":     feat,
-                            "coefficient": float(clf.coef_[i, j]),
-                            "intercept":   float(clf.intercept_[i]),
-                        })
-                #coefs_by_year[test_year] = pd.DataFrame(rows)
-                coefs_by_year[test_year] = {
-                    "coefs":    pd.DataFrame(rows),
-                    "scaler":   clf.scaler_,
-                    "features": actual_features,
-                    "formula":  formula_str,
-                }
-        else:
-            raise ValueError(f"Global CV model fitting failed for holdout year {test_year}.")
-
-    #return pd.concat(results, ignore_index=True) if results else pd.DataFrame()
-    # NEW — final return:
-    if not results:
+    if not fold_results:
         raise ValueError("Global CV produced no fold predictions.")
-    cv_preds = pd.concat(results, ignore_index=True)
-    #if save_coefs:                                                              # ← NEW
-    #    return cv_preds, coefs_by_year                                         # ← NEW
-    #return cv_preds                                                             # ← NEW (was a one-liner)
-    return cv_preds, coefs_by_year                                         # ← NEW
+    cv_preds = pd.concat(
+        [result[1] for result in fold_results], ignore_index=True
+    )
+    coefs_by_year = {
+        test_year: coef_artifact
+        for test_year, _, coef_artifact in fold_results
+        if coef_artifact is not None
+    }
+    return cv_preds, coefs_by_year
 
 
 def compute_cv_local(formula_str, data, holdout_years):

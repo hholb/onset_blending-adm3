@@ -48,12 +48,20 @@ python python/pipelines/blending_process/0_connect_prepare_data_to_2025_pipeline
 # Stage 1: CV evaluation
 python python/pipelines/blending_process/1_blend_evaluation.py --spec_id cv_models_fixed_cutoff
 
+# Parallel global-CV folds (models remain sequential)
+python python/pipelines/blending_process/1_blend_evaluation.py --spec_id cv_models_fixed_cutoff --cores 4
+
 # Stage 2: 2025 out-of-sample evaluation
 python python/pipelines/blending_process/2_2025_evaluation.py
 
 # Stage 3: Publication figures
 python python/pipelines/blending_process/3_produce_figures.py
 ```
+
+`--cores N` processes independent global holdout-year folds with up to `N`
+worker processes, capped by the number of folds. Omitting it retains serial
+execution. Model formulas are evaluated sequentially to avoid nested process
+parallelism.
 
 ---
 

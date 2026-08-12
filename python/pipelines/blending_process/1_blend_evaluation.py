@@ -65,7 +65,7 @@ def main():
     parser.add_argument("--spec_id", default="cv_models",
                         help="Spec file name (without .yml) in specs/2025_blend/")
     parser.add_argument("--cores", type=int, default=None,
-                        help="Override number of parallel cores")
+                        help="Process workers for global CV folds")
     parser.add_argument("--work_dir", default=None,
                         help="If provided, input pkl is read directly from this directory, "
                              "overriding pipeline_input_dir in the spec.")
@@ -75,6 +75,8 @@ def main():
                         help="If provided, all outputs are written to this directory, "
                              "overriding pipeline_output_dir in the spec.")
     args = parser.parse_args()
+    if args.cores is not None and args.cores < 1:
+        parser.error("--cores must be a positive integer")
 
     spec_path = os.path.join("specs", "2025_blend", f"{args.spec_id}.yml")
     with open(spec_path, "r") as f:
@@ -320,6 +322,7 @@ def main():
                         training_years=training_years,
                         true_holdout_years=true_holdout_years,
                         data_pred=wide_df,
+                        n_jobs=args.cores or 1,
                         save_coefs=True,                                     # ← NEW
                         required_classes=interval_bins(N_BINS),
                     )
