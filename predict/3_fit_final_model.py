@@ -16,6 +16,7 @@ Usage (run from repo root)
     python 3_fit_final_model.py \\
         --spec_id  cv_models_fixed_cutoff \\
         --model    blended_model \\
+        [--input_path Monsoon_Data/Processed_Data/2025_pipeline_input/cv_data_fixed_cutoff_new_pipeline.pkl] \\
         [--method  global] \\
         [--tag     final] \\
         [--out_dir Monsoon_Data/results/2025_model_evaluation/]
@@ -45,6 +46,7 @@ import pickle
 import argparse
 import warnings
 import itertools
+import re
 import numpy as np
 import pandas as pd
 import patsy
@@ -52,13 +54,19 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
 
 from python.blending_process.blend_evaluation_utils import (
+    apply_formula_sample_support,
     build_formulas_from_spec,
     expand_formula_str,
     input_rds_from_cutoff,
     make_cutoff_tag,
     restrict_to_allowed,
     _make_multinom_clf,
-    validate_formula_feature_support,
+)
+from python.pipelines._shared.misc import coalesce, interval_bins
+from python.prepare_data.nc_utils import ensure_id_col
+from python.prepare_data.spatial_id_utils import (
+    resolve_grid_id_convention,
+    validate_id_coordinate_consistency,
 )
 from python.pipelines._shared.read_spec import load_spec
 
@@ -189,38 +197,95 @@ def main():
     parser.add_argument("--out_dir", default=None,
                         help="Output directory. "
                              "Defaults to Monsoon_Data/results/2025_model_evaluation/")
-    parser.add_argument("--dissem_file", default="Monsoon_Data/dissemination_cells.csv",
-                        help="Path to dissemination_cells.csv")
+    parser.add_argument("--input_path", default=None,
+                        help="Read the connector pickle at this exact path "
+                             "(highest priority).")
+    parser.add_argument("--dissem_file", default=None,
+                        help="Override the dissemination CSV configured by "
+                             "cell.dissemination")
     parser.add_argument("--pipeline_input_dir", default="Monsoon_Data/Processed_Data/2025_pipeline_input",
                         help="Directory containing the wide processed data")
     args = parser.parse_args()
 
     # ── Load spec ──────────────────────────────────────────────────────
-    spec               = load_spec(args.spec_id, "2025_blend")
-    cutoff_mode        = spec["run"]["cutoff_mode"]
-    holdout_years      = [int(y) for y in spec["run"]["cv_holdout_years"]]
-    training_years     = [int(y) for y in spec["run"].get("training_years", holdout_years)]
-    pipeline_input_dir = spec["run"].get("pipeline_input_dir", "")
+    spec = load_spec(args.spec_id, "2025_blend")
+    run_cfg = spec.get("run", {})
+    cutoff_mode = coalesce(run_cfg.get("cutoff_mode"), "ref_onset")
+    training_years = list(map(
+        int,
+        coalesce(run_cfg.get("training_years"), list(range(2000, 2025))),
+    ))
+    true_holdout_years = set(map(
+        int, coalesce(run_cfg.get("true_holdout_years"), [])
+    ))
+    fit_years = [
+        year for year in training_years if year not in true_holdout_years
+    ]
+    pipeline_input_dir = run_cfg.get("pipeline_input_dir", "")
 
     out_dir = args.out_dir or "Monsoon_Data/results/2025_model_evaluation"
     os.makedirs(out_dir, exist_ok=True)
 
     # ── Load input data ────────────────────────────────────────────────
     input_file = input_rds_from_cutoff(cutoff_mode)
-    input_path = os.path.join(args.pipeline_input_dir, pipeline_input_dir, input_file)
+    input_override = run_cfg.get("input_rds_override")
+    if args.input_path:
+        input_path = args.input_path
+    elif input_override:
+        input_path = input_override
+    else:
+        input_path = os.path.join(
+            args.pipeline_input_dir, pipeline_input_dir, input_file
+        )
     print(f"\nLoading wide_df from: {input_path}")
     with open(input_path, "rb") as f:
         wide_df = pickle.load(f)
     print(f"  Total rows in wide_df : {len(wide_df)}")
 
-    # ── Filter to training years and allowed cells ─────────────────────
-    dissemination_cells = pd.read_csv(args.dissem_file)
-    dissemination_cells["id"] = dissemination_cells["adm3_name"].astype(str)
+    # ── Normalize input and dissemination IDs ──────────────────────
+    wide_df = ensure_id_col(wide_df, spec=spec, context="blend input IDs")
+    id_convention = resolve_grid_id_convention(
+        spec=spec,
+        authoritative_ids=wide_df["id"],
+        context="blend input/dissemination ID handoff",
+    )
 
-    wide_df_allowed = restrict_to_allowed(wide_df, dissemination_cells)
-    train_df = wide_df_allowed[wide_df_allowed["year"].isin(training_years)].copy()
-    print(f"  Training years        : {sorted(training_years)}")
-    print(f"  Training rows (allowed cells) : {len(train_df)}")
+    cell_cfg = spec["cell"]
+    dissemination_csv = (
+        args.dissem_file
+        or cell_cfg.get("dissemination")
+        or "Monsoon_Data/dissemination_cells.csv"
+    )
+    dissemination_input = pd.read_csv(dissemination_csv, dtype=str)
+    dissemination_id_col = cell_cfg.get("id_col") or cell_cfg.get(
+        "dissemination_id_col"
+    )
+    if dissemination_id_col:
+        if dissemination_id_col not in dissemination_input.columns:
+            raise ValueError(
+                f"cell.id_col '{dissemination_id_col}' not found. "
+                f"Found: {dissemination_input.columns.tolist()}"
+            )
+        dissemination_input = dissemination_input.rename(
+            columns={dissemination_id_col: "id"}
+        )
+    dissemination_cells = ensure_id_col(
+        dissemination_input,
+        spec=spec,
+        convention=id_convention,
+        context="blend dissemination IDs",
+    )
+    validate_id_coordinate_consistency(
+        dissemination_cells, context="blend dissemination IDs"
+    )
+    dissemination_cells = dissemination_cells.drop_duplicates("id")
+
+    n_bins = max([
+        int(match.group(1))
+        for column in wide_df.columns
+        for match in [re.match(r"^prob_clim_week(\d+)$", column)]
+        if match
+    ] or [4])
 
     # ── Get formula ────────────────────────────────────────────────────
     formulas = build_formulas_from_spec(spec, cutoff_mode, data=wide_df)
@@ -230,17 +295,49 @@ def main():
             f"Available: {list(formulas.keys())}"
         )
     formula_str = formulas[args.model]
-    validate_formula_feature_support(
-        train_df, {args.model: formula_str}
+    wide_df, support = apply_formula_sample_support(wide_df, formulas)
+    print(
+        "Formula sample support "
+        f"({support['policy']}): {support['rows_before']} -> "
+        f"{support['rows_after']} rows "
+        f"({support['rows_excluded']} excluded)"
     )
+
+    wide_df_allowed = restrict_to_allowed(wide_df, dissemination_cells)
+    train_df = wide_df_allowed[wide_df_allowed["year"].isin(fit_years)].copy()
+    if train_df.empty:
+        raise ValueError(
+            "Final fit has no rows in the configured training years and "
+            "dissemination cells."
+        )
+    required_classes = interval_bins(n_bins)
+    present_classes = {
+        value for value in train_df["outcome"].unique()
+        if isinstance(value, str)
+    }
+    missing_classes = [
+        value for value in required_classes if value not in present_classes
+    ]
+    if missing_classes:
+        raise ValueError(
+            "Final-fit training rows are missing outcome classes: "
+            + ", ".join(missing_classes)
+        )
+
+    print(f"  Training years        : {sorted(fit_years)}")
+    print(f"  Training rows (allowed cells) : {len(train_df)}")
     print(f"\nFormula : {formula_str}")
 
     # ── Fit model on all training years ───────────────────────────────
-    print(f"\nFitting {args.model} on all {len(training_years)} training years...")
+    print(f"\nFitting {args.model} on all {len(fit_years)} training years...")
     bundle = fit_final_model(formula_str, train_df)
 
     # ── Print and save ────────────────────────────────────────────────
-    print_coef_table(bundle["coefs"], args.model, f"all years ({min(training_years)}-{max(training_years)})")
+    print_coef_table(
+        bundle["coefs"],
+        args.model,
+        f"all years ({min(fit_years)}-{max(fit_years)})",
+    )
 
     stem     = f"coefs_{args.model}_{args.method}_{args.tag}"
     pkl_path = os.path.join(out_dir, f"{stem}.pkl")

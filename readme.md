@@ -153,6 +153,25 @@ python python/pipelines/blending_process/3_produce_figures.py
 
 **Outputs**: `Monsoon_Data/results/2025_model_evaluation/`
 
+### Fit the production model
+
+After selecting a formula through cross-validation, fit it once on all
+spec-configured training years for operational forecasting:
+
+```bash
+python predict/3_fit_final_model.py \
+    --spec_id cv_models_fixed_cutoff_2026 \
+    --model blended_model \
+    --input_path Monsoon_Data/Processed_Data/training/cv_data_fixed_cutoff_new_pipeline.pkl \
+    --out_dir Monsoon_Data/results/training \
+    --tag final
+```
+
+This remains a separate step from cross-validation. It uses the same connector
+input, dissemination IDs, common formula sample, training-year exclusions, and
+outcome classes as the evaluator, then saves the existing coefficient-bundle
+format used by `apply_blend_model.py`.
+
 ---
 
 ## Operational Forecasting (Single New Forecast Year)
