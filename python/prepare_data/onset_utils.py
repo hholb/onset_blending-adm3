@@ -689,3 +689,171 @@ def _find_onset_core(series, n, wsum, aux1, aux2, thresh,
 
     ok = ~has_dry_spell
     return int(cand[np.where(ok)[0][0]]) if np.any(ok) else None
+
+
+def _row_prefix_sum(values, dtype=None):
+    """Return row-wise cumulative sums with a leading zero column."""
+    summed = np.cumsum(values, axis=1, dtype=dtype)
+    return np.concatenate(
+        (np.zeros((len(values), 1), dtype=summed.dtype), summed), axis=1
+    )
+
+
+def find_onsets_batch(series, thresholds, start_days, params,
+                      reject_if_short_followup=False, chunk_size=10_000):
+    """Find onset indices for multiple series and start-day restrictions.
+
+    The onset definition remains entirely controlled by ``params``. Rows are
+    processed in chunks to vectorise the shared trigger and dry-spell work
+    without tying memory use to the full forecast size. ``start_days`` may be
+    one vector or a matrix whose rows represent alternative restrictions; the
+    returned array has the same leading dimension and uses NaN for no onset.
+
+    The scalar :func:`find_onset` path remains the reference implementation and
+    continues to serve callers that process one rainfall series at a time.
+    """
+    series = np.asarray(series, dtype=float)
+    thresholds = np.asarray(thresholds, dtype=float)
+    start_days = np.asarray(start_days, dtype=float)
+    if series.ndim != 2:
+        raise ValueError("series must be a two-dimensional rows-by-days array")
+    if start_days.ndim == 1:
+        start_days = start_days[np.newaxis, :]
+    if len(thresholds) != len(series) or start_days.shape[1] != len(series):
+        raise ValueError("thresholds and start_days must match the series rows")
+
+    n_rows, n_days = series.shape
+    output = np.full((len(start_days), n_rows), np.nan)
+    max_candidate = n_days - params.win + 1
+    valid_rows = np.flatnonzero(~np.isnan(thresholds))
+    if max_candidate < 1 or len(valid_rows) == 0:
+        return output
+
+    candidate_days = np.arange(1, max_candidate + 1)
+    if params.followup_anchor == "onset_day":
+        follow_start_offset = 0
+        full_end_unclipped = candidate_days + params.follow_days
+    elif params.followup_anchor == "after_trigger":
+        follow_start_offset = params.win
+        full_end_unclipped = (
+            candidate_days + params.win - 1 + params.follow_days
+        )
+    else:
+        raise NotImplementedError(
+            f"Unsupported followup_anchor: {params.followup_anchor}"
+        )
+    full_end = np.minimum(n_days, full_end_unclipped)
+    full_followup = full_end_unclipped <= n_days
+    if params.wet_day_comparison == "gt":
+        compare_wet = np.greater
+    elif params.wet_day_comparison == "gte":
+        compare_wet = np.greater_equal
+    else:
+        raise NotImplementedError(
+            f"Unsupported wet_day_comparison: {params.wet_day_comparison}"
+        )
+
+    for first in range(0, len(valid_rows), int(chunk_size)):
+        rows = valid_rows[first:first + int(chunk_size)]
+        rain = series[rows]
+        rain_zero = np.where(np.isnan(rain), 0.0, rain)
+        rain_cumsum = _row_prefix_sum(rain_zero)
+        win = params.win
+        window_sums = rain_cumsum[:, win:] - rain_cumsum[:, :-win]
+
+        if params.trigger_rule == "first_day_wet":
+            wet_ok = compare_wet(
+                rain[:, :max_candidate], params.wet_day_min_mm
+            )
+        elif params.trigger_rule == "all_days_wet":
+            wet = compare_wet(rain, params.wet_day_min_mm)
+            wet_cumsum = _row_prefix_sum(wet, dtype=np.int32)
+            wet_ok = (
+                wet_cumsum[:, win:] - wet_cumsum[:, :-win]
+            ) == win
+        else:
+            raise NotImplementedError(
+                f"Unsupported trigger_rule: {params.trigger_rule}"
+            )
+
+        eligible = (
+            wet_ok
+            & (window_sums > thresholds[rows, np.newaxis])
+            & ~np.isnan(rain[:, :max_candidate])
+        )
+        if reject_if_short_followup:
+            eligible &= full_followup[np.newaxis, :]
+
+        if params.mode == "consecutive_dry":
+            dry = (
+                ~np.isnan(rain)
+                & (rain < params.dry_day_min_mm)
+            )
+            dry_starts = np.zeros_like(dry, dtype=np.int8)
+            dry_days = params.min_dry_days
+            if n_days >= dry_days:
+                dry_cumsum = _row_prefix_sum(dry, dtype=np.int32)
+                all_dry = (
+                    dry_cumsum[:, dry_days:]
+                    - dry_cumsum[:, :-dry_days]
+                ) == dry_days
+                first_dry = all_dry.copy()
+                if all_dry.shape[1] > 1:
+                    first_dry[:, 1:] &= ~dry[:, :all_dry.shape[1] - 1]
+                dry_starts[:, :all_dry.shape[1]] = first_dry
+            dry_prefix = _row_prefix_sum(dry_starts, dtype=np.int32)
+            lower = candidate_days - 1 + follow_start_offset
+            upper = np.minimum(n_days, full_end)
+            has_dry_spell = (
+                dry_prefix[:, upper] - dry_prefix[:, lower]
+            ) > 0
+
+        elif params.mode == "window_sum":
+            sum_window = params.sum_window
+            if n_days >= sum_window:
+                na_cumsum = _row_prefix_sum(
+                    np.isnan(rain), dtype=np.int32
+                )
+                follow_sums = (
+                    rain_cumsum[:, sum_window:]
+                    - rain_cumsum[:, :-sum_window]
+                )
+                follow_has_na = (
+                    na_cumsum[:, sum_window:]
+                    - na_cumsum[:, :-sum_window]
+                ) > 0
+                bad_window = (
+                    ~follow_has_na & (follow_sums < params.sum_min_mm)
+                )
+                bad_prefix = _row_prefix_sum(bad_window, dtype=np.int32)
+                max_prefix = bad_prefix.shape[1] - 1
+                lower = candidate_days - 1 + follow_start_offset
+                lower = np.minimum(lower, max_prefix)
+                upper = np.minimum(
+                    max_prefix,
+                    np.maximum(0, full_end - sum_window + 1),
+                )
+                has_dry_spell = (
+                    bad_prefix[:, upper] - bad_prefix[:, lower]
+                ) > 0
+            else:
+                has_dry_spell = np.zeros_like(eligible)
+        else:
+            raise NotImplementedError(
+                f"Unsupported dry-spell mode: {params.mode}"
+            )
+
+        eligible &= ~has_dry_spell
+        for variant, starts in enumerate(start_days):
+            minimum_start = np.maximum(1, np.ceil(starts[rows]))
+            allowed = (
+                eligible
+                & (candidate_days[np.newaxis, :] >= minimum_start[:, np.newaxis])
+            )
+            has_onset = allowed.any(axis=1)
+            first_onset = allowed.argmax(axis=1)
+            output[variant, rows] = np.where(
+                has_onset, candidate_days[first_onset], np.nan
+            )
+
+    return output

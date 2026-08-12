@@ -32,7 +32,7 @@ from .onset_utils import (
     read_ref_onset_dates, read_thresholds,
     read_onset_params,
     roll_sum_na_rm_left, roll_sum_na_propagate_left,
-    find_onset_precomp,
+    find_onset_precomp, find_onsets_batch,
 )
 from .spatial_id_utils import (
     GridIdConvention,
@@ -1052,7 +1052,9 @@ def calc_onsets_rowwise(df, day_cols, day_ints, win, params=None,
         via options.fixed_cutoff_month_day in the spec so a new geography can set
         its own climatological season cutoff.
     """
-    X = df[day_cols].values.astype(float)
+    if params is None:
+        params = read_onset_params({"options": {"window": win}})
+
     t0 = pd.to_datetime(df["time"]).values
     th = df["onset_thresh"].values.astype(float)
     yr = df["year"].values.astype(int)
@@ -1063,42 +1065,91 @@ def calc_onsets_rowwise(df, day_cols, day_ints, win, params=None,
     need_clim = np.searchsorted(day_ints_arr, need_clim_offset - 1, side='right') + 1
     need_clim = np.where(need_clim > len(day_ints_arr), 9999, need_clim).astype(int)
 
-    ref_onset_dates = pd.to_datetime(df["ref_onset_date"]).values if "ref_onset_date" in df.columns else np.array([pd.NaT] * len(df))
+    ref_onset_dates = (
+        pd.to_datetime(df["ref_onset_date"]).values
+        if "ref_onset_date" in df.columns
+        else np.full(len(df), np.datetime64("NaT"), dtype="datetime64[ns]")
+    )
     start_ref = np.ones(len(df), dtype=int)
+    has_ref = ~pd.isnull(ref_onset_dates)
+    ref_offsets = np.zeros(len(df), dtype=int)
+    ref_offsets[has_ref] = (
+        ref_onset_dates[has_ref] - t0[has_ref]
+    ).astype("timedelta64[D]").astype(int)
+    start_ref[has_ref] = (
+        np.searchsorted(
+            day_ints_arr, ref_offsets[has_ref] - 1, side="right"
+        ) + 1
+    )
+    start_ref[start_ref > len(day_ints_arr)] = 9999
 
-    n = len(df)
-    onset_raw = []
-    onset_fixed_cutoff = []
-    onset_ref = []
+    onset = np.full((3, len(df)), np.nan)
+    valid_threshold = ~np.isnan(th)
+    if np.any(valid_threshold):
+        onset[:, valid_threshold] = find_onsets_batch(
+            df.loc[valid_threshold, day_cols].to_numpy(dtype=float),
+            th[valid_threshold],
+            np.vstack((
+                np.ones(valid_threshold.sum(), dtype=int),
+                need_clim[valid_threshold],
+                start_ref[valid_threshold],
+            )),
+            params,
+        )
 
-    for i in range(n):
-        s = X[i]
-        wsum_all = roll_sum_na_rm_left(s, win)
+    return {
+        "onset_raw": onset[0],
+        "onset_fixed_cutoff": onset[1],
+        "onset_ref": onset[2],
+    }
 
-        if len(s) >= 10:
-            sum10 = roll_sum_na_propagate_left(s, 10)
-            bad10 = (~np.isnan(sum10)) & (sum10 < 5)
-            pre_bad = np.concatenate([[0], np.cumsum(bad10.astype(int))])
-            last10start = len(s) - 10 + 1
-        else:
-            pre_bad = np.array([0])
-            last10start = 0
 
-        onset_raw.append(find_onset_precomp(s, win, th[i], wsum_all, pre_bad, last10start, start_day=0, params=params))
-        onset_fixed_cutoff.append(find_onset_precomp(s, win, th[i], wsum_all, pre_bad, last10start,
-                                                       start_day=int(need_clim[i]), params=params))
+def _aggregate_forecast_members(df, key_cols, rain_day_cols, rain_day_ints,
+                                probability_day_ints):
+    """Aggregate member rainfall summaries and onset-day probabilities."""
+    grouped = df.groupby(key_cols, dropna=False, sort=True)
+    group_index = grouped.size().index
+    group_codes = grouped.ngroup().to_numpy(dtype=np.intp)
+    n_groups = len(group_index)
 
-        mk = ref_onset_dates[i]
-        if pd.isnull(mk):
-            sd_ref = 1
-        else:
-            offset = int((mk - t0[i]).astype("timedelta64[D]").astype(int))
-            sd_ref = int(np.searchsorted(day_ints_arr, offset - 1, side='right')) + 1
-            if sd_ref > len(day_ints_arr):
-                sd_ref = 9999
-        onset_ref.append(find_onset_precomp(s, win, th[i], wsum_all, pre_bad, last10start, start_day=sd_ref, params=params))
+    rain = df[rain_day_cols]
+    rain_mean = rain.groupby(group_codes, sort=True).mean()
+    rain_sd = rain.groupby(group_codes, sort=True).std()
+    frac_raining = rain.gt(1).groupby(group_codes, sort=True).mean()
 
-    return {"onset_raw": onset_raw, "onset_fixed_cutoff": onset_fixed_cutoff, "onset_ref": onset_ref}
+    rain_mean.columns = [f"forecast_rain_day_{day}" for day in rain_day_ints]
+    rain_sd.columns = [f"forecast_rain_sd_day_{day}" for day in rain_day_ints]
+    frac_raining.columns = [f"frac_raining_day_{day}" for day in rain_day_ints]
+
+    group_sizes = np.bincount(group_codes, minlength=n_groups).astype(float)
+    probability_frames = []
+    D = len(probability_day_ints)
+    for onset_col, prefix in (
+        ("onset_raw", "predicted_prob_day_"),
+        ("onset_fixed_cutoff", "predicted_prob_fixed_cutoff_day_"),
+        ("onset_ref", "predicted_prob_ref_day_"),
+    ):
+        onset = pd.to_numeric(df[onset_col], errors="coerce").to_numpy(float)
+        onset_pos = np.zeros(len(onset), dtype=np.intp)
+        finite = np.isfinite(onset)
+        onset_pos[finite] = onset[finite].astype(np.intp)
+        valid = finite & (onset >= 1) & (onset <= D)
+
+        counts = np.zeros((n_groups, D), dtype=float)
+        np.add.at(
+            counts,
+            (group_codes[valid], onset_pos[valid] - 1),
+            1.0,
+        )
+        probability_frames.append(pd.DataFrame(
+            counts / group_sizes[:, None],
+            columns=[f"{prefix}{day}" for day in probability_day_ints],
+        ))
+
+    parts = [rain_mean, rain_sd, frac_raining, *probability_frames]
+    for part in parts:
+        part.index = group_index
+    return pd.concat(parts, axis=1).reset_index()
 
 
 def process_rainfall_forecast_id(df, spec, ref_onset_dt=None, thr_dt=None):
@@ -1191,40 +1242,17 @@ def process_rainfall_forecast_id(df, spec, ref_onset_dt=None, thr_dt=None):
     df["onset_fixed_cutoff"] = on["onset_fixed_cutoff"]
     df["onset_ref"] = on["onset_ref"]
 
-    D = len(keep_ints)
-
-    def prob_from_idx(idxs):
-        valid = [x for x in idxs if x is not None and 1 <= x <= D]
-        if not valid:
-            return [0.0] * D
-        counts = np.zeros(D)
-        for x in valid:
-            counts[int(x) - 1] += 1
-        return list(counts / len(idxs))
-
-    # data.table keeps NA-valued grouping keys. Use dropna=False so pandas does
-    # the same for missing thresholds/reference dates instead of silently
-    # deleting complete forecast groups.
-    stats_agg = df.groupby(key_base, dropna=False).apply(
-        lambda g: pd.Series({
-            **{f"forecast_rain_day_{day_ints[j]}": g[keep_days[j]].mean() for j in range(len(keep_days))},
-            **{f"forecast_rain_sd_day_{day_ints[j]}": g[keep_days[j]].std() for j in range(len(keep_days))},
-            **{f"frac_raining_day_{day_ints[j]}": (g[keep_days[j]] > 1).mean() for j in range(len(keep_days))},
-        })
-    ).reset_index()
-
-    prob_agg = df.groupby(key_base, dropna=False).apply(
-        lambda g: pd.Series({
-            **{f"predicted_prob_day_{keep_ints[j]}": p
-               for j, p in enumerate(prob_from_idx(list(g["onset_raw"])))},
-            **{f"predicted_prob_fixed_cutoff_day_{keep_ints[j]}": p
-               for j, p in enumerate(prob_from_idx(list(g["onset_fixed_cutoff"])))},
-            **{f"predicted_prob_ref_day_{keep_ints[j]}": p
-               for j, p in enumerate(prob_from_idx(list(g["onset_ref"])))},
-        })
-    ).reset_index()
-
-    wide = stats_agg.merge(prob_agg, on=key_base)
+    # Preserve the historical rainfall-column labels based on day_ints. In the
+    # normal pipeline the NetCDF reader has already applied min/max-day
+    # filtering, so these align with keep_ints.
+    rain_day_ints = day_ints[:len(keep_days)]
+    wide = _aggregate_forecast_members(
+        df,
+        key_cols=key_base,
+        rain_day_cols=keep_days,
+        rain_day_ints=rain_day_ints,
+        probability_day_ints=keep_ints,
+    )
     return {"wide": wide}
 
 
