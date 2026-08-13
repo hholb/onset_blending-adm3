@@ -23,7 +23,6 @@ import pandas as pd
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 
-import re
 from python.pipelines._shared.misc import coalesce, interval_bins
 from python.prepare_data.nc_utils import ensure_id_col
 from python.prepare_data.spatial_id_utils import (
@@ -32,6 +31,7 @@ from python.prepare_data.spatial_id_utils import (
 )
 from python.blending_process.blend_evaluation_utils import (
     _present_weeks,
+    resolve_climatology_weeks,
     build_formulas_from_spec,
     print_formula_summary,
     apply_formula_sample_support,
@@ -164,11 +164,10 @@ def main():
     )
     dissemination_cells = dissemination_cells.drop_duplicates("id")
 
-    # Number of forecast week-bins, inferred from the connect-stage output
-    # (prob_clim_week<n> columns). Drives all bin lists below so a spec with a
-    # different days_per_bin / n_bins flows through unchanged.
-    N_BINS = max([int(m.group(1)) for c in wide_df.columns
-                   for m in [re.match(r"^prob_clim_week(\d+)$", c)] if m] or [4])
+    # Number of forecast week-bins, inferred from the configured climatology
+    # columns written by the connect stage.
+    _, clim_weeks = resolve_climatology_weeks(spec, wide_df)
+    N_BINS = max(clim_weeks)
 
 
 #    # --- DIAGNOSTIC
@@ -264,6 +263,7 @@ def main():
         cutoff_mode,
         data=wide_df,
         return_resolution=True,
+        n_bins=N_BINS,
     )
     wide_df, support = apply_formula_sample_support(wide_df, formulas)
     support["formula_resolution"] = formula_resolution

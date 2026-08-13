@@ -46,7 +46,6 @@ import pickle
 import argparse
 import warnings
 import itertools
-import re
 import numpy as np
 import pandas as pd
 import patsy
@@ -59,6 +58,7 @@ from python.blending_process.blend_evaluation_utils import (
     expand_formula_str,
     input_rds_from_cutoff,
     make_cutoff_tag,
+    resolve_climatology_weeks,
     restrict_to_allowed,
     _make_multinom_clf,
 )
@@ -280,15 +280,13 @@ def main():
     )
     dissemination_cells = dissemination_cells.drop_duplicates("id")
 
-    n_bins = max([
-        int(match.group(1))
-        for column in wide_df.columns
-        for match in [re.match(r"^prob_clim_week(\d+)$", column)]
-        if match
-    ] or [4])
+    _, clim_weeks = resolve_climatology_weeks(spec, wide_df)
+    n_bins = max(clim_weeks)
 
     # ── Get formula ────────────────────────────────────────────────────
-    formulas = build_formulas_from_spec(spec, cutoff_mode, data=wide_df)
+    formulas = build_formulas_from_spec(
+        spec, cutoff_mode, data=wide_df, n_bins=n_bins
+    )
     if args.model not in formulas:
         raise ValueError(
             f"Model '{args.model}' not found in spec formulas. "

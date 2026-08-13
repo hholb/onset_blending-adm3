@@ -30,6 +30,23 @@ def _present_weeks(df, base):
     return sorted(int(m.group(1)) for c in df.columns for m in [pat.match(c)] if m)
 
 
+def resolve_climatology_weeks(spec, df):
+    """Return the configured conditional-climatology prefix and its weeks."""
+    clim_tasks = ((spec.get("extras") or {}).get("clim_logits") or [])
+    clim_task = next(
+        (task for task in clim_tasks if task.get("name") == "clim_raw"),
+        {},
+    )
+    base = coalesce(clim_task.get("base_col_prefix"), "prob_clim")
+    weeks = _present_weeks(df, base)
+    if not weeks:
+        raise ValueError(
+            f"No climatology columns found for configured prefix '{base}' "
+            f"(expected {base}_week<n>)."
+        )
+    return base, weeks
+
+
 def _cv_weeks(df):
     """Sorted week numbers present as `cv_week<n>` columns in df."""
     return sorted(int(m.group(1)) for c in df.columns
@@ -212,7 +229,7 @@ def make_window_suffix(start_year, end_year):
 
 
 def build_formulas_from_spec(spec, cutoff_mode, data=None,
-                             return_resolution=False):
+                             return_resolution=False, n_bins=None):
     """
     Build dict of formula strings from spec["models"]["formulas"],
     with optional windowed variants.
@@ -221,7 +238,7 @@ def build_formulas_from_spec(spec, cutoff_mode, data=None,
     if not formula_cfg:
         raise ValueError("Spec must define models.formulas with named entries containing 'text'.")
 
-    n_bins = _spec_n_bins(spec)
+    n_bins = _spec_n_bins(spec) if n_bins is None else int(n_bins)
     base_texts = {}
     resolution = {}
     for nm, v in formula_cfg.items():

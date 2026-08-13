@@ -13,7 +13,7 @@ Sources
 -------
 Blended model  : cv_preds_<model>_global_*.pkl  (from 1_blend_evaluation.py)
 Climatology    : the weekly-bin wide pickle      (from 0_connect_...py)
-                 columns prob_clim_week1..4 are logit-scale → converted back
+                 configured climatology week columns are converted from logits
 
 Usage (run from repo root)
 --------------------------
@@ -29,7 +29,7 @@ Standard mode (two input files derived from spec):
         [--input_path Monsoon_Data/Processed_Data/2026_pipeline_input/cv_data_clim_mok_date_new_pipeline.pkl] \\
         [--out_dir    Monsoon_Data/results/2025_model_evaluation/exports/]
 
-Operational mode (single combined preds pkl containing both cv_* and prob_clim_* columns):
+Operational mode (single combined preds pkl containing both cv_* and climatology columns):
     python predict/export_blend_output.py \\
         --issue_date  2026-06-09 \\
         --spec_id     cv_models_fixed_cutoff_2026 \\
@@ -41,7 +41,7 @@ Notes
 --cv_preds_file   overrides --coef_dir for locating the cv_preds pickle.
 --input_path  overrides --pipeline_input_dir for locating the wide pipeline pickle.
 --preds_file  activates operational mode: skips loading two separate files and reads
-              everything (cv_* and prob_clim_* columns) from a single combined pkl.
+              everything from a single combined pkl.
 """
 
 import os
@@ -84,6 +84,7 @@ try:
         input_rds_from_cutoff,
         make_cutoff_tag,
         make_year_tag,
+        resolve_climatology_weeks,
     )
     from python.pipelines._shared.read_spec import load_spec
 except ImportError:
@@ -164,7 +165,7 @@ def main():
     parser.add_argument("--preds_file", default=None,
                         help="Optional: Operational mode. Direct path to a combined preds pkl "
                              "(e.g. blended_model_global_year2026_preds.pkl) that contains both "
-                             "cv_* and prob_clim_* columns. When provided, --cv_preds_file, "
+                             "cv_* and configured climatology columns. When provided, --cv_preds_file, "
                              "--coef_dir, --input_path, and --pipeline_input_dir are all ignored.")
     args = parser.parse_args()
 
@@ -261,17 +262,11 @@ def main():
         print(f"  Climatology rows for {issue_date}: {len(clim_day)}")
 
     # ── Extract climatology probabilities ─────────────────────────────
-    # prob_clim_week* are stored in logit scale → convert back with expit()
+    # The configured climatology week columns are stored in logit scale.
+    clim_prefix, clim_weeks = resolve_climatology_weeks(spec, clim_day)
     clim_logit_cols = {
-        f"prob_clim_week{w}": f"clim_week{w}" for w in _week_nums(clim_day, "prob_clim_")
+        f"{clim_prefix}_week{w}": f"clim_week{w}" for w in clim_weeks
     }
-    missing_clim = [c for c in clim_logit_cols if c not in clim_day.columns]
-    if missing_clim:
-        raise ValueError(
-            f"Missing climatology columns in wide_df: {missing_clim}\n"
-            f"Available prob_clim columns: "
-            f"{[c for c in wide_df.columns if 'prob_clim' in c][:10]}"
-        )
 
     clim_out = clim_day[["id", "time"]].copy()
     for logit_col, out_col in clim_logit_cols.items():
