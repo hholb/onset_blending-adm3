@@ -129,7 +129,7 @@ filter:
   #
   # Unit lat/lon for the bbox comes from (in order): 'lat'/'lon' columns,
   # an id of the form '<lat>_<lon>' (grid-cell units), or a centroids CSV:
-  # centroids_file: "Monsoon_Data/reference/unit_centroids.csv"   # adm3_name, lat/lon (or center_lat/center_lon)
+  # centroids_file: "Monsoon_Data/reference/unit_centroids.csv"   # target_id, lat/lon (legacy adm3_name accepted)
 
 # ------------------------------------------------------------------------------
 # Climatology Options

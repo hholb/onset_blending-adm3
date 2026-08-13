@@ -1,0 +1,123 @@
+# Portable country template: historical observed rainfall and climatology.
+# Copy this file, rename it, and replace every example_country path/field.
+# The active scientific example is the Indian Moron-Robertson definition;
+# choose settings appropriate for the new country before running.
+
+type: ground_truth_rainfall
+
+input:
+  # This example assumes the optional regrid stage produced *_adm3.nc files.
+  # If the inputs already use the target grid/units, change the folder/regex.
+  nc_folder: Monsoon_Data/raw_nc/example_country/ground_truth
+  file_regex: '^rain_(19|20)\d{2}_adm3\.nc$'
+  value_col: rainfall
+  parallel: true
+  workers: 4
+
+  # The climatology builder reads the wide artifact written by this spec.
+  gt_path: Monsoon_Data/Processed_Data/example_country/ground_truth_template_wide.pkl
+
+dimensions:
+  rename:
+    latitude: lat
+    longitude: lon
+    time: time
+
+output:
+  out_dir: Monsoon_Data/Processed_Data/example_country
+  # The wide table is sufficient for climatology and blending. Enable only
+  # when the annotated daily-long diagnostic artifact is needed.
+  write_long: false
+
+options:
+  window: 5
+  onset_definition:
+    wet_day_min_mm: 1.0
+    trigger_rule: first_day_wet
+    wet_day_comparison: gt
+    follow_days: 30
+    followup_anchor: onset_day
+    dry_spell:
+      # Moron-Robertson rolling-accumulation veto.
+      mode: window_sum
+      sum_window: 10
+      sum_min_mm: 5.0
+
+      # Alternative example: a run of dry days vetoes the trigger.
+      # mode: consecutive_dry
+      # min_dry_days: 7
+      # dry_day_min_mm: 1.0
+
+  cutoff_month_day: '05-01'
+  fixed_cutoff_month_day: '06-01'
+  min_year: 2000
+  max_year: 2024
+
+  # keep preserves missing calendar days as missing rainfall. Use zero only
+  # when a missing value is scientifically known to mean no rain; drop removes
+  # incomplete dates and changes calendar support.
+  missing_rain_policy: keep
+
+  # Alternative to writing regridded NetCDF files in the separate regrid
+  # stage: transform rainfall directly while processing this raw source.
+  # The weight CSV requires source_id, target_id, weight. Keep disabled when
+  # the input already contains the intended target units.
+  cell_transform_enabled: false
+  # cell_transform_enabled: true
+  # cell_transform_file: Monsoon_Data/reference/example_country/cell_transform_weights.csv
+
+thresholds:
+  # Per-unit threshold table. The stable unit key must match the regrid and
+  # dissemination tables. Required columns here: unit_id, onset_threshold.
+  file: Monsoon_Data/reference/example_country/onset_thresholds.csv
+  id_col: unit_id
+  thresh_col: onset_threshold
+
+  # Alternative: one fixed threshold for every unit (remove file/id fields).
+  # constant: 20.0
+
+filter:
+  dissemination_cells_file: Monsoon_Data/reference/example_country/dissemination_units.csv
+  id_col: unit_id
+  # Optional for admin units; produced by the regrid template.
+  centroids_file: Monsoon_Data/reference/example_country/unit_centroids.csv
+  centroids_id_col: target_id
+  # bbox: {lat_min: -10.0, lat_max: 10.0, lon_min: 20.0, lon_max: 40.0}
+
+paths:
+  climatology_out_dir: Monsoon_Data/Processed_Data/example_country
+  climatology_out_stem: ground_truth_template_clim_issue
+
+climatology_runtime:
+  workers: 4
+
+# Keep the names `clim` and `clim_unc`: the one-click wrappers use these two
+# keys to wire the paired outputs into the combine stage.
+climatologies:
+  clim:
+    out_stem: ground_truth_template_clim_issue
+    onset_col: onset_day
+    conditional: true
+    train_year_min: 2000
+    train_year_max: 2024
+    test_year_min: 2000
+    test_year_max: 2024
+    cv_by_year: true
+    season_start_md: '05-01'
+    issue_end_md: '07-31'
+    forecast_window: 28
+    min_onset_years: 10
+
+  clim_unc:
+    out_stem: ground_truth_template_clim_unc_issue
+    onset_col: onset_day
+    conditional: false
+    train_year_min: 2000
+    train_year_max: 2024
+    test_year_min: 2000
+    test_year_max: 2024
+    cv_by_year: true
+    season_start_md: '05-01'
+    issue_end_md: '07-31'
+    forecast_window: 28
+    min_onset_years: 10

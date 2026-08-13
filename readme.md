@@ -470,7 +470,7 @@ Each variant has its own connect and CV spec in `specs/2025_blend/`.
 
 The modelling domain is set in the raw-data spec's `filter:` block, with two composable restrictions:
 - **`dissemination_cells_file`** — a CSV keyed by configured `filter.id_col`, `id`, legacy `adm3_name`, or separate `lat`/`lon`; keeps only those units (the base domain).
-- **`bbox`** — an optional *further* restriction `{lat_min, lat_max, lon_min, lon_max}` (any subset of keys), applied on top. Defaults to no bbox restriction (all dissemination cells). Unit lat/lon is taken from `lat`/`lon` columns, an id of the form `<lat>_<lon>` (grid-cell units), or a `filter.centroids_file` (`adm3_name` + lat/lon). For admin (shapefile) units, the regrid step (0) writes a suitable centroids CSV automatically — set `filter.centroids_file` to that file.
+- **`bbox`** — an optional *further* restriction `{lat_min, lat_max, lon_min, lon_max}` (any subset of keys), applied on top. Defaults to no bbox restriction (all dissemination cells). Unit lat/lon is taken from `lat`/`lon` columns, an id of the form `<lat>_<lon>` (grid-cell units), or a `filter.centroids_file` (`target_id` + lat/lon; legacy `adm3_name` is accepted). For admin (shapefile) units, the regrid step (0) writes a suitable centroids CSV automatically — set `filter.centroids_file` to that file.
 
 ---
 
@@ -565,6 +565,139 @@ To add or remove a predictor: edit `rain_predictors` in the connect spec **and**
 
 ---
 
+## Portable Country Template Bundle
+
+The following six specifications form one copyable, internally consistent
+example. They use relative placeholder paths, one forecast key
+(`forecast_model`), and matching artifact names across every stage:
+
+- `specs/regrid/country_template.yml` — optional grid-to-grid or
+  grid-to-administrative-unit alignment;
+- `specs/raw_data/ground_truth_template.yml` — observed rainfall, onset truth,
+  and paired conditional/unconditional climatologies;
+- `specs/raw_data/forecast_template.yml` — one rainfall forecast family;
+- `specs/combine/combine_country_template.yml` — truth/climatology/forecast
+  join;
+- `specs/2025_blend/connect_country_template.yml` — weekly probabilities and
+  rainfall predictors;
+- `specs/2025_blend/cv_models_country_template.yml` — CV, metrics, and final-fit
+  contract.
+
+Copy and rename the bundle rather than editing these examples in place. Replace
+the country paths, NetCDF variable/dimension names, stable unit IDs, years, and
+scientific onset settings. Keep the chosen model key and artifact handoffs
+identical across the renamed combine, connect, and CV specs. No run manifest is
+required and the existing specification directories/loaders are unchanged.
+
+The active template settings reproduce the Indian/Moron-Robertson-style onset
+rule (`first_day_wet`, strict `gt`, `window_sum`, and `onset_day` anchoring) as
+an example, not as a universal country default. The raw templates also show the
+alternative consecutive-dry rule and fixed versus file-backed thresholds. The
+connector demonstrates fourth-root rainfall features, symbolic trigger/dry
+windows, and `truncate` horizon resolution. Read the comments and make each
+choice explicitly for the target country.
+
+### Artifact handoff
+
+With the filenames above and no wrapper overrides, the data path is:
+
+```text
+ground_truth_template_wide.pkl
+  + ground_truth_template_clim_issue.pkl
+  + ground_truth_template_clim_unc_issue.pkl
+  + forecast_template_wide.pkl
+    -> combine_country_template_combined_wide.pkl
+    -> cv_data_fixed_cutoff_new_pipeline.pkl
+    -> CV results / final coefficient bundle
+```
+
+The regrid step is optional. When used, it writes `*_adm3.nc` files next to the
+raw files; the raw templates are already configured to read those names. When
+the inputs are already on the target support, skip regridding and change the raw
+spec folders/regexes accordingly. As an alternative that avoids writing
+regridded NetCDF files, both raw templates show the direct sparse
+`cell_transform_file` path (`source_id`, `target_id`, `weight`).
+
+The connector and CV templates also show the boundary for a genuinely
+rainfall-only short-horizon system: retain its constructible rainfall predictors
+in the connector/formula, but omit that model from `extras.forecasts` and any
+enabled MME because those consumers require its daily onset probabilities.
+
+### One-click historical training and CV
+
+After copying the specs and preparing the referenced support files:
+
+```bash
+python python/run_training.py \
+    --forecast forecast_model forecast_template \
+    --clim_spec ground_truth_template \
+    --combine_spec combine_country_template \
+    --connect_spec connect_country_template \
+    --blend_spec cv_models_country_template \
+    --work_dir Monsoon_Data/Processed_Data/example_country \
+    --results_dir Monsoon_Data/results/example_country \
+    --cores 4
+```
+
+`run_training.py` rewrites only runtime copies of the selected YAML files and
+passes the exact connector output to the evaluator. Use `--dry_run` first to
+inspect the resolved commands and handoffs.
+
+### Final fit and operational application
+
+Fit the selected formula on all configured training years except
+`true_holdout_years`:
+
+```bash
+python predict/3_fit_final_model.py \
+    --spec_id cv_models_country_template \
+    --model blended_model \
+    --input_path Monsoon_Data/Processed_Data/example_country/cv_data_fixed_cutoff_new_pipeline.pkl \
+    --out_dir Monsoon_Data/results/example_country \
+    --tag final
+```
+
+For a forecast year, copy the ground-truth/climatology, forecast, and combine
+templates to year-specific spec IDs. Set both climatology `test_year_*` fields
+and the combine source `years` to that forecast year, while retaining the same
+model key and saved formula contract. For one forecast (`N=1`), the generic
+operational path through model application is:
+
+```bash
+python predict/run_operational_pipeline.py \
+    --year 2026 \
+    --issue_date 2026-06-09 \
+    --forecast forecast_model forecast_country_2026 \
+    --clim_spec ground_truth_country_2026 \
+    --combine_spec combine_country_2026 \
+    --connect_spec connect_country_template \
+    --blend_spec cv_models_country_template \
+    --coef_dir Monsoon_Data/results/example_country \
+    --coef_tag final \
+    --work_dir Monsoon_Data/Processed_Data/example_country/2026 \
+    --stop_at 5
+```
+
+The core generic workflow currently ends at saved-model application (`N+4`).
+CSV/NetCDF export and maps after that point still contain Ethiopia-oriented
+support-file and `adm3_name` assumptions. Generalizing those presentation
+outputs is separate from configuring and running the blending algorithm.
+
+### Migration note (changes since `a146b0d`)
+
+- No mandatory manifest or specification-directory reorganization was added.
+- The fixed AIFS command-line arguments remain as legacy-compatible aliases;
+  repeatable `--forecast MODEL SPEC_ID` is the geography/model-neutral path.
+- Previously hard-coded onset, forecast-name, horizon, rainfall-transform, and
+  spatial-ID behavior is now explicit in the existing YAML contracts.
+- Effective formulas and coefficient feature/class schemas are saved and
+  checked when the fitted model is applied.
+- Obsolete implicit assumptions remain accepted only where needed for legacy
+  compatibility; new country specs should use the explicit fields shown here.
+- Country-generic export and map support remains future work.
+
+---
+
 ## Re-targeting to a New Geography
 
 The core pipeline keys on an abstract `id` and never touches lat/lon, so moving to a new region is mostly a matter of supplying a boundary shapefile and gridded inputs.
@@ -586,7 +719,7 @@ For shapefile targets, set `geometry.region_id_col` to the stable join key (for 
 
 **Supplying your own weights.** Instead of computing weights, you can point the spec at precomputed weight CSVs (columns `latitude, longitude, target_id, weight`; legacy `adm3_name` is also accepted): a top-level `weights_in:` applies to everything, or a per-target `weights_in:` (under `ground_truth` or a `forecasts[]` entry) overrides it. When all weights are supplied, no shapefile overlay / coverage scan / report runs — the step just applies them. (The low-level `utils/remap.py apply --weights <csv>` does the same for a single file.)
 
-Regridding is applied to **rainfall** (raw NetCDF variables), never to onset probabilities — those are computed downstream. Each `<name>.nc` becomes `<name>_adm3.nc` alongside it; point the step-1 specs at those (`file_regex: '..._adm3\.nc$'`). A **coverage report** CSV lists, for all units and for the dissemination subset, how many units are affected by missing ground truth and the min/5/25/50/75/95/max quantiles of the missing-area fraction. When a shapefile is used, a **unit centroids** CSV (`adm3_name, lat, lon`) is also written (`centroids_out`), ready to use as `filter.centroids_file` for the bbox domain filter.
+Regridding is applied to **rainfall** (raw NetCDF variables), never to onset probabilities — those are computed downstream. Each `<name>.nc` becomes `<name>_adm3.nc` alongside it; point the step-1 specs at those (`file_regex: '..._adm3\.nc$'`). A **coverage report** CSV lists, for all units and for the dissemination subset, how many units are affected by missing ground truth and the min/5/25/50/75/95/max quantiles of the missing-area fraction. When a shapefile is used, a **unit centroids** CSV (`target_id, lat, lon`) is also written (`centroids_out`), ready to use as `filter.centroids_file` for the bbox domain filter. Existing centroid files keyed by `adm3_name` remain readable.
 
 ### Regridding a grid onto admin units (low-level)
 

@@ -49,7 +49,7 @@ forecasts:
 
 weights_out: Monsoon_Data/reference/shared_regrid_weights_india_example.csv
 
-# Per-unit centroids are written here (adm3_name, lat, lon) whenever a shapefile
+# Per-unit centroids are written here (target_id, lat, lon) whenever a shapefile
 # is used. Point a raw-data spec's filter.centroids_file at this to enable the
 # min/max lat/lon (bbox) domain filter on admin units.
 # centroids_out: Monsoon_Data/reference/unit_centroids_india_example.csv

@@ -417,8 +417,9 @@ def _resolve_unit_latlon(df, filt):
     (None, None) if they cannot be determined. Sources, in order:
       1. explicit 'lat'/'lon' columns on df (gridded/legacy data),
       2. an id of the form '<lat>_<lon>' (grid-cell units),
-      3. filter.centroids_file: CSV with adm3_name + lat/lon (or center_lat/
+      3. filter.centroids_file: CSV with target_id + lat/lon (or center_lat/
          center_lon) giving a representative point per unit (admin units).
+         Legacy adm3_name centroid files remain accepted.
     """
     if "lat" in df.columns and "lon" in df.columns:
         return df["lat"].astype(float).values, df["lon"].astype(float).values
@@ -441,7 +442,7 @@ def _resolve_unit_latlon(df, filt):
             )
         if not keyc:
             keyc = next(
-                (x for x in ("id", "adm3_name") if x in c.columns),
+                (x for x in ("target_id", "id", "adm3_name") if x in c.columns),
                 c.columns[0],
             )
         latc = next((x for x in ("lat", "center_lat", "latitude") if x in c.columns), None)

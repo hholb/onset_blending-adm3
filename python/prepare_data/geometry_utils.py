@@ -371,17 +371,18 @@ def coverage_missing_fraction(admin_gdf, coverage_geom):
 
 def unit_centroids(units_gdf):
     """
-    Per-unit centroid as a DataFrame [adm3_name, lat, lon] (in the units' CRS,
+    Per-unit centroid as a DataFrame [target_id, lat, lon] (in the units' CRS,
     normally EPSG:4326). Produced during regridding from the shapefile so it can
     be reused as a `filter.centroids_file` for the bbox domain filter on admin
-    units (which otherwise carry no lat/lon).
+    units (which otherwise carry no lat/lon). The geometry table still uses the
+    legacy internal key, but new external artifacts use the neutral target ID.
     """
     import warnings
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")  # geographic-CRS centroid warning is fine here
         cen = units_gdf.geometry.centroid
     data = {
-        CANON_REGION_KEY: units_gdf[CANON_REGION_KEY].values,
+        "target_id": units_gdf[CANON_REGION_KEY].values,
         "lat": np.asarray(cen.y.values, dtype=float),
         "lon": np.asarray(cen.x.values, dtype=float),
     }

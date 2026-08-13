@@ -1,0 +1,87 @@
+# Portable country template: LOYO evaluation and the final-fit contract.
+
+n_bins: 4
+
+run:
+  cutoff_mode: fixed_cutoff
+  MR: true
+  training_years: [2000, 2001, 2002, 2003, 2004, 2005, 2006, 2007, 2008,
+                   2009, 2010, 2011, 2012, 2013, 2014, 2015, 2016, 2017,
+                   2018, 2019, 2020, 2021, 2022, 2023, 2024]
+  cv_holdout_years: [2000, 2001, 2002, 2003, 2004, 2005, 2006, 2007, 2008,
+                     2009, 2010, 2011, 2012, 2013, 2014, 2015, 2016, 2017,
+                     2018, 2019, 2020, 2021, 2022, 2023, 2024]
+  # Exclude only genuine future/untouched evaluation years from final fitting.
+  true_holdout_years: []
+  pipeline_input_dir: example_country
+  pipeline_output_dir: example_country
+  # Standalone evaluator/final-fit fallback. The wrappers pass --input_path
+  # explicitly, so this never overrides their exact connector handoff.
+  input_rds_override: Monsoon_Data/Processed_Data/example_country/cv_data_fixed_cutoff_new_pipeline.pkl
+
+cv:
+  methods: [global]
+
+cell:
+  dissemination: Monsoon_Data/reference/example_country/dissemination_units.csv
+  id_col: unit_id
+
+models:
+  formulas:
+    blended_model:
+      enabled: true
+      text: >-
+        outcome ~ prob_clim_qx * diff_forecast_model_qx
+        + min_forecast_model_10day_qx
+        + max_forecast_model_5day_qx
+  window_variants:
+    enabled: false
+    only_if_cutoff_mode: ref_onset
+    base_name: blended_model
+    start_years: [2000]
+    end_year: 2024
+    include_baseline_1900: false
+    replace:
+      from: prob_clim_qx
+      to: prob_clim{window}_qx
+
+mme:
+  enabled: false
+  variants: [fixed_cutoff]
+  mc_cores: 4
+  blend_models:
+    - {name: clim_raw, source: clim}
+    - {name: forecast_model, source: forecast, cal_variant: fixed_cutoff}
+
+extras:
+  clim_logits:
+    - name: unc_clim_raw
+      base_col_prefix: prob_clim_unc
+      earlier_col: prob_clim_unc_earlier
+      earlier_is_logit: true
+    - name: clim_raw
+      base_col_prefix: prob_clim
+      window_start_years: [2000]
+      window_end_year: 2024
+
+  forecasts:
+    # This requests complete daily onset probabilities for raw/Platt-calibrated
+    # evaluation. For a rainfall-only short-horizon model, omit its entry here
+    # (and from enabled MME) while retaining constructible rain formula terms.
+    - name: forecast_model
+      variant: fixed_cutoff
+      raw: true
+      calibrated: true
+      fair_brier: true
+      export_platt_weights: true
+
+  forecast_variants:
+    base: ''
+    fixed_cutoff: _fixed_cutoff
+
+# Final fit (same data/formula contract, no CV fold changes):
+# python predict/3_fit_final_model.py --spec_id cv_models_country_template \
+#   --model blended_model \
+#   --input_path Monsoon_Data/Processed_Data/example_country/cv_data_fixed_cutoff_new_pipeline.pkl \
+#   --out_dir Monsoon_Data/results/example_country --tag final
+# This writes the coefficient bundle consumed by apply_blend_model.py.

@@ -1,0 +1,49 @@
+# Optional portable pre-step: align ground truth and forecasts to one target.
+# Run: python python/pipelines/prepare_data/0_regrid_to_shapefile.py \
+#        --spec_id country_template
+
+# Administrative target example. Use a stable code for joins and a separate
+# display name when available. Internally the stable target ID is carried in
+# the legacy NetCDF coordinate named adm3_name for compatibility.
+geometry:
+  shapefile: Monsoon_Data/reference/example_country/admin_units.shp
+  region_id_col: unit_id
+  region_name_col: unit_name
+  # Optional parent-unit key retained for later labels or boundary overlays.
+  # parent_key_col: parent_unit_id
+  crs: EPSG:4326
+  grid_lat_var: latitude
+  grid_lon_var: longitude
+
+  # Grid-cell target alternative: remove `shapefile`, `region_id_col`, and
+  # `region_name_col`. The ground-truth grid becomes the target registry.
+  # Explicit precision is preferred when an established external ID contract
+  # exists; otherwise the least collision-free precision is inferred.
+  # grid_id_decimal_digits: 2
+  # grid_id_format: fixed          # fixed | trimmed
+
+clip_to_coverage: true
+
+ground_truth:
+  nc_folder: Monsoon_Data/raw_nc/example_country/ground_truth
+  file_regex: '^rain_(19|20)\d{2}\.nc$'
+  value_col: rainfall
+
+forecasts:
+  - nc_folder: Monsoon_Data/raw_nc/example_country/forecast_model
+    file_regex: '^forecast_(19|20)\d{2}\.nc$'
+    value_col: rainfall
+
+# Generated weights use columns latitude, longitude, target_id, weight.
+weights_out: Monsoon_Data/reference/example_country/shared_regrid_weights.csv
+# Generated centroids use columns target_id, lat, lon (plus region_name when
+# configured). Raw-data specs can read older adm3_name centroid files too.
+centroids_out: Monsoon_Data/reference/example_country/unit_centroids.csv
+report_out: Monsoon_Data/reference/example_country/regrid_coverage_report.csv
+dissemination_cells_file: Monsoon_Data/reference/example_country/dissemination_units.csv
+dissemination_id_col: unit_id
+
+# Supplied-weight alternative: uncomment globally, or set weights_in separately
+# under ground_truth / each forecasts entry. Legacy adm3_name is accepted in
+# place of target_id, but target_id is the canonical new-table field.
+# weights_in: Monsoon_Data/reference/example_country/precomputed_weights.csv

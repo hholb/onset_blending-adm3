@@ -1,0 +1,39 @@
+# Portable country template: daily probabilities/rainfall -> blend-ready bins.
+
+mode: fixed_cutoff
+input_rds: Monsoon_Data/Processed_Data/example_country/combine_country_template_combined_wide.pkl
+output_rds: Monsoon_Data/Processed_Data/example_country/cv_data_fixed_cutoff_new_pipeline.pkl
+
+# Four seven-day bins use daily onset probabilities through day 28.
+day_max: 28
+days_per_bin: 7
+n_bins: 4
+
+# Symbolic predictor windows below are resolved from this raw-data spec.
+onset_spec: ground_truth_template
+
+climatology:
+  base_prefix: clim
+  unconditional_prefix: clim_unc
+  output_prefix: prob_clim
+  window_tags: []
+
+# Feature-only transform; onset detection and climatology still use raw rain.
+rain_transform: fourth_root
+
+forecast_models:
+  - name: forecast_model
+    variants: [fixed_cutoff]
+    rain_day_max: 40
+    rain_horizon_policy: truncate
+    rain_predictors:
+      - {agg: diff, window: trigger}
+      - {agg: min, window: dry_spell}
+      - {agg: max, window: trigger}
+
+# For short-horizon systems, `truncate` marks unconstructible rain features and
+# CV resolves `_qx` formula terms accordingly. Daily onset probabilities remain
+# required whenever raw/calibrated forecast evaluation or MME requests them.
+# To use a genuinely rainfall-only short-horizon model, keep its constructible
+# rain predictors here and in the formula, but omit that model from both
+# `extras.forecasts` and enabled `mme.blend_models` in the CV spec.
