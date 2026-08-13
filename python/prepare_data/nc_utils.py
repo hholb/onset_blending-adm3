@@ -807,6 +807,61 @@ def transform_groundtruth_long(df, weights_df, value_col, spec=None):
 # NetCDF readers
 # ---------------------------------------------------------------------------
 
+def _select_forecast_days(day_values, spec, nc_path):
+    """Return selected day positions, labels, and integer lead values."""
+    day_values = np.asarray(day_values).reshape(-1)
+    day_numbers = []
+    for value in day_values:
+        try:
+            day_numbers.append(int(value))
+        except (TypeError, ValueError):
+            day_numbers.append(None)
+
+    options = spec.get("options", {})
+    min_day = options.get("min_day")
+    max_day = options.get("max_day")
+    strict_rain_day_max = options.get("rain_day_max")
+    if strict_rain_day_max is not None:
+        _, horizon_policy = resolve_rain_day_max(
+            {
+                "rain_day_max": strict_rain_day_max,
+                "rain_horizon_policy": options.get("rain_horizon_policy"),
+            },
+            probability_day_max=1,
+        )
+        validation_values = [
+            value for value, day in zip(day_values, day_numbers)
+            if day is not None and (min_day is None or day >= int(min_day))
+        ]
+        validate_day_coordinate(
+            validation_values,
+            strict_rain_day_max,
+            context=f"NetCDF file {os.path.basename(nc_path)}",
+            allow_extra=horizon_policy == "truncate",
+        )
+
+    keep = np.ones(len(day_values), dtype=bool)
+    if min_day is not None:
+        keep &= np.array([
+            day is not None and day >= int(min_day) for day in day_numbers
+        ])
+    if max_day is not None:
+        keep &= np.array([
+            day is not None and day <= int(max_day) for day in day_numbers
+        ])
+    if not np.any(keep):
+        raise ValueError(
+            f"Day filtering removed all columns for: {os.path.basename(nc_path)}"
+        )
+
+    positions = np.flatnonzero(keep)
+    return (
+        positions,
+        day_values[positions].tolist(),
+        [day_numbers[position] for position in positions],
+    )
+
+
 def nc_read_forecast_wide(nc_path, var_name, dim_rename_map, spec,
                           day_dim="day", prefix=None, add_year=True):
     """
@@ -858,49 +913,9 @@ def nc_read_forecast_wide(nc_path, var_name, dim_rename_map, spec,
                 f"Available: {renamed_names}"
             )
 
-        day_vals = dim_vals[dim_names[day_idx]]
-        day_vals_num = []
-        for dv in day_vals:
-            try:
-                day_vals_num.append(int(dv))
-            except (TypeError, ValueError):
-                day_vals_num.append(None)
-
-        min_day = spec.get("options", {}).get("min_day")
-        max_day = spec.get("options", {}).get("max_day")
-
-        strict_rain_day_max = spec.get("options", {}).get("rain_day_max")
-        if strict_rain_day_max is not None:
-            _, horizon_policy = resolve_rain_day_max(
-                {
-                    "rain_day_max": strict_rain_day_max,
-                    "rain_horizon_policy": spec["options"].get(
-                        "rain_horizon_policy"
-                    ),
-                },
-                probability_day_max=1,
-            )
-            validation_day_vals = [
-                value for value, day in zip(day_vals, day_vals_num)
-                if day is not None and (min_day is None or day >= int(min_day))
-            ]
-            validate_day_coordinate(
-                validation_day_vals,
-                strict_rain_day_max,
-                context=f"NetCDF file {os.path.basename(nc_path)}",
-                allow_extra=horizon_policy == "truncate",
-            )
-
-        keep = np.ones(len(day_vals), dtype=bool)
-        if min_day is not None:
-            keep &= np.array([(x is not None and x >= int(min_day)) for x in day_vals_num])
-        if max_day is not None:
-            keep &= np.array([(x is not None and x <= int(max_day)) for x in day_vals_num])
-        if not np.any(keep):
-            raise ValueError(f"Day filtering removed all columns for: {os.path.basename(nc_path)}")
-
-        day_vals = [dv for dv, k in zip(day_vals, keep) if k]
-        day_vals_num = [dv for dv, k in zip(day_vals_num, keep) if k]
+        day_positions, day_vals, day_vals_num = _select_forecast_days(
+            dim_vals[dim_names[day_idx]], spec, nc_path
+        )
 
         # Read and permute array so day is last
         raw = v[:]
@@ -908,7 +923,7 @@ def nc_read_forecast_wide(nc_path, var_name, dim_rename_map, spec,
         other_idx = [i for i in range(len(dim_names)) if i != day_idx]
         perm = other_idx + [day_idx]
         arr = np.transpose(arr, perm)
-        arr = arr[..., np.where(keep)[0]]
+        arr = arr[..., day_positions]
 
         # Build grid of other dims
         other_dim_names = [dim_names[i] for i in other_idx]
@@ -1125,6 +1140,229 @@ def nc_read_groundtruth_matrix(nc_path, var_name, dim_rename_map, spec,
         ds.close()
 
 
+def process_rainfall_forecast_tensor(nc_path, var_name, dim_rename_map, spec,
+                                     weights_df, year, ref_onset_dt=None,
+                                     thr_dt=None):
+    """Process a standard gridded forecast without materialising a long table.
+
+    Returns ``None`` when the forecast does not have the supported gridded
+    dimensions, leaving the existing DataFrame path available as a fallback.
+    """
+    import netCDF4 as nc4
+
+    ds = nc4.Dataset(nc_path)
+    try:
+        if var_name not in ds.variables:
+            return None
+
+        variable = ds.variables[var_name]
+        dim_names = list(variable.dimensions)
+        rename = {
+            str(old).lower(): str(new).lower()
+            for old, new in (dim_rename_map or {}).items()
+        }
+        canonical_dims = [
+            rename.get(dim_name.lower(), dim_name.lower())
+            for dim_name in dim_names
+        ]
+        required_dims = {"time", "day", "lat", "lon"}
+        allowed_dims = required_dims | {"number"}
+        if (
+            not required_dims.issubset(canonical_dims)
+            or set(canonical_dims) - allowed_dims
+            or len(set(canonical_dims)) != len(canonical_dims)
+        ):
+            return None
+
+        original_dim = dict(zip(canonical_dims, dim_names))
+        for name in ("time", "day", "lat", "lon"):
+            if original_dim[name] not in ds.variables:
+                return None
+
+        def coordinate_values(name):
+            return np.asarray(ds[original_dim[name]][:]).reshape(-1)
+
+        day_positions, _, day_ints = _select_forecast_days(
+            coordinate_values("day"), spec, nc_path
+        )
+        if any(day is None for day in day_ints):
+            return None
+        day_ints = np.asarray(day_ints, dtype=int)
+
+        time_variable = ds[original_dim["time"]]
+        time_values = np.asarray(time_variable[:]).reshape(-1)
+        if np.issubdtype(time_values.dtype, np.number):
+            issue_dates = nc_time_to_dates(
+                time_values, getattr(time_variable, "units", None)
+            )
+        else:
+            issue_dates = pd.DatetimeIndex(pd.to_datetime(time_values))
+
+        has_number = "number" in canonical_dims
+        if has_number:
+            number_dim = original_dim["number"]
+            number_values = (
+                np.asarray(ds[number_dim][:]).reshape(-1)
+                if number_dim in ds.variables
+                else np.arange(len(ds.dimensions[number_dim]))
+            )
+            try:
+                number_values = number_values.astype(int)
+            except (TypeError, ValueError):
+                return None
+            max_number = (spec.get("filter") or {}).get("max_number")
+            number_positions = np.arange(len(number_values))
+            if max_number is not None:
+                number_positions = number_positions[
+                    number_values <= int(max_number)
+                ]
+                if not len(number_positions):
+                    raise ValueError(
+                        f"After filtering number <= {max_number}, no rows remain."
+                    )
+        else:
+            number_positions = np.array([0], dtype=int)
+        member_count = len(number_positions)
+
+        lat_values = coordinate_values("lat")
+        lon_values = coordinate_values("lon")
+        source_registry = pd.DataFrame(
+            product(lat_values, lon_values), columns=["lat", "lon"]
+        )
+        source_registry = _prepare_transform_source_ids(
+            source_registry,
+            weights_df,
+            spec,
+            "forecast tensor transform",
+        )
+        source_registry["_source_position"] = np.arange(len(source_registry))
+        transform = _get_sparse_transform(weights_df)
+        source_positions = (
+            source_registry.set_index("id")
+            .loc[list(transform.source_ids), "_source_position"]
+            .to_numpy(int)
+        )
+
+        units = pd.DataFrame({
+            "id": list(transform.target_ids),
+            "year": int(year),
+            "_target_position": np.arange(len(transform.target_ids)),
+        })
+        units = filter_by_dissemination_cells(units, spec).reset_index(drop=True)
+        target_positions = units.pop("_target_position").to_numpy(int)
+        units = attach_thresholds_id(units, thr_dt, spec=spec)
+        units = attach_ref_onset(units, ref_onset_dt)
+        target_thresholds = pd.to_numeric(
+            units["onset_thresh"], errors="coerce"
+        ).to_numpy(float)
+        target_ref_dates = units["ref_onset_date"].to_numpy()
+        fixed_cutoff_md = spec.get("options", {}).get(
+            "fixed_cutoff_month_day", "06-02"
+        )
+        onset_params = read_onset_params(spec)
+        n_targets = len(units)
+        issue_frames = []
+
+        for issue_position, issue_timestamp in enumerate(issue_dates):
+            selectors = [slice(None)] * len(dim_names)
+            selectors[canonical_dims.index("time")] = issue_position
+            selectors[canonical_dims.index("day")] = day_positions
+            if has_number:
+                selectors[canonical_dims.index("number")] = number_positions
+            raw = variable[tuple(selectors)]
+            rainfall = (
+                np.ma.filled(raw, np.nan)
+                if np.ma.isMaskedArray(raw)
+                else np.asarray(raw)
+            )
+
+            remaining_dims = [
+                name for name in canonical_dims if name != "time"
+            ]
+            desired_dims = ["lat", "lon"]
+            if has_number:
+                desired_dims.append("number")
+            desired_dims.append("day")
+            rainfall = np.transpose(
+                rainfall,
+                [remaining_dims.index(name) for name in desired_dims],
+            )
+            if not has_number:
+                rainfall = rainfall[:, :, np.newaxis, :]
+            source_values = rainfall.reshape(
+                len(lat_values) * len(lon_values),
+                member_count * len(day_ints),
+            )[source_positions]
+            target_rain = sparse_observed_weighted_mean(
+                transform, source_values, column_chunk_size=512
+            )[target_positions].reshape(n_targets, member_count, len(day_ints))
+
+            fixed_starts, ref_starts = _forecast_start_days(
+                np.full(n_targets, issue_timestamp.to_datetime64()),
+                np.full(n_targets, int(year)),
+                target_ref_dates,
+                day_ints,
+                fixed_cutoff_md,
+            )
+
+            series = target_rain.reshape(-1, len(day_ints))
+            onsets = find_onsets_batch(
+                series,
+                np.repeat(target_thresholds, member_count),
+                np.vstack((
+                    np.ones(len(series), dtype=int),
+                    np.repeat(fixed_starts, member_count),
+                    np.repeat(ref_starts, member_count),
+                )),
+                onset_params,
+                reject_if_short_followup=False,
+            ).reshape(3, n_targets, member_count)
+
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", category=RuntimeWarning)
+                rain_mean = np.nanmean(target_rain, axis=1)
+                rain_sd = (
+                    np.nanstd(target_rain, axis=1, ddof=1)
+                    if member_count > 1
+                    else np.full((n_targets, len(day_ints)), np.nan)
+                )
+            frac_raining = np.mean(target_rain > 1.0, axis=1)
+            onset_positions = np.arange(1, len(day_ints) + 1)
+            probabilities = [
+                np.mean(
+                    onsets[variant, :, :, np.newaxis]
+                    == onset_positions[np.newaxis, np.newaxis, :],
+                    axis=1,
+                )
+                for variant in range(3)
+            ]
+
+            data = {
+                "id": units["id"].to_numpy(),
+                "time": issue_timestamp.date(),
+                "year": int(year),
+                "onset_thresh": target_thresholds,
+                "ref_onset_date": units["ref_onset_date"].to_numpy(),
+            }
+            for prefix, values in (
+                ("forecast_rain_day_", rain_mean),
+                ("forecast_rain_sd_day_", rain_sd),
+                ("frac_raining_day_", frac_raining),
+                ("predicted_prob_day_", probabilities[0]),
+                ("predicted_prob_fixed_cutoff_day_", probabilities[1]),
+                ("predicted_prob_ref_day_", probabilities[2]),
+            ):
+                for position, day in enumerate(day_ints):
+                    data[f"{prefix}{day}"] = values[:, position]
+            issue_frames.append(pd.DataFrame(data))
+
+        return pd.concat(issue_frames, ignore_index=True).sort_values(
+            ["id", "time"], kind="stable"
+        ).reset_index(drop=True)
+    finally:
+        ds.close()
+
+
 # ---------------------------------------------------------------------------
 # Stage-2 onset helpers
 # ---------------------------------------------------------------------------
@@ -1142,6 +1380,38 @@ def order_day_cols(df, key_cols):
             pass
     order = np.argsort(day_ints)
     return [valid_cols[i] for i in order], [day_ints[i] for i in order]
+
+
+def _forecast_start_days(issue_dates, years, ref_onset_dates, day_ints,
+                         fixed_cutoff_month_day):
+    """Return fixed-cutoff and reference-date start positions."""
+    issue_dates = pd.to_datetime(issue_dates).values
+    years = np.asarray(years, dtype=int)
+    day_ints = np.asarray(day_ints)
+
+    cutoff_dates = np.array([
+        np.datetime64(f"{year}-{fixed_cutoff_month_day}") for year in years
+    ])
+    cutoff_offsets = (
+        cutoff_dates - issue_dates
+    ).astype("timedelta64[D]").astype(int)
+    fixed_starts = (
+        np.searchsorted(day_ints, cutoff_offsets - 1, side="right") + 1
+    )
+    fixed_starts[fixed_starts > len(day_ints)] = 9999
+
+    ref_dates = pd.to_datetime(ref_onset_dates).values
+    ref_starts = np.ones(len(issue_dates), dtype=int)
+    has_ref = ~pd.isnull(ref_dates)
+    if np.any(has_ref):
+        ref_offsets = (
+            ref_dates[has_ref] - issue_dates[has_ref]
+        ).astype("timedelta64[D]").astype(int)
+        ref_starts[has_ref] = (
+            np.searchsorted(day_ints, ref_offsets - 1, side="right") + 1
+        )
+        ref_starts[ref_starts > len(day_ints)] = 9999
+    return fixed_starts.astype(int), ref_starts
 
 
 def calc_onsets_rowwise(df, day_cols, day_ints, win, params=None,
@@ -1164,29 +1434,18 @@ def calc_onsets_rowwise(df, day_cols, day_ints, win, params=None,
     th = df["onset_thresh"].values.astype(float)
     yr = df["year"].values.astype(int)
 
-    cutoff_dates = np.array([np.datetime64(f"{y}-{fixed_cutoff_month_day}") for y in yr])
-    need_clim_offset = (cutoff_dates - t0).astype("timedelta64[D]").astype(int)
-    day_ints_arr = np.array(day_ints)
-    need_clim = np.searchsorted(day_ints_arr, need_clim_offset - 1, side='right') + 1
-    need_clim = np.where(need_clim > len(day_ints_arr), 9999, need_clim).astype(int)
-
     ref_onset_dates = (
         pd.to_datetime(df["ref_onset_date"]).values
         if "ref_onset_date" in df.columns
         else np.full(len(df), np.datetime64("NaT"), dtype="datetime64[ns]")
     )
-    start_ref = np.ones(len(df), dtype=int)
-    has_ref = ~pd.isnull(ref_onset_dates)
-    ref_offsets = np.zeros(len(df), dtype=int)
-    ref_offsets[has_ref] = (
-        ref_onset_dates[has_ref] - t0[has_ref]
-    ).astype("timedelta64[D]").astype(int)
-    start_ref[has_ref] = (
-        np.searchsorted(
-            day_ints_arr, ref_offsets[has_ref] - 1, side="right"
-        ) + 1
+    need_clim, start_ref = _forecast_start_days(
+        t0,
+        yr,
+        ref_onset_dates,
+        day_ints,
+        fixed_cutoff_month_day,
     )
-    start_ref[start_ref > len(day_ints_arr)] = 9999
 
     onset = np.full((3, len(df)), np.nan)
     valid_threshold = ~np.isnan(th)
@@ -1560,6 +1819,20 @@ def _process_pipeline_file(task, context=None):
     print(f"Processing year {yr}: {nc_path}")
 
     if spec["type"] == "rainfall_forecast":
+        if weights_df is not None:
+            tensor_wide = process_rainfall_forecast_tensor(
+                nc_path,
+                var_name,
+                dim_rename_map,
+                spec,
+                weights_df,
+                yr,
+                ref_onset_dt=ref_onset_dt,
+                thr_dt=thr_dt,
+            )
+            if tensor_wide is not None:
+                return yr, tensor_wide, None
+
         wide_prefix = spec["input"].get("wide_prefix") or var_name.lower()
         day_dim = spec["input"].get("wide_day_dim", "day")
         dt = nc_read_forecast_wide(
