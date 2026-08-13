@@ -982,6 +982,10 @@ def nc_read_groundtruth_long(nc_path, var_name, dim_rename_map, add_year=True,
     """
     Read a ground-truth NetCDF (adm3_name-indexed) into a long (tidy) DataFrame.
 
+    Under ``drop``, exclude an entire non-time series containing missing
+    rainfall rather than deleting individual dates and compressing the
+    calendar used by positional onset windows.
+
     Returns DataFrame or None if variable not found.
     """
     import netCDF4 as nc4
@@ -1029,11 +1033,7 @@ def nc_read_groundtruth_long(nc_path, var_name, dim_rename_map, add_year=True,
         vcol = var_name.lower()
         grid[vcol] = arr.flatten()
         missing_rain_policy = str(missing_rain_policy).lower()
-        if missing_rain_policy == "drop":
-            grid = grid.dropna(subset=[vcol]).reset_index(drop=True)
-        elif missing_rain_policy == "zero":
-            grid[vcol] = grid[vcol].fillna(0.0)
-        elif missing_rain_policy != "keep":
+        if missing_rain_policy not in ("keep", "drop", "zero"):
             raise ValueError(
                 "missing_rain_policy must be 'keep', 'drop', or 'zero', "
                 f"got '{missing_rain_policy}'"
@@ -1044,9 +1044,47 @@ def nc_read_groundtruth_long(nc_path, var_name, dim_rename_map, add_year=True,
             if pd.api.types.is_float_dtype(grid["time"]) or pd.api.types.is_integer_dtype(grid["time"]):
                 dates = nc_time_to_dates(grid["time"].values, tinfo["units"])
                 grid["time"] = dates.date
+                calendar = pd.Series(pd.to_datetime(nc_time_to_dates(
+                    tinfo["values"], tinfo["units"]
+                )))
             else:
                 grid["time"] = pd.to_datetime(grid["time"]).dt.date
+                calendar = pd.Series(pd.to_datetime(tinfo["values"]))
             grid["year"] = pd.to_datetime(grid["time"]).dt.year
+
+            calendar = calendar.sort_values().reset_index(drop=True)
+            if calendar.isna().any() or calendar.duplicated().any():
+                raise ValueError(
+                    f"{os.path.basename(nc_path)}: ground-truth time coordinate "
+                    "must contain one valid date per day."
+                )
+            day_steps = calendar.groupby(calendar.dt.year).diff().dt.days
+            gaps = day_steps.notna() & day_steps.ne(1)
+            if gaps.any():
+                gap_pos = int(np.flatnonzero(gaps.to_numpy())[0])
+                raise ValueError(
+                    f"{os.path.basename(nc_path)}: ground-truth time coordinate "
+                    "is not daily-contiguous; first gap is "
+                    f"{calendar.iloc[gap_pos - 1].date()} to "
+                    f"{calendar.iloc[gap_pos].date()}."
+                )
+
+        if missing_rain_policy == "drop":
+            missing = grid[vcol].isna()
+            if missing.any():
+                series_cols = [
+                    column for column in grid.columns
+                    if column not in ("time", vcol)
+                ]
+                if series_cols:
+                    incomplete = missing.groupby(
+                        [grid[column] for column in series_cols], dropna=False
+                    ).transform("any")
+                else:
+                    incomplete = pd.Series(missing.any(), index=grid.index)
+                grid = grid.loc[~incomplete].reset_index(drop=True)
+        elif missing_rain_policy == "zero":
+            grid[vcol] = grid[vcol].fillna(0.0)
 
         return grid
     finally:
