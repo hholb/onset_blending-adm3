@@ -31,9 +31,10 @@ forecast_models:
       - {agg: min, window: dry_spell}
       - {agg: max, window: trigger}
 
-# For short-horizon systems, `truncate` marks unconstructible rain features and
-# CV resolves `_qx` formula terms accordingly. Daily onset probabilities remain
-# required whenever raw/calibrated forecast evaluation or MME requests them.
+# `truncate` requires every source day through rain_day_max but discards later
+# days; a genuinely shorter fixed horizon can then mark later rain features as
+# structurally unavailable. Daily onset probabilities remain required whenever
+# raw/calibrated forecast evaluation or MME requests them.
 # To use a genuinely rainfall-only short-horizon model, keep its constructible
 # rain predictors here and in the formula, but omit that model from both
 # `extras.forecasts` and enabled `mme.blend_models` in the CV spec.

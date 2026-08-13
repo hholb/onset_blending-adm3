@@ -54,10 +54,13 @@ Notes
     --forecast.
 
 --gt_path
-    Path to the historical ground truth wide pkl. Simultaneously overrides:
+    Optional path to the historical ground truth wide pkl. Simultaneously
+    overrides:
       - input.gt_path            in the clim spec
       - ground_truth_wide_rds    in the combine spec
-    Both fields must point to the same file, so a single arg controls both.
+    During a full run, omitting this argument automatically hands the Step 1
+    artifact to both stages. A resumed run reuses that work-dir artifact when
+    present; otherwise the combine spec retains its historical input path.
 
 --work_dir
     Working directory for all intermediate files (processed nc outputs,
@@ -455,6 +458,20 @@ def resolve_connector_artifact(work_dir, blend_input=None):
     return blend_input or os.path.join(work_dir, DEFAULT_CONNECTOR_ARTIFACT)
 
 
+def resolve_ground_truth_handoff(
+    work_dir, clim_spec_id, combine_spec_path, gt_path=None, skip_to=1
+):
+    """Resolve the ground-truth artifact without breaking legacy resumes."""
+    generated_path = os.path.join(work_dir, f"{clim_spec_id}_wide.pkl")
+    if gt_path:
+        return gt_path, "explicit --gt_path"
+    if skip_to <= 1:
+        return generated_path, "Step 1 output"
+    if os.path.exists(generated_path):
+        return generated_path, "existing work-dir artifact"
+    return combine_spec_path, "combine-spec resume fallback"
+
+
 def configure_forecast_source(forecasts, model_name, template_name, source_path):
     """
     Point a combine-spec forecast entry at its processed artifact.
@@ -629,6 +646,9 @@ def main():
 
     # ── Derived paths ─────────────────────────────────────────────────────
     work_dir = args.work_dir
+    generated_gt_path = os.path.join(
+        work_dir, f"{args.clim_spec}_wide.pkl"
+    )
 
     os.makedirs(work_dir,      exist_ok=True)
     os.makedirs(args.results_dir, exist_ok=True)
@@ -680,8 +700,7 @@ def main():
         ("output.basename",            args.clim_spec),
         (
             "input.gt_path",
-            args.gt_path
-            or os.path.join(work_dir, f"{args.clim_spec}_wide.pkl"),
+            args.gt_path or generated_gt_path,
         ),
     ]
     clim_spec = write_patched_spec(args.clim_spec, "raw_data", clim_patches)
@@ -704,6 +723,14 @@ def main():
     cs["output"]["basename"]                          = args.combine_spec
     cs["input"]["climatologies"]["clim"]["rds"]       = clim_rds
     cs["input"]["climatologies"]["clim_unc"]["rds"]   = clim_unc_rds
+    ground_truth_path, ground_truth_source = resolve_ground_truth_handoff(
+        work_dir,
+        args.clim_spec,
+        cs["input"]["ground_truth_wide_rds"],
+        gt_path=args.gt_path,
+        skip_to=args.skip_to,
+    )
+    cs["input"]["ground_truth_wide_rds"] = ground_truth_path
     for job in forecast_jobs:
         configure_forecast_source(
             cs.get("forecasts"),
@@ -711,9 +738,6 @@ def main():
             job.template_name,
             job.artifact_path,
         )
-
-    if args.gt_path:
-        cs["input"]["ground_truth_wide_rds"] = args.gt_path
 
     combine_spec = write_temp_spec(args.combine_spec, "combine", cs)
 
@@ -737,7 +761,7 @@ def main():
     blend_spec = write_temp_spec(args.blend_spec, "2025_blend", cs_blend)
 
     # ── Expected output paths ─────────────────────────────────────────────
-    ref_rain_pkl     = os.path.join(work_dir, f"{args.clim_spec}_wide.pkl")
+    ref_rain_pkl = generated_gt_path
     connect_pkl = connect_output_rds
 
     # ── Build steps list ──────────────────────────────────────────────────
@@ -831,8 +855,10 @@ def main():
             log(f"    nc_file override   : {job.nc_file}")
         elif job.nc_folder:
             log(f"    nc_folder override : {job.nc_folder}")
-    if args.gt_path:
-        log(f"gt_path override (clim+combine): {args.gt_path}")
+    log(
+        f"Ground truth → combine artifact ({ground_truth_source}): "
+        f"{ground_truth_path}"
+    )
     if args.skip_to > 1:
         log(f"Skipping steps 1–{args.skip_to - 1} (--skip_to {args.skip_to})")
     if args.stop_at is not None:

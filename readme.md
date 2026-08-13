@@ -640,8 +640,12 @@ python python/run_training.py \
 ```
 
 `run_training.py` rewrites only runtime copies of the selected YAML files and
-passes the exact connector output to the evaluator. Use `--dry_run` first to
-inspect the resolved commands and handoffs.
+passes both the Step-1 ground-truth output to combine and the exact connector
+output to the evaluator. An explicit `--gt_path` still overrides the generated
+ground-truth path. When resuming with `--skip_to`, the wrapper reuses an existing
+work-directory ground-truth artifact and otherwise preserves the path embedded
+in the combine spec. Use `--dry_run` first to inspect the resolved commands and
+handoffs.
 
 ### Final fit and operational application
 

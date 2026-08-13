@@ -49,8 +49,8 @@ options:
   min_day: 1
   max_day: 40
   rain_day_max: 40
-  # exact requires every requested day; truncate permits only features that can
-  # be constructed from the available fixed horizon and records what is absent.
+  # truncate requires every day through rain_day_max and discards later days;
+  # exact additionally rejects any later days in the source.
   rain_horizon_policy: truncate
 
   # Alternative to writing regridded NetCDF files in the separate regrid
