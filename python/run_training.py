@@ -320,11 +320,19 @@ def reconcile_forecast_horizon(
 
 def configure_blend_spec_models(spec, jobs):
     """Apply legacy two-slot aliases inside the selected blend spec."""
-    alias_map = {
+    template_map = {
         job.template_name: job.model
         for job in jobs
-        if job.template_name and job.template_name != job.model
+        if job.template_name
     }
+    alias_pattern = None
+    if template_map:
+        alternatives = "|".join(
+            re.escape(name) for name in sorted(template_map, key=len, reverse=True)
+        )
+        alias_pattern = re.compile(
+            rf"(?<![A-Za-z0-9])(?:{alternatives})(?=_|[^A-Za-z0-9]|$)"
+        )
 
     for entries in (
         spec.get("extras", {}).get("forecasts", []),
@@ -332,19 +340,17 @@ def configure_blend_spec_models(spec, jobs):
     ):
         for entry in entries:
             name = entry.get("name")
-            if name in alias_map:
-                entry["name"] = alias_map[name]
+            if name in template_map:
+                entry["name"] = template_map[name]
 
     formulas = spec.get("models", {}).get("formulas", {}).values()
     for formula in formulas:
         if not formula.get("enabled"):
             continue
-        text = formula["text"]
-        for template_name, model_name in sorted(
-            alias_map.items(), key=lambda item: len(item[0]), reverse=True
-        ):
-            text = text.replace(f"_{template_name}_", f"_{model_name}_")
-        formula["text"] = text
+        if alias_pattern is not None:
+            formula["text"] = alias_pattern.sub(
+                lambda match: template_map[match.group(0)], formula["text"]
+            )
 
 
 def required_probability_prefixes_from_blend_spec(blend_spec, connect_spec):

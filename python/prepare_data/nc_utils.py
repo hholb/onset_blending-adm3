@@ -1606,15 +1606,11 @@ def process_rainfall_forecast_id(df, spec, ref_onset_dt=None, thr_dt=None):
     df["onset_fixed_cutoff"] = on["onset_fixed_cutoff"]
     df["onset_ref"] = on["onset_ref"]
 
-    # Preserve the historical rainfall-column labels based on day_ints. In the
-    # normal pipeline the NetCDF reader has already applied min/max-day
-    # filtering, so these align with keep_ints.
-    rain_day_ints = day_ints[:len(keep_days)]
     wide = _aggregate_forecast_members(
         df,
         key_cols=key_base,
         rain_day_cols=keep_days,
-        rain_day_ints=rain_day_ints,
+        rain_day_ints=keep_ints,
         probability_day_ints=keep_ints,
     )
     return {"wide": wide}
