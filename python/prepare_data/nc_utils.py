@@ -394,6 +394,15 @@ def attach_thresholds_id(df, thr_df, spec=None, convention=None):
     if isinstance(thr_idx, (int, float)):
         df["onset_thresh"] = float(thr_idx)
         return df
+    rainfall_ids = pd.Index(df["id"].drop_duplicates())
+    missing_ids = rainfall_ids[~rainfall_ids.isin(thr_idx.index)]
+    if len(missing_ids):
+        sample = ", ".join(map(str, missing_ids[:10]))
+        raise ValueError(
+            f"Threshold table is missing {len(missing_ids)} of "
+            f"{len(rainfall_ids)} rainfall IDs after domain filtering. "
+            f"Examples: {sample}"
+        )
     df = df.merge(thr_idx.reset_index(), on="id", how="left")
     return df
 

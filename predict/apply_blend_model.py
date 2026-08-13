@@ -56,7 +56,8 @@ Input files
    The full feature dataset — patsy builds the design matrix from this.
 
 4. Dissemination cells (historical metrics only):
-   Monsoon_Data/dissemination_cells.csv
+   Configured by cell.dissemination in the blend spec; --dissem_file can
+   override that path.
 
 Output files
 ------------
@@ -86,6 +87,11 @@ from python.blending_process.blend_evaluation_utils import (
 )
 from python.pipelines._shared.read_spec import load_spec
 from python.pipelines._shared.misc import coalesce
+from python.prepare_data.nc_utils import ensure_id_col
+from python.prepare_data.spatial_id_utils import (
+    resolve_grid_id_convention,
+    validate_id_coordinate_consistency,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -112,6 +118,44 @@ def load_coefs(coef_path):
             "features": list(obj["feature"].unique()),
         }
     return obj
+
+
+def load_dissemination_cells(spec, path_override, authoritative_ids):
+    """Load dissemination cells under the shared spatial-ID contract."""
+    cell_cfg = spec.get("cell") or {}
+    path = (
+        path_override
+        or cell_cfg.get("dissemination")
+        or "Monsoon_Data/dissemination_cells.csv"
+    )
+    cells = pd.read_csv(path, dtype=str)
+    configured_id_col = cell_cfg.get("id_col") or cell_cfg.get(
+        "dissemination_id_col"
+    )
+    if configured_id_col:
+        if configured_id_col not in cells.columns:
+            raise ValueError(
+                f"cell.id_col '{configured_id_col}' not found. "
+                f"Found: {cells.columns.tolist()}"
+            )
+        cells = cells.rename(columns={configured_id_col: "id"})
+    convention = None
+    if "id" not in cells.columns and "adm3_name" not in cells.columns:
+        convention = resolve_grid_id_convention(
+            spec=spec,
+            authoritative_ids=authoritative_ids,
+            context="prediction/dissemination ID handoff",
+        )
+    cells = ensure_id_col(
+        cells,
+        spec=spec,
+        convention=convention,
+        context="prediction dissemination IDs",
+    )
+    validate_id_coordinate_consistency(
+        cells, context="prediction dissemination IDs"
+    )
+    return cells.drop_duplicates("id")
 
 
 def resolve_application_formula(coef_bundle, spec, cutoff_mode, model_name,
@@ -300,8 +344,9 @@ def main():
     parser.add_argument("--out_dir",  default=None,
                         help="Output directory. "
                              "Defaults to Monsoon_Data/results/2025_model_evaluation/per_year/")
-    parser.add_argument("--dissem_file", default="Monsoon_Data/dissemination_cells.csv",
-                        help="Path to dissemination_cells.csv")
+    parser.add_argument("--dissem_file", default=None,
+                        help="Override the dissemination CSV configured by "
+                             "cell.dissemination")
     parser.add_argument("--pipeline_input_dir", default="Monsoon_Data/Processed_Data/2025_pipeline_input",
                         help="Directory containing the wide processed data")
     args = parser.parse_args()
@@ -420,9 +465,13 @@ def main():
 
     # ── Compute metrics (historical only) ──────────────────────────────
     if not is_future_year and cv_preds["outcome"].notna().any():              # ← NEW
-        dissemination_cells = pd.read_csv(args.dissem_file)
+        cv_preds = ensure_id_col(
+            cv_preds, spec=spec, context="prediction IDs"
+        )
+        dissemination_cells = load_dissemination_cells(
+            spec, args.dissem_file, cv_preds["id"]
+        )
         valid_ids = set(cv_preds["id"].dropna().unique())
-        dissemination_cells["id"] = dissemination_cells["adm3_name"].astype(str)
         overlap = valid_ids & set(dissemination_cells["id"])
         print(f"Matching dissemination cell ids: {len(overlap)}")
 
