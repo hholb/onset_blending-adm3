@@ -458,6 +458,44 @@ def resolve_connector_artifact(work_dir, blend_input=None):
     return blend_input or os.path.join(work_dir, DEFAULT_CONNECTOR_ARTIFACT)
 
 
+def resolve_climatology_artifacts(clim_spec, work_dir):
+    """Return the builder output path for every configured climatology run."""
+    default_stem = (
+        clim_spec.get("paths", {}).get("climatology_out_stem")
+        or "climatology_issue"
+    )
+    return {
+        name: os.path.join(
+            work_dir,
+            f"{run.get('out_stem') or f'{default_stem}_{name}'}.pkl",
+        )
+        for name, run in clim_spec["climatologies"].items()
+    }
+
+
+def configure_climatology_sources(clim_spec, combine_spec, work_dir):
+    """Wire generated climatologies into same-named combine inputs."""
+    artifacts = resolve_climatology_artifacts(clim_spec, work_dir)
+    combine_climatologies = combine_spec["input"]["climatologies"]
+
+    for required_name in ("clim", "clim_unc"):
+        if (
+            required_name not in artifacts
+            or required_name not in combine_climatologies
+        ):
+            raise KeyError(
+                f"Training requires climatology key '{required_name}' in both "
+                "the raw and combine specs."
+            )
+
+    wired = {}
+    for name, entry in combine_climatologies.items():
+        if name in artifacts:
+            entry["rds"] = artifacts[name]
+            wired[name] = artifacts[name]
+    return artifacts, wired
+
+
 def resolve_ground_truth_handoff(
     work_dir, clim_spec_id, combine_spec_path, gt_path=None, skip_to=1
 ):
@@ -708,21 +746,14 @@ def main():
     # ── Patch combine spec ────────────────────────────────────────────────
     # Read clim spec for climatology output filenames
     clim_spec_raw = load_yaml_spec(args.clim_spec, "raw_data")
-    clim_rds = os.path.join(
-        work_dir,
-        clim_spec_raw["climatologies"]["clim"]["out_stem"] + ".pkl",
-    )
-    clim_unc_rds = os.path.join(
-        work_dir,
-        clim_spec_raw["climatologies"]["clim_unc"]["out_stem"] + ".pkl",
-    )
-
     cs = load_yaml_spec(args.combine_spec, "combine")
 
     cs["output"]["out_dir"]                           = work_dir
     cs["output"]["basename"]                          = args.combine_spec
-    cs["input"]["climatologies"]["clim"]["rds"]       = clim_rds
-    cs["input"]["climatologies"]["clim_unc"]["rds"]   = clim_unc_rds
+    climatology_artifacts, wired_climatologies = configure_climatology_sources(
+        clim_spec_raw, cs, work_dir
+    )
+    clim_rds = climatology_artifacts["clim"]
     ground_truth_path, ground_truth_source = resolve_ground_truth_handoff(
         work_dir,
         args.clim_spec,
@@ -858,6 +889,12 @@ def main():
     log(
         f"Ground truth → combine artifact ({ground_truth_source}): "
         f"{ground_truth_path}"
+    )
+    log(
+        "Climatology artifacts → combine: "
+        + ", ".join(
+            f"{name}={path}" for name, path in wired_climatologies.items()
+        )
     )
     if args.skip_to > 1:
         log(f"Skipping steps 1–{args.skip_to - 1} (--skip_to {args.skip_to})")

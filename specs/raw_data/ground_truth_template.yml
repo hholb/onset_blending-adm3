@@ -91,8 +91,8 @@ paths:
 climatology_runtime:
   workers: 4
 
-# Keep the names `clim` and `clim_unc`: the one-click wrappers use these two
-# keys to wire the paired outputs into the combine stage.
+# Keep `clim` and `clim_unc` as the required base roles. Additional runs such
+# as `clim_2000_2024` are also wired when the combine spec uses the same key.
 climatologies:
   clim:
     out_stem: ground_truth_template_clim_issue

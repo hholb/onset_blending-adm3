@@ -6,6 +6,8 @@ type: combine_forecasts
 input:
   ground_truth_wide_rds: Monsoon_Data/Processed_Data/example_country/ground_truth_template_wide.pkl
   climatologies:
+    # Keys match raw-data climatology runs. run_training.py rewrites every
+    # matching artifact path; connect.window_tags chooses optional variants.
     clim:
       rds: Monsoon_Data/Processed_Data/example_country/ground_truth_template_clim_issue.pkl
       out_prefix: clim_p_onset

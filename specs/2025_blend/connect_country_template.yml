@@ -16,6 +16,7 @@ climatology:
   base_prefix: clim
   unconditional_prefix: clim_unc
   output_prefix: prob_clim
+  # Example: [2000_2024] consumes the combine prefix clim_2000_2024.
   window_tags: []
 
 # Feature-only transform; onset detection and climatology still use raw rain.
