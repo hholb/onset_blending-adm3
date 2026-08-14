@@ -48,9 +48,9 @@ from python.blending_process.blend_evaluation_utils import (
     make_calibrated_preds_from_wide,
     fit_platt_weights_export,
     platt_cv_multibin,
-    input_rds_from_cutoff,
     make_cutoff_tag,
     make_year_tag,
+    resolve_blend_input_path,
     restrict_to_allowed,
     forecast_label,
     clean_probs5,
@@ -105,29 +105,12 @@ def main():
     output_tag = f"{cutoff_tag}{year_tag}"
 
     # Load data
-    input_file = input_rds_from_cutoff(cutoff_mode)
-    input_override = spec.get("run", {}).get("input_rds_override")
-    #input_path = os.path.join("Monsoon_Data/Processed_Data/2025_pipeline_input", input_file)
-    # pipeline_input_dir = spec["run"].get("pipeline_input_dir", "")   # default: no subfolder
-    # input_path = os.path.join(
-    #     "Monsoon_Data/Processed_Data/pipeline_input",
-    #     pipeline_input_dir,
-    #     input_file,
-    # )
-
-    if args.input_path:
-        input_path = args.input_path
-    elif input_override:
-        input_path = input_override
-    elif args.work_dir:
-        input_path = os.path.join(args.work_dir, input_file)
-    else:
-        pipeline_input_dir = spec["run"].get("pipeline_input_dir", "")
-        input_path = os.path.join(
-            "Monsoon_Data/Processed_Data/pipeline_input",
-            pipeline_input_dir,
-            input_file,
-        )
+    input_path = resolve_blend_input_path(
+        cutoff_mode,
+        spec.get("run"),
+        input_path=args.input_path,
+        work_dir=args.work_dir,
+    )
 
     with open(input_path, "rb") as f:
         wide_df = pickle.load(f)

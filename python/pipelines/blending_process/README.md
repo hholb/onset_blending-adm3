@@ -109,7 +109,7 @@ Located in `specs/2025_blend/*.yml`. Key fields:
 
 ## Outputs
 
-- `Monsoon_Data/Processed_Data/2025_pipeline_input/*.pkl` — weekly-bin data (Stage 0)
+- `Monsoon_Data/Processed_Data/pipeline_input/*.pkl` — weekly-bin data (Stage 0)
 - `Monsoon_Data/results/2025_model_evaluation/` — CV metrics, reliability plots, blend weights
 - `Monsoon_Data/results/2025_model_evaluation/evaluation/` — 2025 out-of-sample metrics
 - `figures/` — Publication-ready figures

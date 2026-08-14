@@ -16,7 +16,7 @@ Usage (run from repo root)
     python 3_fit_final_model.py \\
         --spec_id  cv_models_fixed_cutoff \\
         --model    blended_model \\
-        [--input_path Monsoon_Data/Processed_Data/2025_pipeline_input/cv_data_fixed_cutoff_new_pipeline.pkl] \\
+        [--input_path Monsoon_Data/Processed_Data/pipeline_input/cv_data_fixed_cutoff_new_pipeline.pkl] \\
         [--method  global] \\
         [--tag     final] \\
         [--out_dir Monsoon_Data/results/2025_model_evaluation/]
@@ -32,7 +32,7 @@ Then to apply to a future year:
         --model      blended_model \\
         --year       2026 \\
         --coef_tag   final \\
-        --input_path Monsoon_Data/Processed_Data/2025_pipeline_input/wide_2026.pkl
+        --input_path Monsoon_Data/Processed_Data/pipeline_input/wide_2026.pkl
 """
 
 import os
@@ -53,11 +53,12 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
 
 from python.blending_process.blend_evaluation_utils import (
+    DEFAULT_PIPELINE_INPUT_ROOT,
     apply_formula_sample_support,
     build_formulas_from_spec,
     expand_formula_str,
-    input_rds_from_cutoff,
     make_cutoff_tag,
+    resolve_blend_input_path,
     resolve_climatology_weeks,
     restrict_to_allowed,
     _make_multinom_clf,
@@ -203,8 +204,9 @@ def main():
     parser.add_argument("--dissem_file", default=None,
                         help="Override the dissemination CSV configured by "
                              "cell.dissemination")
-    parser.add_argument("--pipeline_input_dir", default="Monsoon_Data/Processed_Data/2025_pipeline_input",
-                        help="Directory containing the wide processed data")
+    parser.add_argument("--pipeline_input_dir", default=DEFAULT_PIPELINE_INPUT_ROOT,
+                        help="Root directory containing the spec-configured "
+                             "pipeline input subdirectory")
     args = parser.parse_args()
 
     # ── Load spec ──────────────────────────────────────────────────────
@@ -221,22 +223,16 @@ def main():
     fit_years = [
         year for year in training_years if year not in true_holdout_years
     ]
-    pipeline_input_dir = run_cfg.get("pipeline_input_dir", "")
-
     out_dir = args.out_dir or "Monsoon_Data/results/2025_model_evaluation"
     os.makedirs(out_dir, exist_ok=True)
 
     # ── Load input data ────────────────────────────────────────────────
-    input_file = input_rds_from_cutoff(cutoff_mode)
-    input_override = run_cfg.get("input_rds_override")
-    if args.input_path:
-        input_path = args.input_path
-    elif input_override:
-        input_path = input_override
-    else:
-        input_path = os.path.join(
-            args.pipeline_input_dir, pipeline_input_dir, input_file
-        )
+    input_path = resolve_blend_input_path(
+        cutoff_mode,
+        run_cfg,
+        input_path=args.input_path,
+        pipeline_input_root=args.pipeline_input_dir,
+    )
     print(f"\nLoading wide_df from: {input_path}")
     with open(input_path, "rb") as f:
         wide_df = pickle.load(f)

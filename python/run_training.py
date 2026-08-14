@@ -31,7 +31,7 @@ Usage (run from repo root)
         --work_dir        Monsoon_Data/Processed_Data/training \\
         --results_dir     Monsoon_Data/results/dry_spell_aifs_ngcm \\
         [--gt_path            Monsoon_Data/Processed_Data/Models/dry_spell/imd_clim_mok_date_wide.pkl] \\
-        [--blend_input        Monsoon_Data/Processed_Data/training/cv_data_fixed_cutoff_new_pipeline.pkl] \\
+        [--blend_input        /path/to/custom_connector_output.pkl] \\
         [--skip_to STEP] \\
         [--stop_at STEP] \\
         [--dry_run]
@@ -95,7 +95,6 @@ import yaml
 import re
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-DEFAULT_CONNECTOR_ARTIFACT = "cv_data_fixed_cutoff_new_pipeline.pkl"
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
@@ -453,9 +452,16 @@ def validate_blend_spec_models(spec, jobs):
         )
 
 
-def resolve_connector_artifact(work_dir, blend_input=None):
+def resolve_connector_artifact(work_dir, configured_output, blend_input=None):
     """Return the exact connector-output / blend-evaluator-input path."""
-    return blend_input or os.path.join(work_dir, DEFAULT_CONNECTOR_ARTIFACT)
+    if not isinstance(configured_output, str) or not configured_output.strip():
+        raise ValueError("Connect spec must define a non-empty output_rds path.")
+    if blend_input:
+        return blend_input
+    output_basename = os.path.basename(configured_output)
+    if not output_basename:
+        raise ValueError("Connect spec output_rds must name a file.")
+    return os.path.join(work_dir, output_basename)
 
 
 def resolve_climatology_artifacts(clim_spec, work_dir):
@@ -664,7 +670,7 @@ def main():
                              "in the combine spec.")
     parser.add_argument("--blend_input",    default=None,
                         help="Exact connector output / blend-evaluator input pickle path. "
-                             "Defaults to <work_dir>/cv_data_fixed_cutoff_new_pipeline.pkl")
+                             "Defaults to <work_dir>/<basename(connect.output_rds)>.")
 
     # ── Optional ─────────────────────────────────────────────────────────
     parser.add_argument("--cores",          type=int, default=None,
@@ -775,7 +781,20 @@ def main():
     # ── Patch connect spec ────────────────────────────────────────────────
     combine_basename   = f"{args.combine_spec}_combined_wide.pkl"
     connect_input_rds  = os.path.join(work_dir, combine_basename)
-    connect_output_rds = resolve_connector_artifact(work_dir, args.blend_input)
+    connect_output_rds = resolve_connector_artifact(
+        work_dir,
+        cs_connect.get("output_rds"),
+        args.blend_input,
+    )
+    connect_output_source = (
+        "explicit --blend_input"
+        if args.blend_input
+        else "connect spec output_rds basename"
+    )
+    log(
+        "Connector -> evaluator artifact "
+        f"({connect_output_source}): {connect_output_rds}"
+    )
 
     cs_connect["input_rds"]  = connect_input_rds
     cs_connect["output_rds"] = connect_output_rds

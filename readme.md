@@ -65,7 +65,7 @@ onset_blending_for_laude/
 │   │   ├── Models/                       Per-system onset tables (.pkl)
 │   │   ├── Climatology/                  KDE climatology forecasts (.pkl)
 │   │   ├── Combined/                     Merged modeling-ready wide tables (.pkl)
-│   │   └── 2025_pipeline_input/          Weekly-bin data for blending (.pkl)
+│   │   └── pipeline_input/               Weekly-bin data for blending (.pkl)
 │   ├── results/
 │   │   └── 2025_model_evaluation/        Model metrics, blend weights, figures
 │   └── evaluation_2025/                Out-of-sample forecast + ground truth files
@@ -356,7 +356,7 @@ Raw NetCDF (Monsoon_Data/raw_nc/)
            ▼
 ┌──────────────────────────────────────────┐
 │  0_connect (day → week bins)             │  specs/2025_blend/connect_*.yml
-│  → Processed_Data/2025_pipeline_input/   │
+│  → Processed_Data/pipeline_input/        │
 └──────────┬───────────────────────────────┘
            │
            ▼

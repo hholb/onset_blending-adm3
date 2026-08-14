@@ -15,9 +15,9 @@ run:
   true_holdout_years: []
   pipeline_input_dir: example_country
   pipeline_output_dir: example_country
-  # Standalone evaluator/final-fit fallback. The wrappers pass --input_path
-  # explicitly, so this never overrides their exact connector handoff.
-  input_rds_override: Monsoon_Data/Processed_Data/example_country/cv_data_fixed_cutoff_new_pipeline.pkl
+  # Standalone evaluation resolves this subdirectory beneath
+  # Monsoon_Data/Processed_Data/pipeline_input. Wrappers pass the connector
+  # artifact explicitly instead.
 
 cv:
   methods: [global]

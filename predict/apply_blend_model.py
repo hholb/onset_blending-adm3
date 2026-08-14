@@ -28,7 +28,7 @@ Usage (run from repo root)
         --year      2022 \\
         [--coef_dir Monsoon_Data/results/2025_model_evaluation/] \\
         [--out_dir  Monsoon_Data/results/2025_model_evaluation/per_year/] \\
-        [--pipeline_input_dir Monsoon_Data/Processed_Data/2025_pipeline_input] \\
+        [--pipeline_input_dir Monsoon_Data/Processed_Data/pipeline_input] \\
         [--dissem_file Monsoon_Data/dissemination_cells.csv]
 
     # Future year (no ground truth):
@@ -37,7 +37,7 @@ Usage (run from repo root)
         --model      blended_model \\
         --year       2026 \\
         --coef_tag   clim_mok_date_2022_year2022 \\
-        --input_path Monsoon_Data/Processed_Data/2025_pipeline_input/wide_2026.pkl
+        --input_path Monsoon_Data/Processed_Data/pipeline_input/wide_2026.pkl
 
 Input files
 ------------
@@ -52,7 +52,7 @@ Input files
    the resolved training formula.
 
 3. The wide pickle (historical) or --input_path (future):
-   Monsoon_Data/Processed_Data/2025_pipeline_input/cv_data_clim_mok_date_new_pipeline.pkl
+   Monsoon_Data/Processed_Data/pipeline_input/cv_data_clim_mok_date_new_pipeline.pkl
    The full feature dataset — patsy builds the design matrix from this.
 
 4. Dissemination cells (historical metrics only):
@@ -77,11 +77,12 @@ from scipy.special import expit
 
 
 from python.blending_process.blend_evaluation_utils import (
+    DEFAULT_PIPELINE_INPUT_ROOT,
     build_formulas_from_spec,
     compute_cell_metrics_fast,
-    input_rds_from_cutoff,
     make_cutoff_tag,
     make_year_tag,
+    resolve_blend_input_path,
     restrict_to_allowed,
     _parse_formula_cols,
 )
@@ -347,8 +348,9 @@ def main():
     parser.add_argument("--dissem_file", default=None,
                         help="Override the dissemination CSV configured by "
                              "cell.dissemination")
-    parser.add_argument("--pipeline_input_dir", default="Monsoon_Data/Processed_Data/2025_pipeline_input",
-                        help="Directory containing the wide processed data")
+    parser.add_argument("--pipeline_input_dir", default=DEFAULT_PIPELINE_INPUT_ROOT,
+                        help="Root directory containing the spec-configured "
+                             "pipeline input subdirectory")
     args = parser.parse_args()
 
     # ── Load spec ──────────────────────────────────────────────────────
@@ -409,8 +411,11 @@ def main():
             test_df["year"] = args.year                                       # ← NEW
     else:
         # Historical year: load from standard pipeline input
-        input_file = input_rds_from_cutoff(cutoff_mode)
-        input_path = os.path.join(args.pipeline_input_dir, input_file)
+        input_path = resolve_blend_input_path(
+            cutoff_mode,
+            spec.get("run"),
+            pipeline_input_root=args.pipeline_input_dir,
+        )
         print(f"\nLoading wide_df from: {input_path}")
         with open(input_path, "rb") as f:
             wide_df = pickle.load(f)

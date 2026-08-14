@@ -24,6 +24,11 @@ from sklearn.metrics import roc_auc_score
 from ..pipelines._shared.misc import coalesce, week_labels, interval_bins
 
 
+DEFAULT_PIPELINE_INPUT_ROOT = os.path.join(
+    "Monsoon_Data", "Processed_Data", "pipeline_input"
+)
+
+
 def _present_weeks(df, base):
     """Sorted week numbers present as `<base>_week<n>` columns in df."""
     pat = re.compile(rf"^{re.escape(base)}_week(\d+)$")
@@ -108,6 +113,36 @@ def input_rds_from_cutoff(cutoff_mode, resolution=""):
     variant = make_cutoff_tag(cutoff_mode).lstrip("_")
     variant_part = f"{variant}_" if variant else ""
     return f"cv_data_{prefix}{variant_part}new_pipeline.pkl"
+
+
+def resolve_blend_input_path(
+    cutoff_mode,
+    run_cfg=None,
+    *,
+    input_path=None,
+    work_dir=None,
+    pipeline_input_root=DEFAULT_PIPELINE_INPUT_ROOT,
+):
+    """Resolve a connector artifact for evaluation or saved-model use."""
+    if input_path:
+        return input_path
+
+    run_cfg = run_cfg or {}
+    if "input_rds_override" in run_cfg:
+        raise ValueError(
+            "run.input_rds_override has been removed; use --input_path "
+            "or --blend_input."
+        )
+
+    input_file = input_rds_from_cutoff(cutoff_mode)
+    if work_dir:
+        return os.path.join(work_dir, input_file)
+
+    return os.path.join(
+        pipeline_input_root,
+        run_cfg.get("pipeline_input_dir", ""),
+        input_file,
+    )
 
 
 # ---------------------------------------------------------------------------
