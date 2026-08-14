@@ -13,10 +13,10 @@ Postprocessing script: reads saved blending model coefficients for a given
 year, applies them to a wide_df pickle, and writes per-year output files.
 
 Two modes:
-  1. Historical year (in cv_holdout_years): loads from standard pipeline input,
-     computes metrics against observed outcome.
-  2. Future year (not in cv_holdout_years): loads from --input_path, skips
-     metrics (no ground truth available).
+  1. Historical holdout year: loads from the standard pipeline input and uses
+     the configured true/CV holdout years to resolve the coefficient filename.
+  2. Operational year: loads from --input_path and skips metrics because no
+     ground truth is available.
 
 Usage (run from repo root)
 --------------------------
@@ -80,6 +80,7 @@ from python.blending_process.blend_evaluation_utils import (
     DEFAULT_PIPELINE_INPUT_ROOT,
     build_formulas_from_spec,
     compute_cell_metrics_fast,
+    configured_holdout_years,
     make_cutoff_tag,
     make_year_tag,
     resolve_blend_input_path,
@@ -323,7 +324,8 @@ def main():
                         help="Test year to apply the model for")
     parser.add_argument("--year_tag", default=None,
                     help="Override year tag in filename, e.g. '2000_2022'. "
-                         "If not provided, derived from cv_holdout_years in spec.")
+                         "If not provided, derived from configured true and CV "
+                         "holdout years in spec.")
     parser.add_argument("--method",  default="global",
                         help="CV method (default: global)")
     parser.add_argument("--coef_tag",   default=None,                        # ← NEW
@@ -356,7 +358,7 @@ def main():
     # ── Load spec ──────────────────────────────────────────────────────
     spec = load_spec(args.spec_id, "2025_blend")
     cutoff_mode     = spec["run"]["cutoff_mode"]
-    holdout_years   = [int(y) for y in spec["run"]["cv_holdout_years"]]
+    holdout_years   = configured_holdout_years(spec)
     training_years  = [int(y) for y in spec["run"]["training_years"]]
 
     is_future_year = args.input_path is not None                              # ← NEW

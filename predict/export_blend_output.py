@@ -81,6 +81,7 @@ os.chdir(REPO_ROOT)
 
 try:
     from python.blending_process.blend_evaluation_utils import (
+        configured_holdout_years,
         input_rds_from_cutoff,
         make_cutoff_tag,
         make_year_tag,
@@ -178,7 +179,7 @@ def main():
     # ── Load spec ─────────────────────────────────────────────────────
     spec = load_spec(args.spec_id, "2025_blend")
     cutoff_mode   = spec["run"]["cutoff_mode"]
-    holdout_years = [int(y) for y in spec["run"]["cv_holdout_years"]]
+    holdout_years = configured_holdout_years(spec)
     cutoff_tag    = make_cutoff_tag(cutoff_mode)
     year_tag      = make_year_tag(holdout_years)
     output_tag    = f"{cutoff_tag}{year_tag}"

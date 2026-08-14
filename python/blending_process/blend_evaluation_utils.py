@@ -97,6 +97,14 @@ def make_year_tag(years):
     return f"_{min(years)}_{max(years)}"
 
 
+def configured_holdout_years(spec):
+    """Return true and CV holdout years under the shared artifact contract."""
+    run = (spec or {}).get("run") or {}
+    true_holdout = list(map(int, coalesce(run.get("true_holdout_years"), [])))
+    cv_holdout = list(map(int, coalesce(run.get("cv_holdout_years"), [])))
+    return true_holdout + cv_holdout
+
+
 def make_cutoff_tag(cutoff_mode):
     if cutoff_mode == "fixed_cutoff":
         return "_fixed_cutoff"

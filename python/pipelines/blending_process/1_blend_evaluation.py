@@ -48,6 +48,7 @@ from python.blending_process.blend_evaluation_utils import (
     make_calibrated_preds_from_wide,
     fit_platt_weights_export,
     platt_cv_multibin,
+    configured_holdout_years,
     make_cutoff_tag,
     make_year_tag,
     resolve_blend_input_path,
@@ -96,8 +97,7 @@ def main():
     cutoff_mode = coalesce(spec.get("run", {}).get("cutoff_mode"), "ref_onset")
     training_years = list(map(int, coalesce(spec.get("run", {}).get("training_years"), list(range(2000, 2025)))))
     true_holdout_years = list(map(int, coalesce(spec.get("run", {}).get("true_holdout_years"), [])))
-    cv_holdout_years = list(map(int, coalesce(spec.get("run", {}).get("cv_holdout_years"), [])))
-    holdout_years = true_holdout_years + cv_holdout_years
+    holdout_years = configured_holdout_years(spec)
 
     cv_methods = coalesce(spec.get("cv", {}).get("methods"), ["global"])
     cutoff_tag = make_cutoff_tag(cutoff_mode)
