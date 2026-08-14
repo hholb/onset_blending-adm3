@@ -1236,6 +1236,11 @@ def process_rainfall_forecast_tensor(nc_path, var_name, dim_rename_map, spec,
         if any(day is None for day in day_ints):
             return None
         day_ints = np.asarray(day_ints, dtype=int)
+        # Rolling onset logic and searchsorted both require chronological days.
+        day_order = np.argsort(day_ints, kind="stable")
+        if not np.array_equal(day_order, np.arange(len(day_ints))):
+            day_positions = day_positions[day_order]
+            day_ints = day_ints[day_order]
 
         time_variable = ds[original_dim["time"]]
         time_values = np.asarray(time_variable[:]).reshape(-1)
@@ -1374,7 +1379,10 @@ def process_rainfall_forecast_tensor(nc_path, var_name, dim_rename_map, spec,
                     if member_count > 1
                     else np.full((n_targets, len(day_ints)), np.nan)
                 )
+            # NaN onset indices compare false; restore no-support rows to NaN.
+            has_rain_support = np.isfinite(rain_mean).any(axis=1)
             frac_raining = np.mean(target_rain > 1.0, axis=1)
+            frac_raining[~has_rain_support] = np.nan
             onset_positions = np.arange(1, len(day_ints) + 1)
             probabilities = [
                 np.mean(
@@ -1384,6 +1392,8 @@ def process_rainfall_forecast_tensor(nc_path, var_name, dim_rename_map, spec,
                 )
                 for variant in range(3)
             ]
+            for probability in probabilities:
+                probability[~has_rain_support] = np.nan
 
             data = {
                 "id": units["id"].to_numpy(),

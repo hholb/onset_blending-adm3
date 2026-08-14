@@ -49,7 +49,9 @@ options:
       # dry_day_min_mm: 1.0
 
   cutoff_month_day: '05-01'
-  fixed_cutoff_month_day: '06-01'
+  # First eligible onset date. '06-02' reproduces the Indian example's rule
+  # of searching strictly after June 1; set this for the target geography.
+  fixed_cutoff_month_day: '06-02'
   min_year: 2000
   max_year: 2024
 

@@ -41,7 +41,9 @@ options:
       # min_dry_days: 7
       # dry_day_min_mm: 1.0
 
-  fixed_cutoff_month_day: '06-01'
+  # First eligible onset date. Keep this aligned with the ground-truth spec.
+  # '06-02' reproduces the Indian example's search strictly after June 1.
+  fixed_cutoff_month_day: '06-02'
   min_year: 2000
   max_year: 2024
 
