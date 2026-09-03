@@ -1,0 +1,78 @@
+# Portable country template: one historical rainfall forecast family.
+# Use the same onset, threshold, spatial-ID, and calendar choices as the
+# ground-truth spec unless a documented scientific reason requires otherwise.
+
+type: rainfall_forecast
+
+input:
+  nc_folder: Monsoon_Data/raw_nc/example_country/forecast_model
+  file_regex: '^forecast_(19|20)\d{2}_adm3\.nc$'
+  value_col: rainfall
+  wide_day_dim: day
+  wide_prefix: rain
+  parallel: true
+  workers: 4
+
+dimensions:
+  rename:
+    latitude: lat
+    longitude: lon
+    time: time
+    lead_time: day
+    ensemble: number
+
+output:
+  out_dir: Monsoon_Data/Processed_Data/example_country
+
+options:
+  window: 5
+  onset_definition:
+    wet_day_min_mm: 1.0
+    trigger_rule: first_day_wet
+    wet_day_comparison: gt
+    follow_days: 30
+    followup_anchor: onset_day
+    dry_spell:
+      mode: window_sum
+      sum_window: 10
+      sum_min_mm: 5.0
+      # Alternative:
+      # mode: consecutive_dry
+      # min_dry_days: 7
+      # dry_day_min_mm: 1.0
+
+  # First eligible onset date. Keep this aligned with the ground-truth spec.
+  # '06-02' reproduces the Indian example's search strictly after June 1.
+  fixed_cutoff_month_day: '06-02'
+  min_year: 2000
+  max_year: 2024
+
+  # Strict rain-feature horizon contract shared with the connect template.
+  min_day: 1
+  max_day: 40
+  rain_day_max: 40
+  # truncate requires every day through rain_day_max and discards later days;
+  # exact additionally rejects any later days in the source.
+  rain_horizon_policy: truncate
+
+  # Alternative to writing regridded NetCDF files in the separate regrid
+  # stage: transform rainfall directly while processing this raw source.
+  # The weight CSV requires source_id, target_id, weight.
+  cell_transform_enabled: false
+  # cell_transform_enabled: true
+  # cell_transform_file: Monsoon_Data/reference/example_country/cell_transform_weights.csv
+
+thresholds:
+  file: Monsoon_Data/reference/example_country/onset_thresholds.csv
+  id_col: unit_id
+  thresh_col: onset_threshold
+  # Alternative (remove file/id fields): constant: 20.0
+
+filter:
+  dissemination_cells_file: Monsoon_Data/reference/example_country/dissemination_units.csv
+  id_col: unit_id
+  centroids_file: Monsoon_Data/reference/example_country/unit_centroids.csv
+  centroids_id_col: target_id
+
+# Omit ref_onset for a fixed-cutoff-only workflow. Add a constant or file-backed
+# ref_onset block when the ref_onset forecast variant is required.

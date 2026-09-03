@@ -1,0 +1,57 @@
+mode: "fixed_cutoff"
+input_rds: "Monsoon_Data/Processed_Data/2026/combine_template_fixed_cutoff_2026_combined_wide.pkl"
+output_rds: "Monsoon_Data/Processed_Data/2026/cv_data_fixed_cutoff_new_pipeline_2026.pkl"
+# Forecast bin structure:
+#   n_bins       = number of interval bins (each spanning days_per_bin days).
+#                  This does NOT count the 'earlier' or 'later' bins.
+#   days_per_bin = width of each bin, in days.
+#   day_max      = number of forecast lead days to read (>= n_bins * days_per_bin).
+# With n_bins=4, days_per_bin=7 the outcome categories are:
+#   earlier (before day 1, unconditional climatology only), week1..week4, later.
+day_max: 28
+days_per_bin: 7
+n_bins: 4
+
+# Onset definition source (single source of truth). When set, rain_predictor
+# windows may use symbolic tokens (trigger / dry_spell / follow / min_dry) that
+# resolve from this raw_data spec's onset definition, so predictors track it
+# automatically. Explicit integer windows always take precedence.
+onset_spec: ref_rain_fixed_cutoff_2026
+
+climatology:
+  base_prefix: "clim"
+  unconditional_prefix: "clim_unc"
+  window_tags: []
+
+
+#forecast_models:
+#  - name: ngcm
+#    variants: [fixed_cutoff]
+#    rain_predictors: [diff_5day, min_10day]
+#  - name: aifs
+#    variants: [fixed_cutoff]
+#    rain_predictors: [diff_5day, min_10day, max_5day]
+
+
+# Optional transform applied to rain features (diff/max/min) before they enter
+# the blend. Does NOT affect onset detection or climatology. A spec-level
+# `rain_transform` sets the default for all models; a per-model `rain_transform`
+# overrides it. Accepted: identity (default), sqrt, fourth_root, log1p,
+# "power:<p>", or { power: <p> } for any exponent.
+#rain_transform: identity
+
+forecast_models:
+  #- name: ngcm
+  - name: aifs_ens
+    variants: [fixed_cutoff]
+    #rain_transform: fourth_root     # per-model override; e.g. { power: 0.25 }
+    rain_predictors:
+      - { agg: diff, window: trigger }   # = onset trigger window (options.window)
+#      - { agg: min,  window: dry_spell } # = onset dry-spell window (sum_window)
+  - name: aifs
+    variants: [fixed_cutoff]
+    #rain_transform: fourth_root
+    rain_predictors:
+      - { agg: diff, window: trigger }
+#      - { agg: min,  window: dry_spell }
+#      - { agg: max,  window: 3 }        # explicit integers still work

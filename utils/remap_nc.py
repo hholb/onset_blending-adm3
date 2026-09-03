@@ -4,78 +4,31 @@ import glob
 import numpy as np
 import pandas as pd
 import xarray as xr
-from scipy import sparse
 
-
-def _coord_key(lat, lon, precision=10):
-    return (round(float(lat), precision), round(float(lon), precision))
-
-
-def _build_sparse_weights(mapping, lat_values, lon_values):
-    pixel_lookup = {
-        _coord_key(lat, lon): idx
-        for idx, (lat, lon) in enumerate(
-            (lat, lon) for lat in lat_values for lon in lon_values
-        )
-    }
-
-    adm3_names = pd.Index(mapping["adm3_name"].astype(str).drop_duplicates())
-    adm3_lookup = {name: idx for idx, name in enumerate(adm3_names)}
-
-    rows = []
-    cols = []
-    data = []
-    missing_pixels = 0
-    for rec in mapping.itertuples(index=False):
-        pixel_idx = pixel_lookup.get(_coord_key(rec.lat, rec.lon))
-        if pixel_idx is None:
-            missing_pixels += 1
-            continue
-        rows.append(pixel_idx)
-        cols.append(adm3_lookup[str(rec.adm3_name)])
-        data.append(float(rec.weight))
-
-    if not data:
-        raise ValueError("No mapping rows matched the input NetCDF lat/lon coordinates.")
-    if missing_pixels:
-        print(f"  Skipped {missing_pixels} mapping rows with no matching input pixel.")
-
-    weights = sparse.csr_matrix(
-        (data, (rows, cols)),
-        shape=(len(lat_values) * len(lon_values), len(adm3_names)),
-    )
-    return weights, adm3_names.to_numpy()
-
-
-def _aggregate_data_array_to_adm3(da, weights, adm3_names):
-    spatial_dims = ["lat", "lon"]
-    other_dims = [dim for dim in da.dims if dim not in spatial_dims]
-    ordered = da.transpose(*other_dims, *spatial_dims)
-
-    other_shape = tuple(ordered.sizes[dim] for dim in other_dims)
-    values = np.asarray(ordered.values)
-    flat = values.reshape((-1, ordered.sizes["lat"] * ordered.sizes["lon"]))
-
-    valid = np.isfinite(flat)
-    weighted_sum = weights.T.dot(np.nan_to_num(flat, nan=0.0).T).T
-    effective_weight = weights.T.dot(valid.astype(float).T).T
-
-    with np.errstate(invalid="ignore", divide="ignore"):
-        out = weighted_sum / effective_weight
-    out[effective_weight <= 0] = np.nan
-    out = np.asarray(out).reshape(other_shape + (len(adm3_names),))
-
-    coords = {dim: da.coords[dim] for dim in other_dims if dim in da.coords}
-    coords["adm3_name"] = adm3_names
-    return xr.DataArray(out, dims=other_dims + ["adm3_name"], coords=coords, name=da.name)
+from python.prepare_data.geometry_utils import normalize_regrid_weights
+from python.prepare_data.sparse_transform_utils import (
+    compile_sparse_cell_transform,
+    sparse_observed_weighted_mean,
+)
 
 
 def batch_aggregate_to_adm3_matrix(input_dir, mapping_csv_path, input_file=None):
     # 1. Load mapping
-    mapping = pd.read_csv(mapping_csv_path)
+    mapping = normalize_regrid_weights(
+        pd.read_csv(
+            mapping_csv_path,
+            dtype={"target_id": str, "adm3_name": str},
+        ),
+        context=f"regrid weights {mapping_csv_path}",
+    )
     mapping = mapping.rename(columns={'latitude': 'lat', 'longitude': 'lon'})
+    for column in ("lat", "lon", "weight"):
+        mapping[column] = pd.to_numeric(mapping[column], errors="raise")
 
-    # 3. Process Files
+    mapping['source_id'] = list(zip(mapping['lat'], mapping['lon']))
+    mapping['target_id'] = mapping['target_id'].astype(str)
+
+    # 2. Process files
     if input_file is not None:
         nc_files = [input_file]
     else:
@@ -85,6 +38,7 @@ def batch_aggregate_to_adm3_matrix(input_dir, mapping_csv_path, input_file=None)
         print("No new .nc files found to process.")
         return
 
+    transforms_by_grid = {}
     for file_path in nc_files:
         print(f"Processing: {os.path.basename(file_path)}...")
 
@@ -92,8 +46,30 @@ def batch_aggregate_to_adm3_matrix(input_dir, mapping_csv_path, input_file=None)
         # masked to NaN before any arithmetic. This was the main data bug:
         # -99 fill values were being included in the weighted sum.
         with xr.open_dataset(file_path, mask_and_scale=True) as ds:
+            # Standardize spatial coord names so we always work in lat/lon
+            # (input files may use latitude/longitude, e.g. the IMD grids).
+            rename_ll = {}
+            if 'latitude' in ds.dims or 'latitude' in ds.coords:
+                rename_ll['latitude'] = 'lat'
+            if 'longitude' in ds.dims or 'longitude' in ds.coords:
+                rename_ll['longitude'] = 'lon'
+            if rename_ll:
+                ds = ds.rename(rename_ll)
+
+            source_ids = tuple(
+                (float(lat), float(lon))
+                for lat in ds['lat'].values
+                for lon in ds['lon'].values
+            )
+            transform = transforms_by_grid.get(source_ids)
+            if transform is None:
+                transform = compile_sparse_cell_transform(
+                    mapping,
+                    source_ids=source_ids,
+                    target_ids=tuple(sorted(mapping['target_id'].unique())),
+                )
+                transforms_by_grid[source_ids] = transform
             processed_vars = {}
-            weights_cache = {}
 
             for var_name in ds.data_vars:
                 if 'lat' in ds[var_name].dims and 'lon' in ds[var_name].dims:
@@ -106,17 +82,28 @@ def batch_aggregate_to_adm3_matrix(input_dir, mapping_csv_path, input_file=None)
                     if fill_val is not None:
                         da = da.where(da != fill_val)
 
-                    grid_key = (tuple(da["lat"].values), tuple(da["lon"].values))
-                    if grid_key not in weights_cache:
-                        weights_cache[grid_key] = _build_sparse_weights(
-                            mapping, da["lat"].values, da["lon"].values
-                        )
-                    weights, adm3_names = weights_cache[grid_key]
-                    processed_vars[var_name] = _aggregate_data_array_to_adm3(
-                        da, weights, adm3_names
+                    other_dims = [dim for dim in da.dims if dim not in ('lat', 'lon')]
+                    ordered = da.transpose(*other_dims, 'lat', 'lon')
+                    other_shape = tuple(ordered.sizes[dim] for dim in other_dims)
+                    source_values = np.asarray(ordered.values, dtype=float).reshape(
+                        (-1, len(source_ids))
+                    ).T
+                    transformed = sparse_observed_weighted_mean(
+                        transform, source_values
+                    ).T.reshape(other_shape + (len(transform.target_ids),))
+                    result = xr.DataArray(
+                        transformed,
+                        dims=other_dims + ['adm3_name'],
+                        coords={
+                            **{dim: ordered.coords[dim] for dim in other_dims},
+                            'adm3_name': np.asarray(transform.target_ids, dtype=object),
+                        },
+                        attrs=da.attrs,
+                        name=var_name,
                     )
+                    processed_vars[var_name] = result
 
-            # 4. Reconstruct Dataset and save
+            # 3. Reconstruct dataset and save
             adm3_ds = xr.Dataset(processed_vars)
 
             base_name = os.path.splitext(file_path)[0]
@@ -138,7 +125,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--weight_file",
         required=True,
-        help="Path to the CSV mapping file (columns: lat, lon, adm3_name, weight).",
+        help="Path to the CSV mapping file (lat, lon, target_id or adm3_name, weight).",
     )
     parser.add_argument(
         "--input_file",

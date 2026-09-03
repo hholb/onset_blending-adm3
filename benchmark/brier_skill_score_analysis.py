@@ -56,7 +56,7 @@ MODEL_LABELS = {
 
 }
 model_prefix = args.model.lower()
-model_key    = f"{model_prefix}_clim_mok_date_raw"
+model_key    = f"{model_prefix}_fixed_cutoff_raw"
 model_label  = MODEL_LABELS.get(model_prefix, model_prefix.upper())
 
 case    = args.case

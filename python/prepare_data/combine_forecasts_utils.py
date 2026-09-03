@@ -116,8 +116,8 @@ def read_ground_truth_wide(path):
     if miss:
         raise ValueError(f"Ground truth missing columns: {', '.join(miss)}")
 
-    true_onset_day = pd.to_numeric(dt["mr_onset_day"], errors="coerce") if "mr_onset_day" in dt.columns else np.nan
-    true_onset_date = pd.to_datetime(dt["mr_onset_date"]).dt.date if "mr_onset_date" in dt.columns else None
+    true_onset_day = pd.to_numeric(dt["onset_day"], errors="coerce") if "onset_day" in dt.columns else np.nan
+    true_onset_date = pd.to_datetime(dt["onset_date"]).dt.date if "onset_date" in dt.columns else None
 
     result = pd.DataFrame({
         "id": dt["id"].astype(str),

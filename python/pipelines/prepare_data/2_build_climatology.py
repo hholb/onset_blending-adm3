@@ -8,8 +8,8 @@
 #   Supports MULTIPLE climatology runs from a single YAML spec.
 #
 # Usage (run from MO_Forecast_Code/ directory)
-#   python pipelines/prepare_data/2_build_climatology.py --spec_id imd
-#   python pipelines/prepare_data/2_build_climatology.py --spec_id imd --run clim_1965_2024
+#   python pipelines/prepare_data/2_build_climatology.py --spec_id ref_rain
+#   python pipelines/prepare_data/2_build_climatology.py --spec_id ref_rain --run clim_1965_2024
 # ==============================================================================
 
 import argparse
@@ -27,7 +27,28 @@ from python.prepare_data.climatology_utils import (
     filter_gt_training,
     build_issue_grid,
     compute_all_forecasts,
+    write_paired_climatologies,
 )
+
+
+def _pair_key(run):
+    opt = run["options"]
+    horizons = tuple(
+        tuple(sorted(horizon.items())) for horizon in (opt["horizons"] or [])
+    )
+    return (
+        opt["onset_col"],
+        opt["train_year_min"],
+        opt["train_year_max"],
+        run["min_onset_years"],
+        opt["test_year_min"],
+        opt["test_year_max"],
+        opt["season_start_md"],
+        opt["issue_end_md"],
+        opt["forecast_window"],
+        horizons,
+        opt["cv_by_year"],
+    )
 
 
 def main():
@@ -59,6 +80,16 @@ def main():
 
     spec = validate_spec(spec, required_paths=["output.out_dir", "climatologies"], checks=[_validate_clim])
 
+    workers_value = os.environ.get(
+        "CLIM_WORKERS", spec.get("climatology_runtime", {}).get("workers", 1)
+    )
+    try:
+        workers = int(workers_value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("climatology_runtime.workers must be an integer.") from exc
+    if workers < 1:
+        raise ValueError("climatology_runtime.workers must be at least 1.")
+
     paths = get_paths_clim(spec)
     gt_wide_path = paths["gt_path"]
     if not os.path.exists(gt_wide_path):
@@ -73,7 +104,7 @@ def main():
             raise ValueError(f"Requested --run '{args.run}' not found. Available: {', '.join(run_keys)}")
         run_keys = [args.run]
 
-    results = []
+    runs = []
     for run_key in run_keys:
         co = spec["climatologies"][run_key]
         opt = get_climatology_options_from_run(co)
@@ -99,27 +130,74 @@ def main():
             opt["season_start_md"], opt["issue_end_md"],
         )
 
+        out_stem = co.get("out_stem") or f"{paths['out_stem']}_{run_key}"
+        runs.append({
+            "key": run_key,
+            "options": opt,
+            "min_onset_years": min_onset_years,
+            "gt_train": gt_train,
+            "issue_grid": issue_grid,
+            "out_pkl": os.path.join(paths["out_dir"], f"{out_stem}.pkl"),
+        })
+
+    results = {}
+    completed = set()
+    for index, run in enumerate(runs):
+        if run["key"] in completed:
+            continue
+
+        pair = next((
+            other for other in runs[index + 1:]
+            if other["key"] not in completed
+            and other["options"]["conditional"]
+            != run["options"]["conditional"]
+            and _pair_key(other) == _pair_key(run)
+        ), None)
+
+        if pair is not None:
+            conditional = run if run["options"]["conditional"] else pair
+            unconditional = pair if run["options"]["conditional"] else run
+            opt = run["options"]
+            write_paired_climatologies(
+                gt_train=run["gt_train"],
+                issue_grid=run["issue_grid"],
+                season_start_md=opt["season_start_md"],
+                forecast_window=opt["forecast_window"],
+                horizons=opt["horizons"],
+                cv_by_year=opt["cv_by_year"],
+                conditional_path=conditional["out_pkl"],
+                unconditional_path=unconditional["out_pkl"],
+                workers=workers,
+            )
+            for item in (conditional, unconditional):
+                print(f"[{item['key']}] Wrote: {item['out_pkl']}")
+                results[item["key"]] = {
+                    "run": item["key"], "out_pkl": item["out_pkl"]
+                }
+                completed.add(item["key"])
+            continue
+
         out = compute_all_forecasts(
-            gt_train=gt_train,
-            issue_grid=issue_grid,
-            season_start_md=opt["season_start_md"],
-            forecast_window=opt["forecast_window"],
-            horizons=opt["horizons"],
-            conditional=opt["conditional"],
-            cv_by_year=opt["cv_by_year"],
+            gt_train=run["gt_train"],
+            issue_grid=run["issue_grid"],
+            season_start_md=run["options"]["season_start_md"],
+            forecast_window=run["options"]["forecast_window"],
+            horizons=run["options"]["horizons"],
+            conditional=run["options"]["conditional"],
+            cv_by_year=run["options"]["cv_by_year"],
         )
 
         forecast_tbl = out["forecasts"]
-        out_stem = co.get("out_stem") or f"{paths['out_stem']}_{run_key}"
-        out_rds = os.path.join(paths["out_dir"], f"{out_stem}.pkl")
-
-        with open(out_rds, "wb") as f:
+        with open(run["out_pkl"], "wb") as f:
             pickle.dump(forecast_tbl, f)
 
-        print(f"[{run_key}] Wrote: {out_rds}")
-        results.append({"run": run_key, "out_pkl": out_rds})
+        print(f"[{run['key']}] Wrote: {run['out_pkl']}")
+        results[run["key"]] = {
+            "run": run["key"], "out_pkl": run["out_pkl"]
+        }
+        completed.add(run["key"])
 
-    return results
+    return [results[run_key] for run_key in run_keys]
 
 
 if __name__ == "__main__":

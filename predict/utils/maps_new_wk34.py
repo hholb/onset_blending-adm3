@@ -1,6 +1,11 @@
 # ==============================================================================
 # File: maps.py (3-Panel Probability & Single-Panel Max-Period Edition)
 # ==============================================================================
+# NOTE: This is an UNUSED legacy variant that combines weeks 3+4 into one panel
+# and assumes the 4-week structure. It is not imported by run_maps.py (which uses
+# maps_new_zone). For the general "plot all bins" behavior use maps_new.py /
+# maps_new_zone.py, which size the panels to the number of bins in the data.
+# ==============================================================================
 from datetime import timedelta
 import os
 import pandas as pd
@@ -71,7 +76,7 @@ def max_period(vf):
 # Main map generator
 # ---------------------------------------------------------------------------
 
-def make_maps(summary, output_path, mok=False, all_cells_file=None,
+def make_maps(summary, output_path, ref_onset=False, all_cells_file=None,
               woreda_shapefile=None, use_cartopy=False, region='country',
               resolution='10m', category='cultural', name='admin_0_countries', 
               zoom_to_data=False):
@@ -90,7 +95,7 @@ def make_maps(summary, output_path, mok=False, all_cells_file=None,
 
     first_date = pd.to_datetime(summary["time"].iloc[0])
     date_str_fmt = first_date.strftime("%Y%m%d")
-    output_dir = output_path / ("maps_mok" if mok else "maps")
+    output_dir = output_path / ("maps_ref" if ref_onset else "maps")
     os.makedirs(output_dir, exist_ok=True)
 
     preds_df = summary.copy()

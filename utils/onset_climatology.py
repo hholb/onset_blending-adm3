@@ -11,21 +11,21 @@ df.to_csv("Monsoon_Data/Processed_Data/Models/dry_spell_strict/mr_onset_idx.csv"
 #df_2020 = df[df["year"] == 2020]
 #df_2020 = (
 #        df_2020.rename(columns={"id": "adm3_name"})
-#        .rename(columns={"mr_onset_day": "median_mr_onset_idx"})
+#        .rename(columns={"onset_day": "median_onset_idx"})
 #)
 #
 #df_2020.to_pickle("Monsoon_Data/Processed_Data/Models/mr_onset_idx_2020_by_id.pkl")
 
 
-# Calculate median mr_onset_idx for each id
+# Calculate median onset_idx for each id
 stats_df = (
-    #df.groupby("id", as_index=False)["mr_onset_idx"]
-    df.groupby("id", as_index=False)["mr_onset_day"]
+    #df.groupby("id", as_index=False)["onset_idx"]
+    df.groupby("id", as_index=False)["onset_day"]
       .median()
       .rename(columns={"id": "adm3_name"})
-      #.rename(columns={"mr_onset_idx": "median_mr_onset_idx"})
-      .rename(columns={"mr_onset_day": "median_mr_onset_idx"})
-      #.rename(columns={"mr_onset_idx": "tp"})
+      #.rename(columns={"onset_idx": "median_onset_idx"})
+      .rename(columns={"onset_day": "median_onset_idx"})
+      #.rename(columns={"onset_idx": "tp"})
 )
 
 # Save output

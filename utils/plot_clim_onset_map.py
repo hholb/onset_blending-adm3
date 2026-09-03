@@ -17,7 +17,7 @@ Map settings follow maps_new.py exactly:
 Usage
 -----
   python plot_clim_onset_map.py \
-      --pkl Monsoon_Data/Processed_Data/Models/mr_onset_idx_median_by_id.pkl \
+      --pkl Monsoon_Data/Processed_Data/Models/onset_idx_median_by_id.pkl \
       --shp manual_zones_woredas.shp \
       --out clim_median_onset.png
 """
@@ -163,14 +163,14 @@ woredas = gpd.read_file(args.shp).to_crs('EPSG:4326')[['adm3_name', 'geometry']]
 #df = pd.DataFrame({'adm3_name': ds['adm3_name'].values, 'tp': tp_slice.values})
 
 df = pd.read_pickle(args.pkl)
-df = df.rename(columns={"median_mr_onset_idx" : "tp"})
+df = df.rename(columns={"median_onset_idx" : "tp"})
 df["tp"] = df["tp"] + 120
 
 if args.diff_map:
     if args.pkl2 is None:
         raise ValueError("--diff_map requires --pkl2 to be specified.")
     df2 = pd.read_pickle(args.pkl2)
-    df2 = df2.rename(columns={"median_mr_onset_idx": "tp"})
+    df2 = df2.rename(columns={"median_onset_idx": "tp"})
     df2["tp"] = df2["tp"] + 120
     df = df.merge(df2[["adm3_name", "tp"]], on="adm3_name", suffixes=("", "_2"))
     df["tp"] = df["tp_2"] - df["tp"]

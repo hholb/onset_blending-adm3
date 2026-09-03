@@ -12,6 +12,7 @@
 # ==============================================================================
 
 import argparse
+import json
 import os
 import sys
 import pickle
@@ -22,10 +23,18 @@ import pandas as pd
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 
-from python.pipelines._shared.misc import coalesce
+from python.pipelines._shared.misc import coalesce, interval_bins
+from python.prepare_data.nc_utils import ensure_id_col
+from python.prepare_data.spatial_id_utils import (
+    resolve_grid_id_convention,
+    validate_id_coordinate_consistency,
+)
 from python.blending_process.blend_evaluation_utils import (
+    _present_weeks,
+    resolve_climatology_weeks,
     build_formulas_from_spec,
     print_formula_summary,
+    apply_formula_sample_support,
     compute_cv_global,
     compute_cv_local,
     compute_cv_neighbors,
@@ -39,9 +48,10 @@ from python.blending_process.blend_evaluation_utils import (
     make_calibrated_preds_from_wide,
     fit_platt_weights_export,
     platt_cv_multibin,
-    input_rds_from_cutoff,
+    configured_holdout_years,
     make_cutoff_tag,
     make_year_tag,
+    resolve_blend_input_path,
     restrict_to_allowed,
     forecast_label,
     clean_probs5,
@@ -51,32 +61,23 @@ from python.blending_process.blend_evaluation_utils import (
 )
 
 
-def format_coord(series):
-    """Format coordinate series consistently — int if whole numbers, else minimal decimal places."""
-#    if (series % 1 == 0).all():
-#        return series.astype(int).astype(str)
-#    else:
-#        for decimals in range(1, 10):
-#            rounded = series.round(decimals)
-#            if (rounded == series.round(10)).all():
-#                return rounded.map(lambda v: f"{v:.{decimals}f}")
-#        return series.map(lambda v: f"{v:.6f}")
-    return series.map(lambda v: f"{v:.2f}")
-
-
 def main():
     parser = argparse.ArgumentParser(description="Cross-validate weekly-bin blending models.")
     parser.add_argument("--spec_id", default="cv_models",
                         help="Spec file name (without .yml) in specs/2025_blend/")
     parser.add_argument("--cores", type=int, default=None,
-                        help="Override number of parallel cores")
+                        help="Process workers for global CV folds")
     parser.add_argument("--work_dir", default=None,
                         help="If provided, input pkl is read directly from this directory, "
                              "overriding pipeline_input_dir in the spec.")
+    parser.add_argument("--input_path", default=None,
+                        help="Read the connector pickle at this exact path (highest priority).")
     parser.add_argument("--results_dir", default=None,
                         help="If provided, all outputs are written to this directory, "
                              "overriding pipeline_output_dir in the spec.")
     args = parser.parse_args()
+    if args.cores is not None and args.cores < 1:
+        parser.error("--cores must be a positive integer")
 
     spec_path = os.path.join("specs", "2025_blend", f"{args.spec_id}.yml")
     with open(spec_path, "r") as f:
@@ -93,50 +94,67 @@ def main():
 
     os.makedirs(path_box, exist_ok=True)
 
-    cutoff_mode = coalesce(spec.get("run", {}).get("cutoff_mode"), "mok")
+    cutoff_mode = coalesce(spec.get("run", {}).get("cutoff_mode"), "ref_onset")
     training_years = list(map(int, coalesce(spec.get("run", {}).get("training_years"), list(range(2000, 2025)))))
     true_holdout_years = list(map(int, coalesce(spec.get("run", {}).get("true_holdout_years"), [])))
-    cv_holdout_years = list(map(int, coalesce(spec.get("run", {}).get("cv_holdout_years"), [])))
-    holdout_years = true_holdout_years + cv_holdout_years
+    holdout_years = configured_holdout_years(spec)
 
     cv_methods = coalesce(spec.get("cv", {}).get("methods"), ["global"])
     cutoff_tag = make_cutoff_tag(cutoff_mode)
     year_tag = make_year_tag(holdout_years)
     output_tag = f"{cutoff_tag}{year_tag}"
 
-    # Load dissemination cells
-    #dissemination_cells = pd.read_csv("Monsoon_Data/dissemination_cells.csv")
-    #dissemination_cells = pd.read_csv("Monsoon_Data/dissemination_cells_box1.csv")
-    dissemination_csv = spec["cell"].get("dissemination", "")
-    dissemination_cells = pd.read_csv(dissemination_csv)
-    dissemination_cells["id"] = dissemination_cells["adm3_name"].astype(str)
-
     # Load data
-    input_file = input_rds_from_cutoff(cutoff_mode)
-    #input_path = os.path.join("Monsoon_Data/Processed_Data/2025_pipeline_input", input_file)
-    # pipeline_input_dir = spec["run"].get("pipeline_input_dir", "")   # default: no subfolder
-    # input_path = os.path.join(
-    #     "Monsoon_Data/Processed_Data/pipeline_input",
-    #     pipeline_input_dir,
-    #     input_file,
-    # )
-
-    if args.work_dir:
-        input_path = os.path.join(args.work_dir, input_file)
-    else:
-        pipeline_input_dir = spec["run"].get("pipeline_input_dir", "")
-        input_path = os.path.join(
-            "Monsoon_Data/Processed_Data/pipeline_input",
-            pipeline_input_dir,
-            input_file,
-        )
+    input_path = resolve_blend_input_path(
+        cutoff_mode,
+        spec.get("run"),
+        input_path=args.input_path,
+        work_dir=args.work_dir,
+    )
 
     with open(input_path, "rb") as f:
         wide_df = pickle.load(f)
 
+    wide_df = ensure_id_col(wide_df, spec=spec, context="blend input IDs")
+    id_convention = resolve_grid_id_convention(
+        spec=spec,
+        authoritative_ids=wide_df["id"],
+        context="blend input/dissemination ID handoff",
+    )
+    cell_cfg = spec["cell"]
+    dissemination_csv = cell_cfg.get("dissemination", "")
+    dissemination_input = pd.read_csv(dissemination_csv, dtype=str)
+    dissemination_id_col = cell_cfg.get("id_col") or cell_cfg.get(
+        "dissemination_id_col"
+    )
+    if dissemination_id_col:
+        if dissemination_id_col not in dissemination_input.columns:
+            raise ValueError(
+                f"cell.id_col '{dissemination_id_col}' not found. "
+                f"Found: {dissemination_input.columns.tolist()}"
+            )
+        dissemination_input = dissemination_input.rename(
+            columns={dissemination_id_col: "id"}
+        )
+    dissemination_cells = ensure_id_col(
+        dissemination_input,
+        spec=spec,
+        convention=id_convention,
+        context="blend dissemination IDs",
+    )
+    validate_id_coordinate_consistency(
+        dissemination_cells, context="blend dissemination IDs"
+    )
+    dissemination_cells = dissemination_cells.drop_duplicates("id")
+
+    # Number of forecast week-bins, inferred from the configured climatology
+    # columns written by the connect stage.
+    _, clim_weeks = resolve_climatology_weeks(spec, wide_df)
+    N_BINS = max(clim_weeks)
+
 
 #    # --- DIAGNOSTIC
-#    mask = wide_df["prob_clim_mr_week1"].isna() & wide_df["ngcm_p_onset_clim_mok_date_week1"].notna()
+#    mask = wide_df["prob_clim_week1"].isna() & wide_df["ngcm_p_onset_fixed_cutoff_week1"].notna()
 #    print(f"Before outcome filter — NaN clim but valid ngcm: {mask.sum()}")
 #    print(f"  of which outcome is notna: {(mask & wide_df['outcome'].notna()).sum()}")
 #    print(f"  of which outcome is NA:    {(mask & wide_df['outcome'].isna()).sum()}")
@@ -150,7 +168,7 @@ def main():
 #        gt_wide = pickle.load(f)
 #    
 #    # Get the 570 ghost cells (NaN clim but valid ngcm, before outcome filter)
-#    mask = wide_df["prob_clim_mr_week1"].isna() & wide_df["ngcm_p_onset_clim_mok_date_week1"].notna()
+#    mask = wide_df["prob_clim_week1"].isna() & wide_df["ngcm_p_onset_fixed_cutoff_week1"].notna()
 #    ghost_ids = set(wide_df[mask]["id"].unique())
 #    
 #    # Count non-NaN onset years per cell in ground truth
@@ -159,7 +177,7 @@ def main():
 #        .groupby("id")
 #        .apply(lambda g: pd.Series({
 #            "n_years_total": len(g),
-#            "n_years_with_onset": g["mr_onset_day"].notna().sum(),
+#            "n_years_with_onset": g["onset_day"].notna().sum(),
 #            "lat": g.name.split("_")[0],
 #            "lon": g.name.split("_")[1],
 #        }))
@@ -175,11 +193,11 @@ def main():
 #    wide_df = wide_df[wide_df["outcome"].notna()].copy()
 #
 #    # --- DIAGNOSTIC
-#    mask = wide_df["prob_clim_mr_week1"].isna() & wide_df["ngcm_p_onset_clim_mok_date_week1"].notna()
-#    #print(f"\nRows where prob_clim_mr_week1 is NaN but ngcm has a value: {mask.sum()}")
-#    #print(wide_df[mask][["id", "year", "time", "outcome", "prob_clim_mr_week1", "ngcm_p_onset_clim_mok_date_week1"]].to_string())
+#    mask = wide_df["prob_clim_week1"].isna() & wide_df["ngcm_p_onset_fixed_cutoff_week1"].notna()
+#    #print(f"\nRows where prob_clim_week1 is NaN but ngcm has a value: {mask.sum()}")
+#    #print(wide_df[mask][["id", "year", "time", "outcome", "prob_clim_week1", "ngcm_p_onset_fixed_cutoff_week1"]].to_string())
 #
-#    clim_cols = [c for c in wide_df.columns if c.startswith("prob_clim_mr")]
+#    clim_cols = [c for c in wide_df.columns if c.startswith("prob_clim")]
 #    raw_col = next((c for c in wide_df.columns if "ngcm" in c and "p_onset" in c and "week" in c), None)
 #    if clim_cols and raw_col:
 #        has_raw   = wide_df[raw_col].notna()
@@ -194,7 +212,7 @@ def main():
 #    holdout_mask = wide_df["year"].isin(training_years)  # or holdout_years
 #    
 #    # Check which columns have NaN in holdout rows
-#    clim_cols = [c for c in wide_df.columns if c.startswith("prob_clim_mr")]
+#    clim_cols = [c for c in wide_df.columns if c.startswith("prob_clim")]
 #    ngcm_cols = [c for c in wide_df.columns if "ngcm_p_onset" in c and "week" in c]
 #    aifs_cols = [c for c in wide_df.columns if "aifs_p_onset" in c and "week" in c]
 #    
@@ -221,29 +239,35 @@ def main():
 #    # --- END DIAGNOSTIC ---
 
 
-    # Drop rows with NaN in any feature column to ensure consistent n
-    # across blended models and raw/calibrated forecast evaluation
-    feature_prefixes = ("prob_clim_mr", "diff_", "min_", "max_")
-    feature_cols = [c for c in wide_df.columns
-                    if any(c.startswith(p) for p in feature_prefixes)]
-    wide_df = wide_df.dropna(subset=feature_cols).copy()
-    print(f"After feature NaN filter: {len(wide_df)} rows")
+    # Build formulas before selecting sample support. Only predictors actually
+    # referenced by enabled formulas may determine the common evaluation rows.
+    formulas, formula_resolution = build_formulas_from_spec(
+        spec,
+        cutoff_mode,
+        data=wide_df,
+        return_resolution=True,
+        n_bins=N_BINS,
+    )
+    wide_df, support = apply_formula_sample_support(wide_df, formulas)
+    support["formula_resolution"] = formula_resolution
+    print(
+        "Formula sample support "
+        f"({support['policy']}): {support['rows_before']} -> "
+        f"{support['rows_after']} rows "
+        f"({support['rows_excluded']} excluded)"
+    )
+    if support["nonfinite_by_column"]:
+        print(f"Non-finite formula predictors: {support['nonfinite_by_column']}")
+    support_path = os.path.join(
+        path_box, f"formula_sample_support{output_tag}.json"
+    )
+    with open(support_path, "w") as handle:
+        json.dump(support, handle, indent=2)
+    print(f"Wrote formula sample-support diagnostics: {support_path}")
 
-#    # Drop rows with NaN in any formula feature column so n is consistent
-#    # across blended models and raw/calibrated forecasts
-#    all_feature_cols = set()
-#    for formula_str in build_formulas_from_spec(spec, cutoff_mode).values():
-#        all_feature_cols.update(_parse_formula_cols(formula_str))
-#    all_feature_cols = [c for c in all_feature_cols if c in wide_df.columns]
-#    wide_df = wide_df.dropna(subset=all_feature_cols).copy()
-#    print(f"After feature NaN filter: {len(wide_df)} rows")
-
-    print(f"Loaded {len(wide_df)} rows from {input_path}")
-
-    # Build formulas from spec
-    formulas = build_formulas_from_spec(spec, cutoff_mode)
+    print(f"Loaded {len(wide_df)} supported rows from {input_path}")
     print(f"Formulas: {list(formulas.keys())}")
-    print_formula_summary(spec, cutoff_mode)
+    print_formula_summary(spec, cutoff_mode, formulas=formulas)
 
     # FIX Bug 1: restrict training to allowed cells; predict on all cells
     wide_df_allowed = restrict_to_allowed(wide_df, dissemination_cells)
@@ -278,9 +302,12 @@ def main():
                         formula_str,
                         wide_df_allowed,
                         holdout_years,
+                        training_years=training_years,
                         true_holdout_years=true_holdout_years,
                         data_pred=wide_df,
+                        n_jobs=args.cores or 1,
                         save_coefs=True,                                     # ← NEW
+                        required_classes=interval_bins(N_BINS),
                     )
                     cv_preds = cv_preds.reset_index(drop=True)
 
@@ -299,8 +326,7 @@ def main():
                     continue
 
                 if cv_preds is None or cv_preds.empty:
-                    print(f"  No predictions for {model_name}/{method}")
-                    continue
+                    raise ValueError(f"No predictions for {model_name}/{method}.")
 
 #                print("\n cv_pred = ", cv_preds)
                 # Compute metrics
@@ -310,7 +336,7 @@ def main():
                 all_cells_list.append(cell_metrics)
 
                 # Yearly metrics
-                bins = ["week1", "week2", "week3", "week4", "later"]
+                bins = interval_bins(N_BINS)
                 cv_cols = [f"cv_{b}" for b in bins]
                 sub = cv_preds.dropna(subset=["outcome"] + cv_cols)
                 for yr, g in sub.groupby("year"):
@@ -357,10 +383,7 @@ def main():
             #    continue
 
             except Exception as e:
-                import traceback
-                traceback.print_exc()
-                warnings.warn(f"Error in {model_name}/{method}: {e}")
-                continue
+                raise RuntimeError(f"Error in {model_name}/{method}: {e}") from e
 
     # --------------------------------------------------------------------------
     # Section 2: Climatology logit baselines
@@ -475,17 +498,18 @@ def main():
                             get_forecast_variant_suffix, forecast_prob_cols
                         )
                         suf = get_forecast_variant_suffix(spec, variant)
-                        cols = forecast_prob_cols(fc_name, suf)
-                        missing = [c for c in cols.values() if c not in wide_df.columns]
-                        if not missing:
+                        base = f"{fc_name}_p_onset{suf}"
+                        weeks = _present_weeks(wide_df, base)
+                        if weeks:
                             platt_df_full = wide_df[wide_df["year"].isin(training_years + holdout_years)].copy()
-                            for wk in ["week1", "week2", "week3", "week4"]:
-                                platt_df_full[wk] = platt_df_full[cols[wk]]
+                            wk_labels = [f"week{w}" for w in weeks]
+                            for w in weeks:
+                                platt_df_full[f"week{w}"] = platt_df_full[f"{base}_week{w}"]
                             platt_df_full["later"] = np.maximum(
-                                0.0, 1.0 - platt_df_full[["week1", "week2", "week3", "week4"]].sum(axis=1)
+                                0.0, 1.0 - platt_df_full[wk_labels].sum(axis=1)
                             )
                             platt_result = fit_platt_weights_export(
-                                platt_df_full, ["week1", "week2", "week3", "week4", "later"],
+                                platt_df_full, wk_labels + ["later"],
                                 training_years, year_col="year"
                             )
                             platt_path = os.path.join(
@@ -505,11 +529,11 @@ def main():
     mme_cfg = spec.get("mme") or {}
     if mme_cfg.get("enabled", False) and clim_cv_preds_list:
 
-        mme_variants = list(mme_cfg.get("variants") or ["clim_mok_date"])
+        mme_variants = list(mme_cfg.get("variants") or ["fixed_cutoff"])
         blend_models = mme_cfg.get("blend_models") or []
         mc_cores = args.cores or mme_cfg.get("mc_cores", 1)
 
-        bins5 = ["week1", "week2", "week3", "week4", "later"]
+        bins5 = interval_bins(N_BINS)
         cols5 = [f"cv_{b}" for b in bins5]
         id_vars = ["time", "id", "lat", "lon", "year", "outcome"]
 

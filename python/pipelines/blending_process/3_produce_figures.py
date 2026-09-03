@@ -69,14 +69,14 @@ MODEL_LABELS = {
     "blended_model":                    "Blended Model",
     "ngcm_raw":                         "NGCM (raw)",
     "aifs_calibrated":                  "AIFS (calibrated)",
-    "aifs_calibrated_clim_mok_date":    "AIFS (calibrated)",
+    "aifs_calibrated_fixed_cutoff":    "AIFS (calibrated)",
     "ngcm_calibrated":                  "NGCM (calibrated)",
     "ngcm_blend":                       "NGCM : EE",
     "int_all":                          "NGCM : AIFS : EE",
-    "ngcm_clim_mok_date_raw":           "NGCM (raw)",
-    "ngcm_calibrated_clim_mok_date":    "NGCM (calibrated)",
-    "mme_clim_mok_date_clim_raw_opt_rps": "Best MME",
-    "mme_no_mok_filter_clim_raw_opt_rps": "Best MME",
+    "ngcm_fixed_cutoff_raw":           "NGCM (raw)",
+    "ngcm_calibrated_fixed_cutoff":    "NGCM (calibrated)",
+    "mme_fixed_cutoff_clim_raw_opt_rps": "Best MME",
+    "mme_no_ref_filter_clim_raw_opt_rps": "Best MME",
 }
 
 METRIC_LABELS = {
@@ -88,7 +88,7 @@ METRIC_LABELS = {
 PERIOD_LABELS = {
     "2000-2024":              "2000-2024",
     "1965-1978":              "1965-1978",
-    "2000-2024-clim_mok_date": "2000-2024 (Climatological MOK Date)",
+    "2000-2024-fixed_cutoff": "2000-2024 (Climatological MOK Date)",
     "2025_MR":                 "2025",
 }
 
@@ -106,8 +106,8 @@ OKABE_ITO = {
 MODEL_COLORS_CORE = {
     "unc_clim_raw":                   "#237192",
     "clim_raw":                       "#70c8d4",
-    "ngcm_calibrated_clim_mok_date":  "#eb7900",
-    "ngcm_calibrated_mok":            "#eb7900",
+    "ngcm_calibrated_fixed_cutoff":  "#eb7900",
+    "ngcm_calibrated_ref":            "#eb7900",
     "ngcm_calibrated":                "#eb7900",
     "blended_model":                  "#ca1b00",
     "ngcm_cal":                       "#eb7900",
@@ -120,9 +120,9 @@ METRIC_COLORS = {
 }
 
 RELIABILITY_COLORS = {
-    "ngcm_clim_mok_date_raw":          "#c49a2c",
+    "ngcm_fixed_cutoff_raw":          "#c49a2c",
     "ngcm_raw":                        "#c49a2c",
-    "ngcm_calibrated_clim_mok_date":   "#eb7900",
+    "ngcm_calibrated_fixed_cutoff":   "#eb7900",
     "ngcm_calibrated":                 "#eb7900",
     "blended_model":                   "#ca1b00",
 }
@@ -130,8 +130,8 @@ RELIABILITY_COLORS = {
 MODEL_COLORS_WEEKLY = {
     "unc_clim_raw":                   "#237192",
     "clim_raw":                       "#70c8d4",
-    "ngcm_calibrated_clim_mok_date":  "#eb7900",
-    "ngcm_calibrated_mok":            "#eb7900",
+    "ngcm_calibrated_fixed_cutoff":  "#eb7900",
+    "ngcm_calibrated_ref":            "#eb7900",
     "blended_model":                  "#ca1b00",
 }
 
@@ -142,25 +142,36 @@ FIG2_MODEL_COLORS = {**MODEL_COLORS_CORE}
 
 PATHS = {
     "summary_1965_1978":              "Monsoon_Data/results/2025_model_evaluation/summary_models_1965_1978.pkl",
-    "summary_1965_1978_clim_mok_date": "Monsoon_Data/results/2025_model_evaluation/summary_models_1965_1978_clim_mok_date.pkl",
-    "summary_1965_1978_no_mok_filter": "Monsoon_Data/results/2025_model_evaluation/summary_models_1965_1978_no_mok_filter.pkl",
+    "summary_1965_1978_fixed_cutoff": "Monsoon_Data/results/2025_model_evaluation/summary_models_1965_1978_clim_mok_date.pkl",
+    "summary_1965_1978_no_ref_filter": "Monsoon_Data/results/2025_model_evaluation/summary_models_1965_1978_no_mok_filter.pkl",
     "summary_2000_2024":              "Monsoon_Data/results/2025_model_evaluation/summary_models_2000_2024.pkl",
-    "summary_2000_2024_clim_mok_date": "Monsoon_Data/results/2025_model_evaluation/summary_models_2000_2024_clim_mok_date.pkl",
-    "summary_2000_2024_no_mok_filter": "Monsoon_Data/results/2025_model_evaluation/summary_models_2000_2024_no_mok_filter.pkl",
+    "summary_2000_2024_fixed_cutoff": "Monsoon_Data/results/2025_model_evaluation/summary_models_2000_2024_clim_mok_date.pkl",
+    "summary_2000_2024_no_ref_filter": "Monsoon_Data/results/2025_model_evaluation/summary_models_2000_2024_no_mok_filter.pkl",
     "summary_2025_mr":                "Monsoon_Data/results/2025_model_evaluation/evaluation/model_metrics_sent_vs_mr_mok_year.pkl",
     "yearly_1965_1978":               "Monsoon_Data/results/2025_model_evaluation/yearly_metrics_global_1965_1978.pkl",
-    "yearly_1965_1978_clim_mok_date": "Monsoon_Data/results/2025_model_evaluation/yearly_metrics_global_clim_mok_date_1965_1978.pkl",
-    "yearly_1965_1978_no_mok_filter": "Monsoon_Data/results/2025_model_evaluation/yearly_metrics_global_no_mok_filter_1965_1978.pkl",
+    "yearly_1965_1978_fixed_cutoff": "Monsoon_Data/results/2025_model_evaluation/yearly_metrics_global_clim_mok_date_1965_1978.pkl",
+    "yearly_1965_1978_no_ref_filter": "Monsoon_Data/results/2025_model_evaluation/yearly_metrics_global_no_mok_filter_1965_1978.pkl",
     "yearly_2000_2024":               "Monsoon_Data/results/2025_model_evaluation/yearly_metrics_global_2000_2024.pkl",
-    "yearly_2000_2024_clim_mok_date": "Monsoon_Data/results/2025_model_evaluation/yearly_metrics_global_clim_mok_date_2000_2024.pkl",
-    "yearly_2000_2024_no_mok_filter": "Monsoon_Data/results/2025_model_evaluation/yearly_metrics_global_no_mok_filter_2000_2024.pkl",
+    "yearly_2000_2024_fixed_cutoff": "Monsoon_Data/results/2025_model_evaluation/yearly_metrics_global_clim_mok_date_2000_2024.pkl",
+    "yearly_2000_2024_no_ref_filter": "Monsoon_Data/results/2025_model_evaluation/yearly_metrics_global_no_mok_filter_2000_2024.pkl",
     "yearly_2025":                    "Monsoon_Data/results/2025_model_evaluation/yearly_metrics_2025.pkl",
-    "yearly_2025_clim_mok_date":      "Monsoon_Data/results/2025_model_evaluation/yearly_metrics_2025_clim_mok_date.pkl",
-    "yearly_2025_no_mok_filter":      "Monsoon_Data/results/2025_model_evaluation/yearly_metrics_2025_no_mok_filter.pkl",
+    "yearly_2025_fixed_cutoff":      "Monsoon_Data/results/2025_model_evaluation/yearly_metrics_2025_clim_mok_date.pkl",
+    "yearly_2025_no_ref_filter":      "Monsoon_Data/results/2025_model_evaluation/yearly_metrics_2025_no_mok_filter.pkl",
     "reliability_dir":                "Monsoon_Data/results/2025_model_evaluation/calibration plots",
     "cell_metrics_2000_2024":         "Monsoon_Data/results/2025_model_evaluation/cell_metrics_2000_2024.pkl",
-    "india_boundary_path":            "Monsoon_Data/maps/india_boundary.csv",
+    "boundary_path":                  "Monsoon_Data/maps/india_boundary.csv",
 }
+
+# Retarget without editing code: the results base dir and boundary file can be
+# overridden via env vars. Defaults above are region-specific example paths
+# (values may be region-named; the keys/knobs are generic).
+_RESULTS_BASE = "Monsoon_Data/results/2025_model_evaluation"
+_results_dir = os.environ.get("BLEND_RESULTS_DIR", _RESULTS_BASE)
+if _results_dir != _RESULTS_BASE:
+    PATHS = {k: (v.replace(_RESULTS_BASE, _results_dir) if isinstance(v, str) else v)
+             for k, v in PATHS.items()}
+if os.environ.get("BLEND_BOUNDARY_PATH"):
+    PATHS["boundary_path"] = os.environ["BLEND_BOUNDARY_PATH"]
 
 
 # ---------------------- 3. HELPERS ----------------------
@@ -299,7 +310,7 @@ def build_overall_variant(summ_main, summ_hist, summ_2025,
                           variant_suffix, ngcm_pref_order=None):
     """Build overall metrics plots for one data variant."""
     if ngcm_pref_order is None:
-        ngcm_pref_order = {"ngcm_calibrated_clim_mok_date": 1, "ngcm_calibrated": 2}
+        ngcm_pref_order = {"ngcm_calibrated_fixed_cutoff": 1, "ngcm_calibrated": 2}
 
     ngcm_variants = list(ngcm_pref_order.keys())
     pool_parts = [add_period_tag(summ_main, "2000-2024"),
@@ -367,42 +378,42 @@ def main():
 
     # ---------------------- 4. READ DATA ----------------------
     summ_1965_1978              = safe_read_pkl(PATHS["summary_1965_1978"])
-    summ_1965_1978_clim_mok_date = optional_read_pkl(PATHS["summary_1965_1978_clim_mok_date"])
-    summ_1965_1978_no_mok_filter = optional_read_pkl(PATHS["summary_1965_1978_no_mok_filter"])
+    summ_1965_1978_fixed_cutoff = optional_read_pkl(PATHS["summary_1965_1978_fixed_cutoff"])
+    summ_1965_1978_no_ref_filter = optional_read_pkl(PATHS["summary_1965_1978_no_ref_filter"])
     summ_2000_2024              = safe_read_pkl(PATHS["summary_2000_2024"])
-    summ_2000_2024_clim_mok_date = safe_read_pkl(PATHS["summary_2000_2024_clim_mok_date"])
-    summ_2000_2024_no_mok_filter = safe_read_pkl(PATHS["summary_2000_2024_no_mok_filter"])
+    summ_2000_2024_fixed_cutoff = safe_read_pkl(PATHS["summary_2000_2024_fixed_cutoff"])
+    summ_2000_2024_no_ref_filter = safe_read_pkl(PATHS["summary_2000_2024_no_ref_filter"])
     summ_2025_mr                = optional_read_pkl(PATHS["summary_2025_mr"])
 
     yearly_1965_1978              = safe_read_pkl(PATHS["yearly_1965_1978"])
-    yearly_1965_1978_clim_mok_date = optional_read_pkl(PATHS["yearly_1965_1978_clim_mok_date"])
-    yearly_1965_1978_no_mok_filter = optional_read_pkl(PATHS["yearly_1965_1978_no_mok_filter"])
+    yearly_1965_1978_fixed_cutoff = optional_read_pkl(PATHS["yearly_1965_1978_fixed_cutoff"])
+    yearly_1965_1978_no_ref_filter = optional_read_pkl(PATHS["yearly_1965_1978_no_ref_filter"])
     yearly_2000_2024              = safe_read_pkl(PATHS["yearly_2000_2024"])
-    yearly_2000_2024_clim_mok_date = safe_read_pkl(PATHS["yearly_2000_2024_clim_mok_date"])
-    yearly_2000_2024_no_mok_filter = safe_read_pkl(PATHS["yearly_2000_2024_no_mok_filter"])
+    yearly_2000_2024_fixed_cutoff = safe_read_pkl(PATHS["yearly_2000_2024_fixed_cutoff"])
+    yearly_2000_2024_no_ref_filter = safe_read_pkl(PATHS["yearly_2000_2024_no_ref_filter"])
 
     yearly_2025              = optional_read_pkl(PATHS["yearly_2025"])
-    yearly_2025_clim_mok_date = optional_read_pkl(PATHS["yearly_2025_clim_mok_date"])
-    yearly_2025_no_mok_filter = optional_read_pkl(PATHS["yearly_2025_no_mok_filter"])
+    yearly_2025_fixed_cutoff = optional_read_pkl(PATHS["yearly_2025_fixed_cutoff"])
+    yearly_2025_no_ref_filter = optional_read_pkl(PATHS["yearly_2025_no_ref_filter"])
 
     # Append 2025 to yearly series if available
     if yearly_2025 is not None and yearly_2000_2024 is not None:
         yearly_2000_2024 = pd.concat([yearly_2000_2024, yearly_2025], ignore_index=True)
-    if yearly_2025_clim_mok_date is not None and yearly_2000_2024_clim_mok_date is not None:
-        yearly_2000_2024_clim_mok_date = pd.concat(
-            [yearly_2000_2024_clim_mok_date, yearly_2025_clim_mok_date], ignore_index=True
+    if yearly_2025_fixed_cutoff is not None and yearly_2000_2024_fixed_cutoff is not None:
+        yearly_2000_2024_fixed_cutoff = pd.concat(
+            [yearly_2000_2024_fixed_cutoff, yearly_2025_fixed_cutoff], ignore_index=True
         )
-    if yearly_2025_no_mok_filter is not None and yearly_2000_2024_no_mok_filter is not None:
-        yearly_2000_2024_no_mok_filter = pd.concat(
-            [yearly_2000_2024_no_mok_filter, yearly_2025_no_mok_filter], ignore_index=True
+    if yearly_2025_no_ref_filter is not None and yearly_2000_2024_no_ref_filter is not None:
+        yearly_2000_2024_no_ref_filter = pd.concat(
+            [yearly_2000_2024_no_ref_filter, yearly_2025_no_ref_filter], ignore_index=True
         )
 
     required_cols = ["model", "brier_skill", "rps_skill", "auc"]
     for df, lbl in [
         (summ_1965_1978, "summ_1965_1978"),
         (summ_2000_2024, "summ_2000_2024"),
-        (summ_2000_2024_clim_mok_date, "summ_2000_2024_clim_mok_date"),
-        (summ_2000_2024_no_mok_filter, "summ_2000_2024_no_mok_filter"),
+        (summ_2000_2024_fixed_cutoff, "summ_2000_2024_fixed_cutoff"),
+        (summ_2000_2024_no_ref_filter, "summ_2000_2024_no_ref_filter"),
     ]:
         check_required_cols(df, required_cols, lbl)
 
@@ -413,8 +424,8 @@ def main():
         pool_parts.append(add_period_tag(summ_2025_mr, "2025_MR"))
     first_pool = pd.concat(pool_parts, ignore_index=True)
 
-    ngcm_variants = ["ngcm_calibrated_clim_mok_date", "ngcm_calibrated"]
-    ngcm_pref     = {"ngcm_calibrated_clim_mok_date": 1, "ngcm_calibrated": 2}
+    ngcm_variants = ["ngcm_calibrated_fixed_cutoff", "ngcm_calibrated"]
+    ngcm_pref     = {"ngcm_calibrated_fixed_cutoff": 1, "ngcm_calibrated": 2}
     first_pool["_ngcm_rank"] = first_pool["model"].apply(lambda m: ngcm_pref.get(m, 0))
     first_pool["model"] = first_pool["model"].apply(
         lambda m: "ngcm_cal" if m in ngcm_variants else m
@@ -440,43 +451,43 @@ def main():
         out_dir=OUTPUT_DIR,
     )
 
-    # Variant: clim_mok_date
-    if summ_2000_2024_clim_mok_date is not None:
+    # Variant: fixed_cutoff
+    if summ_2000_2024_fixed_cutoff is not None:
         build_overall_variant(
-            summ_2000_2024_clim_mok_date,
-            summ_1965_1978_clim_mok_date if summ_1965_1978_clim_mok_date is not None else summ_1965_1978,
+            summ_2000_2024_fixed_cutoff,
+            summ_1965_1978_fixed_cutoff if summ_1965_1978_fixed_cutoff is not None else summ_1965_1978,
             summ_2025_mr,
-            "_clim_mok_date",
+            "_fixed_cutoff",
         )
 
-    # Variant: no_mok_filter
-    if summ_2000_2024_no_mok_filter is not None:
+    # Variant: no_ref_filter
+    if summ_2000_2024_no_ref_filter is not None:
         build_overall_variant(
-            summ_2000_2024_no_mok_filter,
-            summ_1965_1978_no_mok_filter if summ_1965_1978_no_mok_filter is not None else summ_1965_1978,
+            summ_2000_2024_no_ref_filter,
+            summ_1965_1978_no_ref_filter if summ_1965_1978_no_ref_filter is not None else summ_1965_1978,
             summ_2025_mr,
-            "_no_mok_filter",
+            "_no_ref_filter",
             ngcm_pref_order={"ngcm_calibrated": 1},
         )
 
     # ---------------------- 7. MODEL COMPARISONS (FIG 4 STYLE) ----------------------
-    models_clim_mok_date_bars = [
-        "clim_raw", "ngcm_clim_mok_date_raw", "aifs_calibrated_clim_mok_date",
-        "ngcm_calibrated_clim_mok_date", "ngcm_blend", "int_all",
-        "mme_clim_mok_date_clim_raw_opt_rps", "blended_model",
+    models_fixed_cutoff_bars = [
+        "clim_raw", "ngcm_fixed_cutoff_raw", "aifs_calibrated_fixed_cutoff",
+        "ngcm_calibrated_fixed_cutoff", "ngcm_blend", "int_all",
+        "mme_fixed_cutoff_clim_raw_opt_rps", "blended_model",
     ]
-    models_no_mok_filter = [
+    models_no_ref_filter = [
         "clim_raw", "ngcm_raw", "aifs_calibrated", "ngcm_calibrated",
-        "ngcm_blend", "int_all", "mme_no_mok_filter_clim_raw_opt_rps", "blended_model",
+        "ngcm_blend", "int_all", "mme_no_ref_filter_clim_raw_opt_rps", "blended_model",
     ]
 
     for summ_df, model_list, title_suffix, file_stem in [
-        (summ_2000_2024,              models_clim_mok_date_bars, "2000-2024",                    "skill_comparison_2000_2024"),
-        (summ_2000_2024_clim_mok_date, models_clim_mok_date_bars, "2000-2024, Climatological MOK Filter", "skill_comparison_2000_2024_clim_mok_date_filter"),
-        (summ_2000_2024_no_mok_filter, models_no_mok_filter,      "2000-2024, No MOK Filter",   "skill_comparison_2000_2024_no_mok_filter"),
-        (summ_1965_1978,              models_clim_mok_date_bars, "1965-1978",                    "skill_comparison_1965_1978"),
-        (summ_1965_1978_clim_mok_date, models_clim_mok_date_bars, "1965-1978, Climatological MOK Filter", "skill_comparison_1965_1978_clim_mok_date_filter"),
-        (summ_1965_1978_no_mok_filter, models_no_mok_filter,      "1965-1978, No MOK Filter",   "skill_comparison_1965_1978_no_mok_filter"),
+        (summ_2000_2024,              models_fixed_cutoff_bars, "2000-2024",                    "skill_comparison_2000_2024"),
+        (summ_2000_2024_fixed_cutoff, models_fixed_cutoff_bars, "2000-2024, Climatological MOK Filter", "skill_comparison_2000_2024_fixed_cutoff_filter"),
+        (summ_2000_2024_no_ref_filter, models_no_ref_filter,      "2000-2024, No MOK Filter",   "skill_comparison_2000_2024_no_ref_filter"),
+        (summ_1965_1978,              models_fixed_cutoff_bars, "1965-1978",                    "skill_comparison_1965_1978"),
+        (summ_1965_1978_fixed_cutoff, models_fixed_cutoff_bars, "1965-1978, Climatological MOK Filter", "skill_comparison_1965_1978_fixed_cutoff_filter"),
+        (summ_1965_1978_no_ref_filter, models_no_ref_filter,      "1965-1978, No MOK Filter",   "skill_comparison_1965_1978_no_ref_filter"),
     ]:
         make_fig4_variant(summ_df, model_list, title_suffix, file_stem, OUTPUT_DIR)
 
@@ -484,8 +495,8 @@ def main():
     for summ_df, title_suffix, variant, file_stem in [
         (summ_1965_1978,              "1965-1978",                            "standard",       "skill_by_week_1965_1978"),
         (summ_2000_2024,              "2000-2024",                            "standard",       "skill_by_week_2000_2024"),
-        (summ_2000_2024_clim_mok_date, "2000-2024 (Climatological MOK Filter)", "clim_mok_date", "skill_by_week_2000_2024_clim_mok_date_filter"),
-        (summ_2000_2024_no_mok_filter, "2000-2024 (No MOK Filter)",            "no_mok_filter", "skill_by_week_2000_2024_no_mok_filter"),
+        (summ_2000_2024_fixed_cutoff, "2000-2024 (Climatological MOK Filter)", "fixed_cutoff", "skill_by_week_2000_2024_fixed_cutoff_filter"),
+        (summ_2000_2024_no_ref_filter, "2000-2024 (No MOK Filter)",            "no_ref_filter", "skill_by_week_2000_2024_no_ref_filter"),
     ]:
         if summ_df is None:
             continue
@@ -513,10 +524,10 @@ def main():
         (yearly_1965_1978,              "1965-1978",   "yearly_metrics_by_model_1965_1978",   None),
         (yearly_2000_2024,              "2000-2025" if (yearly_2000_2024 is not None and 2025 in yearly_2000_2024.get("year", pd.Series()).values) else "2000-2024",
                                                         "yearly_metrics_by_model_2000_2024",   None),
-        (yearly_2000_2024_clim_mok_date, "2000-2025 (Climatological MOK Filter)" if (yearly_2000_2024_clim_mok_date is not None and 2025 in yearly_2000_2024_clim_mok_date.get("year", pd.Series()).values) else "2000-2024 (Climatological MOK Filter)",
-                                                        "yearly_metrics_by_model_2000_2024_clim_mok_date", None),
-        (yearly_2000_2024_no_mok_filter, "2000-2025 (No MOK Filter)" if (yearly_2000_2024_no_mok_filter is not None and 2025 in yearly_2000_2024_no_mok_filter.get("year", pd.Series()).values) else "2000-2024 (No MOK Filter)",
-                                                        "yearly_metrics_by_model_2000_2024_no_mok_filter", "ngcm_calibrated"),
+        (yearly_2000_2024_fixed_cutoff, "2000-2025 (Climatological MOK Filter)" if (yearly_2000_2024_fixed_cutoff is not None and 2025 in yearly_2000_2024_fixed_cutoff.get("year", pd.Series()).values) else "2000-2024 (Climatological MOK Filter)",
+                                                        "yearly_metrics_by_model_2000_2024_fixed_cutoff", None),
+        (yearly_2000_2024_no_ref_filter, "2000-2025 (No MOK Filter)" if (yearly_2000_2024_no_ref_filter is not None and 2025 in yearly_2000_2024_no_ref_filter.get("year", pd.Series()).values) else "2000-2024 (No MOK Filter)",
+                                                        "yearly_metrics_by_model_2000_2024_no_ref_filter", "ngcm_calibrated"),
     ]:
         if yearly_df is None:
             continue
@@ -543,11 +554,11 @@ def main():
     # ---------------------- 9b. COMBINED FIG 2 ----------------------
     for summ_df, yearly_df, variant, file_stem in [
         (summ_2000_2024,              yearly_2000_2024,              "standard",       "fig2_combined_2000_2024"),
-        (summ_2000_2024_clim_mok_date, yearly_2000_2024_clim_mok_date, "clim_mok_date", "fig2_combined_2000_2024_clim_mok_date"),
-        (summ_2000_2024_no_mok_filter, yearly_2000_2024_no_mok_filter, "no_mok_filter", "fig2_combined_2000_2024_no_mok_filter"),
+        (summ_2000_2024_fixed_cutoff, yearly_2000_2024_fixed_cutoff, "fixed_cutoff", "fig2_combined_2000_2024_fixed_cutoff"),
+        (summ_2000_2024_no_ref_filter, yearly_2000_2024_no_ref_filter, "no_ref_filter", "fig2_combined_2000_2024_no_ref_filter"),
         (summ_1965_1978,              yearly_1965_1978,              "standard",       "fig2_combined_1965_1978"),
-        (summ_1965_1978_clim_mok_date, yearly_1965_1978_clim_mok_date, "clim_mok_date", "fig2_combined_1965_1978_clim_mok_date"),
-        (summ_1965_1978_no_mok_filter, yearly_1965_1978_no_mok_filter, "no_mok_filter", "fig2_combined_1965_1978_no_mok_filter"),
+        (summ_1965_1978_fixed_cutoff, yearly_1965_1978_fixed_cutoff, "fixed_cutoff", "fig2_combined_1965_1978_fixed_cutoff"),
+        (summ_1965_1978_no_ref_filter, yearly_1965_1978_no_ref_filter, "no_ref_filter", "fig2_combined_1965_1978_no_ref_filter"),
     ]:
         if summ_df is None or yearly_df is None:
             continue
@@ -572,12 +583,12 @@ def main():
     os.makedirs(rel_out_dir, exist_ok=True)
 
     reliability_configs = [
-        {"period_tag": "2000_2024",          "label": "2000_2024",             "models": ["ngcm_clim_mok_date_raw", "ngcm_calibrated_clim_mok_date", "blended_model"]},
-        {"period_tag": "clim_mok_date_2000_2024", "label": "2000_2024_clim_mok_date", "models": ["ngcm_clim_mok_date_raw", "ngcm_calibrated_clim_mok_date", "blended_model"]},
-        {"period_tag": "no_mok_filter_2000_2024", "label": "2000_2024_no_mok_filter", "models": ["ngcm_raw", "ngcm_calibrated", "blended_model"]},
-        {"period_tag": "1965_1978",          "label": "1965_1978",             "models": ["ngcm_clim_mok_date_raw", "ngcm_calibrated_clim_mok_date", "blended_model"]},
-        {"period_tag": "clim_mok_date_1965_1978", "label": "1965_1978_clim_mok_date", "models": ["ngcm_clim_mok_date_raw", "ngcm_calibrated_clim_mok_date", "blended_model"]},
-        {"period_tag": "no_mok_filter_1965_1978", "label": "1965_1978_no_mok_filter", "models": ["ngcm_raw", "ngcm_calibrated", "blended_model"]},
+        {"period_tag": "2000_2024",          "label": "2000_2024",             "models": ["ngcm_fixed_cutoff_raw", "ngcm_calibrated_fixed_cutoff", "blended_model"]},
+        {"period_tag": "fixed_cutoff_2000_2024", "label": "2000_2024_fixed_cutoff", "models": ["ngcm_fixed_cutoff_raw", "ngcm_calibrated_fixed_cutoff", "blended_model"]},
+        {"period_tag": "no_ref_filter_2000_2024", "label": "2000_2024_no_ref_filter", "models": ["ngcm_raw", "ngcm_calibrated", "blended_model"]},
+        {"period_tag": "1965_1978",          "label": "1965_1978",             "models": ["ngcm_fixed_cutoff_raw", "ngcm_calibrated_fixed_cutoff", "blended_model"]},
+        {"period_tag": "fixed_cutoff_1965_1978", "label": "1965_1978_fixed_cutoff", "models": ["ngcm_fixed_cutoff_raw", "ngcm_calibrated_fixed_cutoff", "blended_model"]},
+        {"period_tag": "no_ref_filter_1965_1978", "label": "1965_1978_no_ref_filter", "models": ["ngcm_raw", "ngcm_calibrated", "blended_model"]},
     ]
 
     for cfg in reliability_configs:
@@ -625,7 +636,7 @@ def main():
         cell_2000_2024["lat"] = pd.to_numeric(cell_2000_2024["lat"], errors="coerce")
         cell_2000_2024["lon"] = pd.to_numeric(cell_2000_2024["lon"], errors="coerce")
 
-#        india_map = read_india_boundary(PATHS["india_boundary_path"])
+#        boundary_map = read_boundary(PATHS["boundary_path"])
 #        if india_map is not None and "id" in india_map.columns:
 #            india_map = india_map[india_map["id"] == 253]
 

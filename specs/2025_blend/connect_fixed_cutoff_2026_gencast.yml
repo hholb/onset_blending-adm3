@@ -1,10 +1,9 @@
-mode: "clim_mok_date"
-input_rds: "Monsoon_Data/Processed_Data/2026/combine_template_clim_mok_date_2026_ngcm_combined_wide.pkl"
-#output_rds: "Monsoon_Data/Processed_Data/2025_pipeline_input/cv_data_clim_mok_date_new_pipeline.pkl"
-output_rds: "Monsoon_Data/Processed_Data/2026/cv_data_clim_mok_date_new_pipeline_2026.pkl"
+mode: "fixed_cutoff"
+input_rds: "Monsoon_Data/Processed_Data/2026/combine_template_fixed_cutoff_2026_gencast_combined_wide.pkl"
+output_rds: "Monsoon_Data/Processed_Data/2026/cv_data_fixed_cutoff_new_pipeline_2026_gencast.pkl"
 day_max: 28
-days_per_week: 7
-n_weeks: 4
+days_per_bin: 7
+n_bins: 4
 
 climatology:
   base_prefix: "clim"
@@ -13,23 +12,23 @@ climatology:
 
 
 #forecast_models:
-#  - name: ngcm
-#    variants: [clim_mok_date]
+#  - name: gencast
+#    variants: [fixed_cutoff]
 #    rain_predictors: [diff_5day, min_10day]
 #  - name: aifs
-#    variants: [clim_mok_date]
+#    variants: [fixed_cutoff]
 #    rain_predictors: [diff_5day, min_10day, max_5day]
 
 
 forecast_models:
-  - name: ngcm
+  - name: gencast
   #- name: aifs_ens
-    variants: [clim_mok_date]
+    variants: [fixed_cutoff]
     rain_predictors:
       - { agg: diff, window: 3 }
 #      - { agg: min,  window: 7 }
   - name: aifs
-    variants: [clim_mok_date]
+    variants: [fixed_cutoff]
     rain_predictors:
       - { agg: diff, window: 3 }
 #      - { agg: min,  window: 7 }

@@ -26,7 +26,7 @@ Usage (run from repo root)
         --input_file Monsoon_Data/results/wet_spell_aifs_aifs_ens/exports/blend_output_summary_20220617.csv \\
         [--output_path predict/output/] \\
         [--region Ethiopia] \\
-        [--mok] \\
+        [--ref_onset] \\
         [--all_cells_file Monsoon_Data/dissemination_cells.csv] \\
         [--zoom_to_data]
         """,
@@ -41,10 +41,16 @@ Usage (run from repo root)
                              "Default: predict/output/")
     parser.add_argument("--region", default="Ethiopia",
                         help="Region name passed to make_maps. Default: Ethiopia")
-    parser.add_argument("--mok", action="store_true",
+    parser.add_argument("--ref_onset", action="store_true",
                         help="If set, overlay MOK date on maps.")
     parser.add_argument("--all_cells_file", default=None,
                         help="Optional path to all-cells CSV for background plotting.")
+    parser.add_argument("--shapefile", default=None,
+                        help="adm3 boundary shapefile (must contain 'adm3_name'). "
+                             "Default: predict/data/shapefile/manual_zones_woredas.shp")
+    parser.add_argument("--adm2_shapefile", default=None,
+                        help="Optional adm2 shapefile for zone overlays/labels "
+                             "(must contain 'adm2_name'). Defaults to the adm3 shapefile.")
     parser.add_argument("--zoom_to_data", action="store_true",
                         help="If set, zoom map extent to data bounds.")
     args = parser.parse_args()
@@ -70,8 +76,10 @@ Usage (run from repo root)
     make_maps(
         summary,
         output_path=Path(args.output_path),
-        mok=args.mok,
+        ref_onset=args.ref_onset,
         all_cells_file=args.all_cells_file,
+        woreda_shapefile=args.shapefile,
+        adm2_shapefile=args.adm2_shapefile,
         use_cartopy=True,
         region=args.region,
         zoom_to_data=args.zoom_to_data,

@@ -4,18 +4,34 @@ Converts raw NetCDF rainfall data (IMD ground truth, NeuralGCM and AIFS forecast
 
 ## Stages
 
+### Stage 0 (optional): `0_regrid_to_shapefile.py`
+
+Regrids gridded rainfall onto a shapefile's admin units before Stage 1 (spec in `specs/regrid/`). Builds grid→unit area weights, restricts them to cells that actually have ground-truth data (renormalized to sum to 1 per unit), and applies those **same** weights to both the ground truth and the forecasts so they share one spatial footprint. Regridding is applied to rainfall, not to probabilities. Source-to-target weights are compiled into a sparse matrix and applied in bounded value chunks. Writes `<name>_adm3.nc` beside each input; point the Stage-1 specs at those. See "Re-targeting to a New Geography" in the top-level README.
+
 ### Stage 1: `1_process_raw_nc_files.py`
 
 Reads raw NetCDF files, detects monsoon onset per grid cell using the configured onset definition, and writes wide-format pickle tables.
 
 - **Forecast systems** (e.g., `--spec_id ngcm`): Produces per-ensemble-member onset probabilities across lead days.
-- **Ground truth** (e.g., `--spec_id imd_clim_mok_date`): Produces observed onset dates and long/wide rainfall tables.
+- **Ground truth** (e.g., `--spec_id ref_rain_fixed_cutoff`): Produces observed onset dates and a wide rainfall table, plus an optional annotated daily-long table.
+
+When a spec selects multiple NetCDF files, `input.parallel: true` processes
+independent files in separate processes using up to `input.workers` workers.
+Results are collected in deterministic year/file order. Parallel execution is
+skipped for a single file or one worker; `input.parallel: false` retains the
+serial path.
 
 The onset definition is fully configurable from the spec under `options.onset_definition`. Two dry-spell veto modes are supported: `consecutive_dry` (new definition) and `window_sum` (original Moron-Robertson definition). All numerical parameters — trigger window, wet-day threshold, accumulation threshold, follow-up period, and dry-spell check — are set in the yml. See [Onset Definition](#onset-definition) below.
 
 ### Stage 2: `2_build_climatology.py`
 
 Fits per-cell KDE climatology models from historical IMD onset dates and produces issue-date probability forecasts over lead days. Supports multiple training windows defined in the spec. One convention to note is that for unconditional climatology (`clim_unc`) a "day 0" forecast stores the probability that onset occurred before the forecast date.
+
+Compatible conditional and unconditional runs are built together automatically,
+sharing the KDE calculations while preserving the existing output tables and
+filenames. Set `climatology_runtime.workers` in the raw-data spec (or the
+`CLIM_WORKERS` environment variable) to process bounded cell chunks in parallel;
+temporary chunk files are removed when the run completes.
 
 ### Stage 3: `3_combine_datasets.py`
 
@@ -29,22 +45,22 @@ All commands run from the repository root:
 
 ```bash
 # Ground truth
-python python/pipelines/prepare_data/1_process_raw_nc_files.py --spec_id imd_clim_mok_date
-python python/pipelines/prepare_data/2_build_climatology.py --spec_id imd_clim_mok_date
+python python/pipelines/prepare_data/1_process_raw_nc_files.py --spec_id ref_rain_fixed_cutoff
+python python/pipelines/prepare_data/2_build_climatology.py --spec_id ref_rain_fixed_cutoff
 
 # Forecast systems
 python python/pipelines/prepare_data/1_process_raw_nc_files.py --spec_id ngcm
 python python/pipelines/prepare_data/1_process_raw_nc_files.py --spec_id aifs
 
 # Combine
-python python/pipelines/prepare_data/3_combine_datasets.py --spec_id combine_template_clim_mok_date_2025
+python python/pipelines/prepare_data/3_combine_datasets.py --spec_id combine_template_fixed_cutoff_2025
 ```
 
 ---
 
 ## Spec Files
 
-- **`specs/raw_data/*.yml`**: One per data source. Key fields: `type` (`ground_truth_rainfall` / `rainfall_forecast`), `input.nc_folder`, `output.out_dir`, `options.onset_definition`, `thresholds`, `mok`, `paths.climatology_out_dir`, `climatologies`.
+- **`specs/raw_data/*.yml`**: One per data source. Key fields: `type` (`ground_truth_rainfall` / `rainfall_forecast`), `input.nc_folder`, `output.out_dir`, optional `output.write_long`, `options.onset_definition`, `thresholds`, `ref_onset`, `paths.climatology_out_dir`, `climatologies`.
 - **`specs/combine/*.yml`**: One per combination template. Key fields: `input.ground_truth_wide_rds`, `input.climatologies`, `forecasts`, `output.out_dir`.
 
 ---
@@ -144,6 +160,16 @@ In addition to the general requirements:
 - **Lead-day dimension**: A dimension for forecast lead days (e.g., `day`), specified via `input.wide_day_dim`. Values should be positive integers.
 - **Ensemble dimension** (optional): A `number` dimension for ensemble members. The spec can filter to a maximum number of members via `filter.max_number`.
 - **Day range**: The spec's `options.min_day` and `options.max_day` control which lead days are kept. The file should contain at least days in `[min_day, max_day + window - 1]`.
+- **Fixed rainfall horizon** (optional): setting `options.rain_day_max: N` activates strict validation. By default, the NetCDF lead coordinate must be exactly `1..N`, and every retained issue date, ensemble member, and spatial cell must have finite rainfall throughout that range. Use the same `rain_day_max` for the model in the connect spec. Omitting it preserves legacy raw-input behavior. Set `options.rain_horizon_policy: truncate` only when later source days intentionally exist but features must stop at `N`; days `1..N` are still validated strictly.
+
+Example for a forecast system with exactly 15 available days:
+
+```yaml
+options:
+  min_day: 1
+  max_day: 15
+  rain_day_max: 15
+```
 
 ### Ground Truth NetCDF Requirements (`type: "ground_truth_rainfall"`)
 
@@ -156,11 +182,15 @@ In addition to the general requirements:
 ### Optional: Cell Transform (Regridding)
 
 When `options.cell_transform_enabled: true`, a CSV weights file is required with columns:
-- `target_id`: Grid cell ID on the target grid (format `"lat_lon"`)
-- `source_id`: Grid cell ID on the source grid
-- `weight`: Linear combination weight (weights for a given `target_id` should sum to 1)
+- `target_id`: Stable ID of the target grid cell or administrative unit
+- `source_id`: Stable ID of the contributing source cell or unit
+- `weight`: Finite, non-negative overlap weight; zero-weight rows are ignored, each source/target pair must be unique, and every target must have positive total weight
 
-Thresholds must match the target grid when cell transform is enabled.
+The transform is applied before target/dissemination filtering. For each target,
+weights are renormalized over source cells with finite rainfall; if none are
+observed, the transformed rainfall remains missing. The same sparse observed-weight
+engine is used for forecast and ground-truth transforms. Thresholds must match
+the target units when cell transform is enabled.
 
 ---
 
@@ -178,13 +208,13 @@ One row per (grid cell, initialization date, year). Ensemble members are aggrega
 | `time` | date | Forecast initialization date |
 | `year` | int | Year (from filename) |
 | `onset_thresh` | float | Per-cell onset accumulation threshold (mm) |
-| `mok_date` | date | MOK date for this year (or NaT) |
+| `ref_onset_date` | date | MOK date for this year (or NaT) |
 | `forecast_rain_day_<k>` | float | Ensemble mean rainfall on lead day k |
 | `forecast_rain_sd_day_<k>` | float | Ensemble std dev of rainfall on lead day k |
 | `frac_raining_day_<k>` | float | Fraction of members with rainfall >= 1mm on day k |
 | `predicted_prob_day_<k>` | float | Onset probability on day k (raw, no start restriction) |
-| `predicted_prob_clim_mok_date_day_<k>` | float | Onset probability on day k (restricted to after June 2) |
-| `predicted_prob_mok_day_<k>` | float | Onset probability on day k (restricted to after MOK date) |
+| `predicted_prob_fixed_cutoff_day_<k>` | float | Onset probability on day k (restricted to after June 2) |
+| `predicted_prob_ref_day_<k>` | float | Onset probability on day k (restricted to after MOK date) |
 
 #### Ground truth wide table (`<spec_id>_wide.pkl`)
 
@@ -194,12 +224,16 @@ One row per (grid cell, year).
 |--------|------|-------------|
 | `id` | str | Grid cell ID |
 | `year` | int | Year |
-| `mr_onset_idx` | float | Index (position in daily series) of onset |
-| `mr_onset_date` | date | Calendar date of onset |
-| `mr_onset_day` | float | Days from `cutoff_month_day` to onset (e.g., days since May 1) |
+| `onset_idx` | float | Index (position in daily series) of onset |
+| `onset_date` | date | Calendar date of onset |
+| `onset_day` | float | Days from `cutoff_month_day` to onset (e.g., days since May 1) |
 | `cutoff_date` | date | Season start date for that year |
 
-#### Ground truth long table (`<spec_id>_long.pkl`)
+#### Ground truth long table (`<spec_id>_long.pkl`, optional)
+
+Set `output.write_long: false` to skip constructing and writing this diagnostic
+artifact. The default is `true` for backward compatibility. The wide onset
+table used by climatology and blending is still written.
 
 One row per (grid cell, day). Annotated daily rainfall series.
 
@@ -210,9 +244,9 @@ One row per (grid cell, day). Annotated daily rainfall series.
 | `year` | int | Year |
 | `<value_col>` | float | Daily rainfall (mm); column name from spec (e.g., `precip`) |
 | `onset_thresh` | float | Per-cell onset threshold |
-| `mok_date` | date | MOK date for this year |
-| `mr_onset_date` | date | Onset date for this cell-year |
-| `mr_onset_flag` | bool | True on the onset date, False otherwise |
+| `ref_onset_date` | date | MOK date for this year |
+| `onset_date` | date | Onset date for this cell-year |
+| `onset_flag` | bool | True on the onset date, False otherwise |
 
 ### Stage 2 Outputs (`Processed_Data/Climatology/`)
 
@@ -247,7 +281,7 @@ One row per (grid cell, initialization date, year). All systems merged.
 | `<system>_p_onset_day_<k>` | float | Forecast system onset probability for day k (e.g., `ngcm_p_onset_day_1`) |
 | `<system>_rain_mean_day_<k>` | float | Forecast system mean rainfall for day k |
 | `<system>_onset_thresh` | float | Per-cell onset threshold (constant per cell) |
-| `<system>_mok_date` | date | MOK date (constant per year) |
+| `<system>_ref_onset_date` | date | MOK date (constant per year) |
 | `*_day_<max+1>plus` | float | Remainder bin probability (1 − sum of day bins) |
 
 Where `<system>` is `ngcm`, `aifs`, etc. and `<k>` ranges from 1 to `max_day` (typically 28 or 40).
@@ -265,7 +299,7 @@ Where `<system>` is `ngcm`, `aifs`, etc. and `<k>` ranges from 1 to `max_day` (t
 
 ## Adding a New Onset Filter Variant
 
-1. Create a new IMD spec variant in `specs/raw_data/` (e.g., `imd_new_variant.yml`) with the appropriate `mok` configuration.
+1. Create a new IMD spec variant in `specs/raw_data/` (e.g., `ref_rain_new_variant.yml`) with the appropriate `ref_onset` configuration.
 2. Run Stages 1–2 with the new spec.
 3. Create a matching combine template in `specs/combine/`.
 4. Run Stage 3 with the new combine spec.

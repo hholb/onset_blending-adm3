@@ -22,8 +22,12 @@
 # ==============================================================================
 
 import os
+import gc
+from functools import lru_cache
 import pickle
+import tempfile
 import warnings
+from multiprocessing import get_context
 import numpy as np
 import pandas as pd
 from datetime import date
@@ -67,7 +71,7 @@ def get_climatology_options_from_run(co):
         "test_year_max": int(co["test_year_max"]),
         "season_start_md": str(co["season_start_md"]),
         "issue_end_md": str(co["issue_end_md"]),
-        "onset_col": str(co.get("onset_col") or "mr_onset_day"),
+        "onset_col": str(co.get("onset_col") or "onset_day"),
         "forecast_window": int(co["forecast_window"]) if co.get("forecast_window") is not None else None,
         "horizons": co.get("horizons"),
         "conditional": bool(co["conditional"]) if co.get("conditional") is not None else True,
@@ -79,7 +83,7 @@ def get_climatology_options_from_run(co):
 # Ground-truth IO
 # ---------------------------------------------------------------------------
 
-def read_gt_onset_from_tbl(gt_tbl, onset_col="mr_onset_day", na_sentinel=None):
+def read_gt_onset_from_tbl(gt_tbl, onset_col="onset_day", na_sentinel=None):
     """
     Read and standardize ground-truth onset data from a loaded wide table.
 
@@ -299,14 +303,22 @@ def compute_d0(t, season_start_md):
     return (pd.Timestamp(t).date() - season_start).days
 
 
-def _kde_cdf(kde, x_vals):
-    """Approximate CDF from a gaussian_kde by numerical integration on a grid."""
-    x_min = kde.dataset.min() - 3 * kde.factor * kde.dataset.std()
-    x_max = kde.dataset.max() + 3 * kde.factor * kde.dataset.std()
-    grid = np.linspace(x_min, x_max, 2000)
+@lru_cache(maxsize=512)
+def _kde_cdf(kde, x_vals=None):
+    """Approximate R density()+approxfun(rule=2) CDF construction."""
+    data = kde.dataset.flatten()
+    bandwidth = kde.factor * np.std(data, ddof=1)
+    x_min = data.min() - 3 * bandwidth
+    x_max = data.max() + 3 * bandwidth
+    grid = np.linspace(x_min, x_max, 512)
     pdf_vals = kde.evaluate(grid)
     cdf_vals = np.cumsum(pdf_vals) / np.sum(pdf_vals)
-    cdf_fn = interp1d(grid, cdf_vals, bounds_error=False, fill_value=(0.0, 1.0))
+    cdf_fn = interp1d(
+        grid,
+        cdf_vals,
+        bounds_error=False,
+        fill_value=(cdf_vals[0], cdf_vals[-1]),
+    )
     return cdf_fn
 
 
@@ -386,6 +398,182 @@ def predict_from_kde(kde, d0, forecast_window, conditional=True, include_day0=Fa
     return _enforce_floor_with_target_sum(p_raw, target_sum, lb=min_prob)
 
 
+def _enforce_floor_with_target_sum_rows(p_raw, target_sum, lb=MIN_PROB,
+                                         eps=EPS):
+    """Vectorized form of ``_enforce_floor_with_target_sum`` by row."""
+    p_raw = np.asarray(p_raw, dtype=float)
+    target_sum = np.asarray(target_sum, dtype=float).copy()
+    if p_raw.ndim != 2:
+        raise ValueError("p_raw must be a two-dimensional array.")
+    if len(target_sum) != len(p_raw):
+        raise ValueError("target_sum must have one value per probability row.")
+
+    p_raw = np.maximum(p_raw, 0.0)
+    p_raw = np.where(np.isfinite(p_raw), p_raw, 0.0)
+    target_sum = np.where(
+        np.isfinite(target_sum) & (target_sum >= 0.0), target_sum, 0.0
+    )
+    target_sum = np.minimum(target_sum, 1.0)
+
+    out = np.empty_like(p_raw)
+    zero = target_sum <= eps
+    small = (~zero) & (target_sum < p_raw.shape[1] * lb)
+    normal = ~(zero | small)
+    out[zero] = 0.0
+    out[small] = target_sum[small, None] / p_raw.shape[1]
+
+    if normal.any():
+        p = np.maximum(p_raw[normal], lb)
+        excess = p.sum(axis=1) - target_sum[normal]
+        no_reduction = excess <= eps
+        adjusted = np.empty_like(p)
+        adjusted[no_reduction] = p[no_reduction]
+
+        reduce = ~no_reduction
+        if reduce.any():
+            p_reduce = p[reduce]
+            reducible = p_reduce - lb
+            reducible_sum = reducible.sum(axis=1)
+            degenerate = reducible_sum <= eps
+            reduced = np.empty_like(p_reduce)
+            targets = target_sum[normal][reduce]
+            reduced[degenerate] = (
+                targets[degenerate, None] / p_raw.shape[1]
+            )
+            regular = ~degenerate
+            reduced[regular] = p_reduce[regular] - (
+                excess[reduce][regular, None]
+                * reducible[regular]
+                / reducible_sum[regular, None]
+            )
+            adjusted[reduce] = np.maximum(reduced, lb)
+        out[normal] = adjusted
+
+    return out
+
+
+def _predict_pair_for_rows(kde, d0, windows, max_h):
+    """Predict compatible conditional/unconditional rows from one KDE."""
+    d0 = np.asarray(d0, dtype=int)
+    windows = np.asarray(windows, dtype=int)
+    conditional = np.full((len(d0), max_h), np.nan)
+    unconditional = np.full((len(d0), max_h + 1), np.nan)
+    if kde is None:
+        return conditional, unconditional
+
+    cdf = _kde_cdf(kde, None)
+    for horizon in np.unique(windows[windows > 0]):
+        rows = np.flatnonzero(windows == horizon)
+        days = np.arange(1, int(horizon) + 1)
+        num = cdf(d0[rows, None] + days) - cdf(
+            d0[rows, None] + days - 1
+        )
+        num = np.maximum(num, 0.0)
+        num = np.where(np.isfinite(num), num, 0.0)
+
+        unc = _enforce_floor_with_target_sum_rows(num, num.sum(axis=1))
+        base_prob = cdf(d0[rows])
+        unconditional[rows, 0] = base_prob
+        unconditional[rows, 1:int(horizon) + 1] = unc
+
+        denom = 1.0 - base_prob
+        cond = np.empty_like(num)
+        fallback = (~np.isfinite(denom)) | (denom <= EPS)
+        if fallback.any():
+            cond[fallback] = _enforce_floor_with_target_sum_rows(
+                num[fallback], num[fallback].sum(axis=1)
+            )
+
+        regular = ~fallback
+        if regular.any():
+            p_raw = num[regular] / denom[regular, None]
+            p_raw = np.maximum(p_raw, 0.0)
+            p_raw = np.where(np.isfinite(p_raw), p_raw, 0.0)
+            target_sum = p_raw.sum(axis=1)
+            empty = (~np.isfinite(target_sum)) | (target_sum <= EPS)
+            cond_regular = np.empty_like(p_raw)
+            cond_regular[empty] = 0.0
+            if (~empty).any():
+                cond_regular[~empty] = _enforce_floor_with_target_sum_rows(
+                    p_raw[~empty], target_sum[~empty]
+                )
+            cond[regular] = cond_regular
+        conditional[rows, :int(horizon)] = cond
+
+    return conditional, unconditional
+
+
+def _build_issue_plan(issue_grid, season_start_md, forecast_window, horizons):
+    issue_grid = issue_grid.reset_index(drop=True)
+    windows = np.array([
+        resolve_forecast_window_by_time(t, forecast_window, horizons)
+        for t in issue_grid["time"]
+    ], dtype=object)
+    windows = np.array([
+        -1 if value is None else int(value) for value in windows
+    ], dtype=int)
+    return {
+        "time": issue_grid["time"].to_numpy(copy=False),
+        "year": issue_grid["year"].to_numpy(dtype=int, copy=False),
+        "d0": np.array([
+            compute_d0(t, season_start_md) for t in issue_grid["time"]
+        ], dtype=int),
+        "window": windows,
+        "max_h": max_forecast_window(forecast_window, horizons),
+    }
+
+
+def _pair_matrices_for_cell(gt_years, onset_days, issue_plan,
+                            cv_by_year, static_kde=None):
+    max_h = issue_plan["max_h"]
+    conditional = np.full((len(issue_plan["year"]), max_h), np.nan)
+    unconditional = np.full((len(issue_plan["year"]), max_h + 1), np.nan)
+
+    if not cv_by_year:
+        return _predict_pair_for_rows(
+            static_kde,
+            issue_plan["d0"],
+            issue_plan["window"],
+            max_h,
+        )
+
+    for year in np.unique(issue_plan["year"]):
+        rows = np.flatnonzero(issue_plan["year"] == year)
+        kde = fit_kde(onset_days[gt_years != year])
+        cond_part, unc_part = _predict_pair_for_rows(
+            kde,
+            issue_plan["d0"][rows],
+            issue_plan["window"][rows],
+            max_h,
+        )
+        conditional[rows] = cond_part
+        unconditional[rows] = unc_part
+    return conditional, unconditional
+
+
+def _forecast_frame(cell_id, issue_plan, probabilities, conditional,
+                    cv_by_year):
+    if cv_by_year:
+        model = "clim_kde_cv" if conditional else "clim_kde_unc_cv"
+    else:
+        model = "clim_kde" if conditional else "clim_kde_unc"
+
+    data = {
+        "time": issue_plan["time"],
+        "year": issue_plan["year"],
+        "id": np.full(len(issue_plan["year"]), str(cell_id), dtype=object),
+        "model": np.full(len(issue_plan["year"]), model, dtype=object),
+    }
+    if not conditional:
+        data["predicted_prob_day_0"] = probabilities[:, 0]
+        for day in range(1, issue_plan["max_h"] + 1):
+            data[f"predicted_prob_day_{day}"] = probabilities[:, day]
+    else:
+        for day in range(1, issue_plan["max_h"] + 1):
+            data[f"predicted_prob_day_{day}"] = probabilities[:, day - 1]
+    return pd.DataFrame(data)
+
+
 # ---------------------------------------------------------------------------
 # KDEs by cell
 # ---------------------------------------------------------------------------
@@ -404,65 +592,46 @@ def fit_kdes_by_cell(gt_train):
 
 def compute_forecasts_for_cell(cell_id, issue_grid, kdes,
                                 season_start_md, forecast_window, horizons,
-                                conditional=True, cv_by_year=False, gt_train=None):
+                                conditional=True, cv_by_year=False, gt_train=None,
+                                issue_plan=None):
     """
     Compute predicted probabilities for a single cell over all issue dates.
 
     Returns DataFrame: time, year, id, model, predicted_prob_day_1..N
     """
     cell_key = str(cell_id)
-    max_H = max_forecast_window(forecast_window, horizons)
-    include_day0 = not conditional
-    max_cols = max_H + (1 if include_day0 else 0)
+    if issue_plan is None:
+        issue_plan = _build_issue_plan(
+            issue_grid, season_start_md, forecast_window, horizons
+        )
 
-    dens_static = None
-    dens_by_year = {}
-
-    if not cv_by_year:
-        dens_static = kdes.get(cell_key) if kdes else None
-    else:
+    if cv_by_year:
         if gt_train is None:
             raise ValueError("cv_by_year=True requires gt_train.")
-        years_needed = sorted(issue_grid["year"].unique())
         gt_id = gt_train[gt_train["id"] == cell_key]
-        for y in years_needed:
-            x = gt_id[gt_id["year"] != y]["onset_day"].values
-            dens_by_year[str(y)] = fit_kde(x)
-
-    if cv_by_year and conditional:
-        model_label = "clim_kde_cv"
-    elif cv_by_year and not conditional:
-        model_label = "clim_kde_unc_cv"
-    elif not cv_by_year and conditional:
-        model_label = "clim_kde"
+        static_kde = None
     else:
-        model_label = "clim_kde_unc"
+        gt_id = None
+        static_kde = kdes.get(cell_key) if kdes else None
 
-    rows = []
-    for _, row in issue_grid.iterrows():
-        t = row["time"]
-        yr = int(row["year"])
-        d0 = compute_d0(t, season_start_md)
-        H = resolve_forecast_window_by_time(t, forecast_window, horizons)
+    if gt_id is None:
+        gt_years = np.empty(0, dtype=int)
+        onset_days = np.empty(0, dtype=float)
+    else:
+        gt_years = gt_id["year"].to_numpy(dtype=int, copy=False)
+        onset_days = gt_id["onset_day"].to_numpy(dtype=float, copy=False)
 
-        probs = np.full(max_cols, np.nan)
-        if H is not None and H > 0:
-            dens_use = dens_static if not cv_by_year else dens_by_year.get(str(yr))
-            p = predict_from_kde(dens_use, d0, H, conditional=conditional, include_day0=include_day0)
-            length = min(len(p), max_cols)
-            probs[:length] = p[:length]
-
-        entry = {"time": t, "year": yr, "id": cell_key, "model": model_label}
-        if include_day0:
-            entry["predicted_prob_day_0"] = probs[0]
-            for k in range(1, max_H + 1):
-                entry[f"predicted_prob_day_{k}"] = probs[k] if k < max_cols else np.nan
-        else:
-            for k in range(1, max_H + 1):
-                entry[f"predicted_prob_day_{k}"] = probs[k - 1] if k - 1 < max_cols else np.nan
-        rows.append(entry)
-
-    return pd.DataFrame(rows)
+    cond_probs, unc_probs = _pair_matrices_for_cell(
+        gt_years,
+        onset_days,
+        issue_plan,
+        cv_by_year,
+        static_kde=static_kde,
+    )
+    probabilities = cond_probs if conditional else unc_probs
+    return _forecast_frame(
+        cell_key, issue_plan, probabilities, conditional, cv_by_year
+    )
 
 
 def compute_all_forecasts(gt_train, issue_grid, season_start_md,
@@ -475,6 +644,9 @@ def compute_all_forecasts(gt_train, issue_grid, season_start_md,
     """
     kdes = fit_kdes_by_cell(gt_train) if not cv_by_year else None
     cell_ids = gt_train["id"].unique()
+    issue_plan = _build_issue_plan(
+        issue_grid, season_start_md, forecast_window, horizons
+    )
 
     parts = []
     for cell_id in cell_ids:
@@ -482,8 +654,164 @@ def compute_all_forecasts(gt_train, issue_grid, season_start_md,
             cell_id, issue_grid, kdes,
             season_start_md, forecast_window, horizons,
             conditional=conditional, cv_by_year=cv_by_year, gt_train=gt_train,
+            issue_plan=issue_plan,
         )
         parts.append(part)
 
     forecasts = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
     return {"forecasts": forecasts, "kdes": kdes}
+
+
+def _compute_paired_chunk(gt_chunk, issue_grid, season_start_md,
+                          forecast_window, horizons, cv_by_year):
+    issue_plan = _build_issue_plan(
+        issue_grid, season_start_md, forecast_window, horizons
+    )
+    conditional_parts = []
+    unconditional_parts = []
+    for cell_id, gt_id in gt_chunk.groupby("id", sort=False):
+        gt_years = gt_id["year"].to_numpy(dtype=int, copy=False)
+        onset_days = gt_id["onset_day"].to_numpy(dtype=float, copy=False)
+        static_kde = None if cv_by_year else fit_kde(onset_days)
+        cond_probs, unc_probs = _pair_matrices_for_cell(
+            gt_years,
+            onset_days,
+            issue_plan,
+            cv_by_year,
+            static_kde=static_kde,
+        )
+        conditional_parts.append(
+            _forecast_frame(cell_id, issue_plan, cond_probs, True, cv_by_year)
+        )
+        unconditional_parts.append(
+            _forecast_frame(cell_id, issue_plan, unc_probs, False, cv_by_year)
+        )
+
+    return (
+        pd.concat(conditional_parts, ignore_index=True),
+        pd.concat(unconditional_parts, ignore_index=True),
+    )
+
+
+def _write_paired_chunk(task):
+    (chunk_index, gt_chunk, issue_grid, season_start_md, forecast_window,
+     horizons, cv_by_year, temp_dir) = task
+    conditional, unconditional = _compute_paired_chunk(
+        gt_chunk,
+        issue_grid,
+        season_start_md,
+        forecast_window,
+        horizons,
+        cv_by_year,
+    )
+    conditional_path = os.path.join(
+        temp_dir, f"conditional_{chunk_index:04d}.pkl"
+    )
+    unconditional_path = os.path.join(
+        temp_dir, f"unconditional_{chunk_index:04d}.pkl"
+    )
+    with open(conditional_path, "wb") as f:
+        pickle.dump(conditional, f)
+    with open(unconditional_path, "wb") as f:
+        pickle.dump(unconditional, f)
+    result = (
+        conditional_path,
+        len(conditional),
+        unconditional_path,
+        len(unconditional),
+    )
+    _kde_cdf.cache_clear()
+    return result
+
+
+def _assemble_pickle_parts(paths, row_counts):
+    total_rows = int(sum(row_counts))
+    arrays = None
+    columns = None
+    offset = 0
+    for path, row_count in zip(paths, row_counts):
+        with open(path, "rb") as f:
+            part = pickle.load(f)
+        if arrays is None:
+            columns = list(part.columns)
+            arrays = {
+                name: np.empty(total_rows, dtype=part[name].to_numpy().dtype)
+                for name in columns
+            }
+        end = offset + int(row_count)
+        for name in columns:
+            arrays[name][offset:end] = part[name].to_numpy(copy=False)
+        offset = end
+        del part
+        os.unlink(path)
+    return pd.DataFrame(arrays, columns=columns)
+
+
+def write_paired_climatologies(gt_train, issue_grid, season_start_md,
+                               forecast_window, horizons, cv_by_year,
+                               conditional_path, unconditional_path,
+                               workers=1):
+    """Write a compatible conditional/unconditional pair with shared work."""
+    workers = int(workers)
+    os.makedirs(os.path.dirname(conditional_path) or ".", exist_ok=True)
+    os.makedirs(os.path.dirname(unconditional_path) or ".", exist_ok=True)
+
+    cell_ids = gt_train["id"].unique()
+    ids_per_chunk = max(1, 200_000 // max(1, len(issue_grid)))
+    id_chunks = [
+        cell_ids[start:start + ids_per_chunk]
+        for start in range(0, len(cell_ids), ids_per_chunk)
+    ]
+
+    temp_parent = os.path.dirname(conditional_path) or "."
+    with tempfile.TemporaryDirectory(
+        prefix=".climatology_tmp-", dir=temp_parent
+    ) as temp_dir:
+        tasks = []
+        for chunk_index, ids in enumerate(id_chunks):
+            gt_chunk = gt_train[gt_train["id"].isin(ids)].copy()
+            tasks.append((
+                chunk_index,
+                gt_chunk,
+                issue_grid,
+                season_start_md,
+                forecast_window,
+                horizons,
+                cv_by_year,
+                temp_dir,
+            ))
+
+        worker_count = min(max(1, workers), len(tasks))
+        if worker_count > 1:
+            print(
+                f"Building paired climatologies in {len(tasks)} chunks with "
+                f"{worker_count} workers."
+            )
+            with get_context("spawn").Pool(worker_count) as pool:
+                chunk_results = list(pool.imap(_write_paired_chunk, tasks))
+        else:
+            chunk_results = [_write_paired_chunk(task) for task in tasks]
+        del tasks
+
+        conditional = _assemble_pickle_parts(
+            [result[0] for result in chunk_results],
+            [result[1] for result in chunk_results],
+        )
+        with open(conditional_path, "wb") as f:
+            pickle.dump(conditional, f)
+        del conditional
+        gc.collect()
+
+        unconditional = _assemble_pickle_parts(
+            [result[2] for result in chunk_results],
+            [result[3] for result in chunk_results],
+        )
+        with open(unconditional_path, "wb") as f:
+            pickle.dump(unconditional, f)
+        del unconditional
+        gc.collect()
+
+    return {
+        "conditional": conditional_path,
+        "unconditional": unconditional_path,
+    }

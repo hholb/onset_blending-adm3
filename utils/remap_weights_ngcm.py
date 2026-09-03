@@ -1,3 +1,7 @@
+# DEPRECATED: superseded by utils/remap.py + python/prepare_data/geometry_utils.py,
+# which generalize this file's dynamic-resolution logic and make the shapefile,
+# admin key column, and CRS configurable. Prefer:
+#     python utils/remap.py weights --shapefile <shp> --sample-nc <dir> --out <csv>
 import os
 import glob
 import pandas as pd
@@ -9,7 +13,7 @@ from shapely.geometry import box
 def normalize_adm2_name(adm2_id_series):
     return adm2_id_series.astype(str).str.lower().str.replace(" ", "_")
 
-def standardize_imd_dataset(ds):
+def standardize_ref_dataset(ds):
     rename_dict = {}
     if 'lat' in ds.coords: rename_dict['lat'] = 'latitude'
     if 'lon' in ds.coords: rename_dict['lon'] = 'longitude'
@@ -25,14 +29,14 @@ def build_grid_to_district_mapping(dirs, shp_file):
     # Ensure we keep the district names
     india = gdf[["adm3_name", "geometry"]].reset_index(drop=True)
 
-    imd_path = dirs["raw"]
-    sample_files = sorted(glob.glob(os.path.join(imd_path, "*.nc")))
+    ref_rain_path = dirs["raw"]
+    sample_files = sorted(glob.glob(os.path.join(ref_rain_path, "*.nc")))
     
     if not sample_files:
-        raise FileNotFoundError(f"No NetCDF files found in {imd_path}")
+        raise FileNotFoundError(f"No NetCDF files found in {ref_rain_path}")
         
     ds_sample = xr.open_dataset(sample_files[0])
-    ds_sample = standardize_imd_dataset(ds_sample)
+    ds_sample = standardize_ref_dataset(ds_sample)
     lats = ds_sample.latitude.values
     lons = ds_sample.longitude.values
     ds_sample.close()

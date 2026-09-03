@@ -1,0 +1,44 @@
+# Portable country template: join truth, paired climatologies, and one forecast.
+# The model key `forecast_model` must match --forecast and the connect/CV specs.
+
+type: combine_forecasts
+
+input:
+  ground_truth_wide_rds: Monsoon_Data/Processed_Data/example_country/ground_truth_template_wide.pkl
+  climatologies:
+    # Keys match raw-data climatology runs. run_training.py rewrites every
+    # matching artifact path; connect.window_tags chooses optional variants.
+    clim:
+      rds: Monsoon_Data/Processed_Data/example_country/ground_truth_template_clim_issue.pkl
+      out_prefix: clim_p_onset
+    clim_unc:
+      rds: Monsoon_Data/Processed_Data/example_country/ground_truth_template_clim_unc_issue.pkl
+      out_prefix: clim_unc_p_onset
+
+options:
+  join: inner
+  plus_label_template: day_{plus}plus
+  trim_forecasts_after_true_onset: true
+  default_prob_col: predicted_prob_fixed_cutoff
+
+forecasts:
+  forecast_model:
+    max_day: 40
+    sources:
+      - file: Monsoon_Data/Processed_Data/example_country/forecast_template_wide.pkl
+        years: '2000:2024'
+    constants:
+      - {col: onset_thresh, out: onset_thresh}
+    daily:
+      - {col: predicted_prob_fixed_cutoff, out: p_onset_fixed_cutoff, add_plus: true}
+      - {col: forecast_rain, out: rain_mean, add_plus: false}
+
+climatology:
+  max_day: 28
+  prob_col: predicted_prob
+
+output:
+  out_dir: Monsoon_Data/Processed_Data/example_country
+  # Standalone output: combine_country_template_combined_wide.pkl.
+  # run_training.py rewrites this directory but preserves the basename.
+  basename: combine_country_template

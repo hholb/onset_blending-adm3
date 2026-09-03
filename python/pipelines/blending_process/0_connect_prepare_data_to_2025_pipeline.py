@@ -7,9 +7,9 @@
 #   weekly-bin pickle that 1_blend_evaluation.py expects.
 #
 # Usage (run from MO_Forecast_Code/ directory)
-#   python pipelines/blending_process/0_connect_prepare_data_to_2025_pipeline.py --spec_id connect_mok
-#   python pipelines/blending_process/0_connect_prepare_data_to_2025_pipeline.py --spec_id connect_clim_mok_date
-#   python pipelines/blending_process/0_connect_prepare_data_to_2025_pipeline.py --spec_id connect_no_mok_filter
+#   python pipelines/blending_process/0_connect_prepare_data_to_2025_pipeline.py --spec_id connect_ref
+#   python pipelines/blending_process/0_connect_prepare_data_to_2025_pipeline.py --spec_id connect_fixed_cutoff
+#   python pipelines/blending_process/0_connect_prepare_data_to_2025_pipeline.py --spec_id connect_no_ref_filter
 # ==============================================================================
 
 import argparse
@@ -26,15 +26,27 @@ def main():
     parser = argparse.ArgumentParser(
         description="Convert daily combined data to weekly-bin RDS for blending."
     )
-    parser.add_argument("--spec_id", default="connect_mok",
+    parser.add_argument("--spec_id", default="connect_ref",
                         help="Spec file name (without .yml) in specs/2025_blend/")
+    parser.add_argument(
+        "--required_probability_prefixes",
+        nargs="*",
+        default=None,
+        help=(
+            "Internal wrapper contract listing forecast probability series "
+            "needed downstream. Omit to preserve strict legacy behavior."
+        ),
+    )
     args = parser.parse_args()
 
     spec_path = os.path.join("specs", "2025_blend", f"{args.spec_id}.yml")
     with open(spec_path, "r") as f:
         spec = yaml.safe_load(f)
 
-    wide_df = make_cv_rds_from_daylevel(spec=spec)
+    wide_df = make_cv_rds_from_daylevel(
+        spec=spec,
+        required_probability_prefixes=args.required_probability_prefixes,
+    )
 
     print(f"Wrote: {spec['output_rds']}")
     print(f"Rows: {len(wide_df)}, Cols: {len(wide_df.columns)}")

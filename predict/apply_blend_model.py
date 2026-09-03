@@ -13,49 +13,51 @@ Postprocessing script: reads saved blending model coefficients for a given
 year, applies them to a wide_df pickle, and writes per-year output files.
 
 Two modes:
-  1. Historical year (in cv_holdout_years): loads from standard pipeline input,
-     computes metrics against observed outcome.
-  2. Future year (not in cv_holdout_years): loads from --input_path, skips
-     metrics (no ground truth available).
+  1. Historical holdout year: loads from the standard pipeline input and uses
+     the configured true/CV holdout years to resolve the coefficient filename.
+  2. Operational year: loads from --input_path and skips metrics because no
+     ground truth is available.
 
 Usage (run from repo root)
 --------------------------
     # Historical year:
     python predict/apply_blend_model.py \\
-        --spec_id   cv_models_clim_mok_date \\
+        --spec_id   cv_models_fixed_cutoff \\
         --model     blended_model \\
         --year_tag  2022 \\
         --year      2022 \\
         [--coef_dir Monsoon_Data/results/2025_model_evaluation/] \\
         [--out_dir  Monsoon_Data/results/2025_model_evaluation/per_year/] \\
-        [--pipeline_input_dir Monsoon_Data/Processed_Data/2025_pipeline_input] \\
+        [--pipeline_input_dir Monsoon_Data/Processed_Data/pipeline_input] \\
         [--dissem_file Monsoon_Data/dissemination_cells.csv]
 
     # Future year (no ground truth):
     python predict/apply_blend_model.py \\
-        --spec_id    cv_models_clim_mok_date \\
+        --spec_id    cv_models_fixed_cutoff \\
         --model      blended_model \\
         --year       2026 \\
         --coef_tag   clim_mok_date_2022_year2022 \\
-        --input_path Monsoon_Data/Processed_Data/2025_pipeline_input/wide_2026.pkl
+        --input_path Monsoon_Data/Processed_Data/pipeline_input/wide_2026.pkl
 
 Input files
 ------------
 1. The spec YAML (via --spec_id):
-   specs/2025_blend/cv_models_clim_mok_date.yml
+   specs/2025_blend/cv_models_fixed_cutoff.yml
    Used to get cutoff_mode, holdout_years, and the formula.
 
 2. The coef pickle (looked up automatically from --coef_dir):
    coefs_blended_model_global_clim_mok_date_2022_year2022.pkl  (historical)
    coefs_blended_model_global_final.pkl                         (future, via --coef_tag)
-   Contains fitted coefficients, scaler, and feature names.
+   Contains fitted coefficients, scaler, feature names, and (for new bundles)
+   the resolved training formula.
 
 3. The wide pickle (historical) or --input_path (future):
-   Monsoon_Data/Processed_Data/2025_pipeline_input/cv_data_clim_mok_date_new_pipeline.pkl
+   Monsoon_Data/Processed_Data/pipeline_input/cv_data_clim_mok_date_new_pipeline.pkl
    The full feature dataset — patsy builds the design matrix from this.
 
 4. Dissemination cells (historical metrics only):
-   Monsoon_Data/dissemination_cells.csv
+   Configured by cell.dissemination in the blend spec; --dissem_file can
+   override that path.
 
 Output files
 ------------
@@ -75,16 +77,23 @@ from scipy.special import expit
 
 
 from python.blending_process.blend_evaluation_utils import (
+    DEFAULT_PIPELINE_INPUT_ROOT,
     build_formulas_from_spec,
     compute_cell_metrics_fast,
-    input_rds_from_cutoff,
+    configured_holdout_years,
     make_cutoff_tag,
     make_year_tag,
+    resolve_blend_input_path,
     restrict_to_allowed,
     _parse_formula_cols,
 )
 from python.pipelines._shared.read_spec import load_spec
 from python.pipelines._shared.misc import coalesce
+from python.prepare_data.nc_utils import ensure_id_col
+from python.prepare_data.spatial_id_utils import (
+    resolve_grid_id_convention,
+    validate_id_coordinate_consistency,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -92,7 +101,7 @@ from python.pipelines._shared.misc import coalesce
 # ---------------------------------------------------------------------------
 
 def load_coefs(coef_path):
-    """Load coefficient bundle (dict with coefs, scaler, features) from pickle.
+    """Load coefficient bundle (coefs, scaler, features, optional formula).
     Falls back gracefully if old-format bare DataFrame pickle is found.
     """
     if not os.path.exists(coef_path):
@@ -111,6 +120,93 @@ def load_coefs(coef_path):
             "features": list(obj["feature"].unique()),
         }
     return obj
+
+
+def load_dissemination_cells(spec, path_override, authoritative_ids):
+    """Load dissemination cells under the shared spatial-ID contract."""
+    cell_cfg = spec.get("cell") or {}
+    path = (
+        path_override
+        or cell_cfg.get("dissemination")
+        or "Monsoon_Data/dissemination_cells.csv"
+    )
+    cells = pd.read_csv(path, dtype=str)
+    configured_id_col = cell_cfg.get("id_col") or cell_cfg.get(
+        "dissemination_id_col"
+    )
+    if configured_id_col:
+        if configured_id_col not in cells.columns:
+            raise ValueError(
+                f"cell.id_col '{configured_id_col}' not found. "
+                f"Found: {cells.columns.tolist()}"
+            )
+        cells = cells.rename(columns={configured_id_col: "id"})
+    convention = None
+    if "id" not in cells.columns and "adm3_name" not in cells.columns:
+        convention = resolve_grid_id_convention(
+            spec=spec,
+            authoritative_ids=authoritative_ids,
+            context="prediction/dissemination ID handoff",
+        )
+    cells = ensure_id_col(
+        cells,
+        spec=spec,
+        convention=convention,
+        context="prediction dissemination IDs",
+    )
+    validate_id_coordinate_consistency(
+        cells, context="prediction dissemination IDs"
+    )
+    return cells.drop_duplicates("id")
+
+
+def resolve_application_formula(coef_bundle, spec, cutoff_mode, model_name,
+                                data):
+    """Prefer the saved training formula; support older bundles via the spec."""
+    saved_formula = coef_bundle.get("formula")
+    if saved_formula:
+        return saved_formula, "saved coefficient bundle"
+
+    formulas = build_formulas_from_spec(spec, cutoff_mode, data=data)
+    if model_name not in formulas:
+        raise ValueError(
+            f"Model '{model_name}' not found in spec formulas. "
+            f"Available: {list(formulas.keys())}"
+        )
+    return formulas[model_name], "current spec (legacy coefficient bundle)"
+
+
+def build_application_design_matrix(formula_str, data, feature_cols):
+    """Build a Patsy matrix and enforce the saved training feature schema."""
+    rhs = formula_str.split("~", 1)[1].strip() if "~" in formula_str else formula_str
+    design = patsy.dmatrix(
+        rhs,
+        data,
+        return_type="dataframe",
+        NA_action=patsy.NAAction(NA_types=[]),
+    ).drop(columns=["Intercept"], errors="ignore")
+
+    missing = [feature for feature in feature_cols if feature not in design]
+    unexpected = [feature for feature in design if feature not in feature_cols]
+    if missing or unexpected:
+        raise ValueError(
+            "Applied design matrix does not match the saved training schema. "
+            f"Missing: {missing}; unexpected: {unexpected}."
+        )
+
+    design = design.loc[:, feature_cols]
+    all_nonfinite = [
+        column for column in feature_cols
+        if not np.isfinite(
+            pd.to_numeric(design[column], errors="coerce").to_numpy(dtype=float)
+        ).any()
+    ]
+    if all_nonfinite:
+        raise ValueError(
+            "Saved model features have no finite values in the application "
+            f"data: {all_nonfinite}."
+        )
+    return design
 
 
 def apply_coefs(coef_df, wide_df, feature_cols, design_matrix=None):          # ← NEW: added design_matrix param
@@ -221,26 +317,27 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--spec_id", required=True,
-                        help="CV spec ID (e.g. cv_models_clim_mok_date)")
+                        help="CV spec ID (e.g. cv_models_fixed_cutoff)")
     parser.add_argument("--model",   required=True,
                         help="Model name as in cv_models*.yml (e.g. blended_model)")
     parser.add_argument("--year",    required=True, type=int,
                         help="Test year to apply the model for")
     parser.add_argument("--year_tag", default=None,
                     help="Override year tag in filename, e.g. '2000_2022'. "
-                         "If not provided, derived from cv_holdout_years in spec.")
+                         "If not provided, derived from configured true and CV "
+                         "holdout years in spec.")
     parser.add_argument("--method",  default="global",
                         help="CV method (default: global)")
     parser.add_argument("--coef_tag",   default=None,                        # ← NEW
                         help="Override entire output tag for coef filename. "  # ← NEW
-                             "e.g. clim_mok_date_2022_year2022  "
-                             "for coefs_blended_model_global_clim_mok_date_2022_year2022.pkl"
+                             "e.g. fixed_cutoff_2022_year2022  "
+                             "for coefs_blended_model_global_fixed_cutoff_2022_year2022.pkl"
                              "e.g. 'final' for coefs saved by 3_fit_final_model.py. "  # ← NEW
                              "Coef file becomes: coefs_{model}_{method}_{coef_tag}.pkl")  # ← NEW
     parser.add_argument("--input_path", default=None,                        # ← NEW
                         help="Path to wide_df pickle for a future year. "     # ← NEW
                              "e.g. Monsoon_Data/Processed_Data/2026/cv_data... next line "
-                             "cv_data_clim_mok_date_new_pipeline_2026.pkl"
+                             "cv_data_fixed_cutoff_new_pipeline_2026.pkl"
                              "If provided, skips standard pipeline input lookup "  # ← NEW
                              "and skips outcome filtering and metrics.")       # ← NEW
     parser.add_argument("--coef_dir", default=None,
@@ -250,16 +347,18 @@ def main():
     parser.add_argument("--out_dir",  default=None,
                         help="Output directory. "
                              "Defaults to Monsoon_Data/results/2025_model_evaluation/per_year/")
-    parser.add_argument("--dissem_file", default="Monsoon_Data/dissemination_cells.csv",
-                        help="Path to dissemination_cells.csv")
-    parser.add_argument("--pipeline_input_dir", default="Monsoon_Data/Processed_Data/2025_pipeline_input",
-                        help="Directory containing the wide processed data")
+    parser.add_argument("--dissem_file", default=None,
+                        help="Override the dissemination CSV configured by "
+                             "cell.dissemination")
+    parser.add_argument("--pipeline_input_dir", default=DEFAULT_PIPELINE_INPUT_ROOT,
+                        help="Root directory containing the spec-configured "
+                             "pipeline input subdirectory")
     args = parser.parse_args()
 
     # ── Load spec ──────────────────────────────────────────────────────
     spec = load_spec(args.spec_id, "2025_blend")
     cutoff_mode     = spec["run"]["cutoff_mode"]
-    holdout_years   = [int(y) for y in spec["run"]["cv_holdout_years"]]
+    holdout_years   = configured_holdout_years(spec)
     training_years  = [int(y) for y in spec["run"]["training_years"]]
 
     is_future_year = args.input_path is not None                              # ← NEW
@@ -314,8 +413,11 @@ def main():
             test_df["year"] = args.year                                       # ← NEW
     else:
         # Historical year: load from standard pipeline input
-        input_file = input_rds_from_cutoff(cutoff_mode)
-        input_path = os.path.join(args.pipeline_input_dir, input_file)
+        input_path = resolve_blend_input_path(
+            cutoff_mode,
+            spec.get("run"),
+            pipeline_input_root=args.pipeline_input_dir,
+        )
         print(f"\nLoading wide_df from: {input_path}")
         with open(input_path, "rb") as f:
             wide_df = pickle.load(f)
@@ -329,25 +431,19 @@ def main():
     print(f"Input rows for year {args.year}: {len(test_df)}")
 
     # ── Get formula ────────────────────────────────────────────────────
-    formulas = build_formulas_from_spec(spec, cutoff_mode)
-    if args.model not in formulas:
-        raise ValueError(
-            f"Model '{args.model}' not found in spec formulas. "
-            f"Available: {list(formulas.keys())}"
-        )
-    formula_str = formulas[args.model]
+    formula_str, formula_source = resolve_application_formula(
+        coef_bundle, spec, cutoff_mode, args.model, test_df
+    )
 
-    print(f"\nFormula: {formula_str}")
+    print(f"\nFormula ({formula_source}): {formula_str}")
     print(f"Feature columns ({len(feature_cols)}): {feature_cols}")
 
     # ── Build design matrix with patsy ────────────────────────────────
     # patsy expands interaction terms (a:b) that don't exist as raw columns,
     # matching exactly what was done during training. NA_action keeps NaN rows.
-    rhs = formula_str.split("~", 1)[1].strip() if "~" in formula_str else formula_str
-    X_df = patsy.dmatrix(rhs, test_df, return_type="dataframe",
-                         NA_action=patsy.NAAction(NA_types=[]))
-    X_df = X_df.drop(columns=["Intercept"], errors="ignore")
-    X_df = X_df.reindex(columns=feature_cols, fill_value=0.0)
+    X_df = build_application_design_matrix(
+        formula_str, test_df, feature_cols
+    )
 
     # ← NEW: apply the same StandardScaler fitted during training
     if scaler is not None:                                                    # ← NEW
@@ -376,9 +472,13 @@ def main():
 
     # ── Compute metrics (historical only) ──────────────────────────────
     if not is_future_year and cv_preds["outcome"].notna().any():              # ← NEW
-        dissemination_cells = pd.read_csv(args.dissem_file)
+        cv_preds = ensure_id_col(
+            cv_preds, spec=spec, context="prediction IDs"
+        )
+        dissemination_cells = load_dissemination_cells(
+            spec, args.dissem_file, cv_preds["id"]
+        )
         valid_ids = set(cv_preds["id"].dropna().unique())
-        dissemination_cells["id"] = dissemination_cells["adm3_name"].astype(str)
         overlap = valid_ids & set(dissemination_cells["id"])
         print(f"Matching dissemination cell ids: {len(overlap)}")
 

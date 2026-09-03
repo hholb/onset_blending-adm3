@@ -1,0 +1,35 @@
+mode: "fixed_cutoff"
+input_rds: "Monsoon_Data/Processed_Data/2026/combine_template_fixed_cutoff_2026_ngcm_combined_wide.pkl"
+output_rds: "Monsoon_Data/Processed_Data/2026/cv_data_fixed_cutoff_new_pipeline_2026_ngcm.pkl"
+day_max: 28
+days_per_bin: 7
+n_bins: 4
+
+climatology:
+  base_prefix: "clim"
+  unconditional_prefix: "clim_unc"
+  window_tags: []
+
+
+#forecast_models:
+#  - name: ngcm
+#    variants: [fixed_cutoff]
+#    rain_predictors: [diff_5day, min_10day]
+#  - name: aifs
+#    variants: [fixed_cutoff]
+#    rain_predictors: [diff_5day, min_10day, max_5day]
+
+
+forecast_models:
+  - name: ngcm
+  #- name: aifs_ens
+    variants: [fixed_cutoff]
+    rain_predictors:
+      - { agg: diff, window: 3 }
+#      - { agg: min,  window: 7 }
+  - name: aifs
+    variants: [fixed_cutoff]
+    rain_predictors:
+      - { agg: diff, window: 3 }
+#      - { agg: min,  window: 7 }
+#      - { agg: max,  window: 3 }

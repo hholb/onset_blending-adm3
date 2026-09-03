@@ -15,12 +15,52 @@ import pickle
 import warnings
 import numpy as np
 import pandas as pd
+from multiprocessing import get_context
 from scipy.special import logit, expit
 from scipy.stats import ks_2samp
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score
 
-from ..pipelines._shared.misc import coalesce
+from ..pipelines._shared.misc import coalesce, week_labels, interval_bins
+
+
+DEFAULT_PIPELINE_INPUT_ROOT = os.path.join(
+    "Monsoon_Data", "Processed_Data", "pipeline_input"
+)
+
+
+def _present_weeks(df, base):
+    """Sorted week numbers present as `<base>_week<n>` columns in df."""
+    pat = re.compile(rf"^{re.escape(base)}_week(\d+)$")
+    return sorted(int(m.group(1)) for c in df.columns for m in [pat.match(c)] if m)
+
+
+def resolve_climatology_weeks(spec, df):
+    """Return the configured conditional-climatology prefix and its weeks."""
+    clim_tasks = ((spec.get("extras") or {}).get("clim_logits") or [])
+    clim_task = next(
+        (task for task in clim_tasks if task.get("name") == "clim_raw"),
+        {},
+    )
+    base = coalesce(clim_task.get("base_col_prefix"), "prob_clim")
+    weeks = _present_weeks(df, base)
+    if not weeks:
+        raise ValueError(
+            f"No climatology columns found for configured prefix '{base}' "
+            f"(expected {base}_week<n>)."
+        )
+    return base, weeks
+
+
+def _cv_weeks(df):
+    """Sorted week numbers present as `cv_week<n>` columns in df."""
+    return sorted(int(m.group(1)) for c in df.columns
+                  for m in [re.match(r"^cv_week(\d+)$", c)] if m)
+
+
+def _spec_n_bins(spec):
+    """Number of forecast bins from the spec (default 4)."""
+    return int(coalesce((spec or {}).get("n_bins"), 4))
 
 # ---------------------------------------------------------------------------
 # Column name helpers
@@ -30,23 +70,18 @@ def get_forecast_variant_suffix(spec, variant):
     """Map variant name to column suffix string."""
     m = (spec.get("extras") or {}).get("forecast_variants") or {
         "base": "",
-        "mok": "_mok",
-        "clim_mok_date": "_clim_mok_date",
+        "ref_onset": "_ref",
+        "fixed_cutoff": "_fixed_cutoff",
     }
     if variant not in m:
         raise ValueError(f"Unknown forecast variant: {variant}")
     return m[variant]
 
 
-def forecast_prob_cols(forecast_name, variant_suffix):
-    """Build dict of week1..week4 probability column names."""
+def forecast_prob_cols(forecast_name, variant_suffix, n_bins=4):
+    """Build dict of week1..weekN probability column names."""
     base = f"{forecast_name}_p_onset{variant_suffix}"
-    return {
-        "week1": f"{base}_week1",
-        "week2": f"{base}_week2",
-        "week3": f"{base}_week3",
-        "week4": f"{base}_week4",
-    }
+    return {f"week{w}": f"{base}_week{w}" for w in range(1, int(n_bins) + 1)}
 
 
 def forecast_label(forecast_name, variant):
@@ -62,21 +97,60 @@ def make_year_tag(years):
     return f"_{min(years)}_{max(years)}"
 
 
+def configured_holdout_years(spec):
+    """Return true and CV holdout years under the shared artifact contract."""
+    run = (spec or {}).get("run") or {}
+    true_holdout = list(map(int, coalesce(run.get("true_holdout_years"), [])))
+    cv_holdout = list(map(int, coalesce(run.get("cv_holdout_years"), [])))
+    return true_holdout + cv_holdout
+
+
 def make_cutoff_tag(cutoff_mode):
-    if cutoff_mode == "clim_mok_date":
-        return "_clim_mok_date"
-    if cutoff_mode == "no_mok_filter":
-        return "_no_mok_filter"
+    if cutoff_mode == "fixed_cutoff":
+        return "_fixed_cutoff"
+    if cutoff_mode == "no_ref_filter":
+        return "_no_ref_filter"
     return ""
 
 
 def input_rds_from_cutoff(cutoff_mode, resolution=""):
+    # Derive the CV-input filename from the single-source-of-truth cutoff tag
+    # (make_cutoff_tag) instead of hardcoding the variant token. The variant
+    # segment is generic (e.g. "fixed_cutoff"), so this tracks any rename.
     prefix = f"{resolution}_" if resolution else ""
-    if cutoff_mode == "clim_mok_date":
-        return f"cv_data_{prefix}clim_mok_date_new_pipeline.pkl"
-    if cutoff_mode == "no_mok_filter":
-        return f"cv_data_{prefix}no_mok_filter_new_pipeline.pkl"
-    return f"cv_data_{prefix}new_pipeline.pkl"
+    variant = make_cutoff_tag(cutoff_mode).lstrip("_")
+    variant_part = f"{variant}_" if variant else ""
+    return f"cv_data_{prefix}{variant_part}new_pipeline.pkl"
+
+
+def resolve_blend_input_path(
+    cutoff_mode,
+    run_cfg=None,
+    *,
+    input_path=None,
+    work_dir=None,
+    pipeline_input_root=DEFAULT_PIPELINE_INPUT_ROOT,
+):
+    """Resolve a connector artifact for evaluation or saved-model use."""
+    if input_path:
+        return input_path
+
+    run_cfg = run_cfg or {}
+    if "input_rds_override" in run_cfg:
+        raise ValueError(
+            "run.input_rds_override has been removed; use --input_path "
+            "or --blend_input."
+        )
+
+    input_file = input_rds_from_cutoff(cutoff_mode)
+    if work_dir:
+        return os.path.join(work_dir, input_file)
+
+    return os.path.join(
+        pipeline_input_root,
+        run_cfg.get("pipeline_input_dir", ""),
+        input_file,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -109,13 +183,8 @@ def input_rds_from_cutoff(cutoff_mode, resolution=""):
 
 
 # AFTER
-def expand_formula_str(formula_str):
-    """
-    Expand formula shortcuts in a formula string.
-    1. Terms containing '_qx' expand to '_week1'..'_week4'.
-    2. '*' terms are expanded R/Wilkinson-style: a*b*c -> a + b + c + a:b + a:c + b:c + a:b:c
-    Returns the expanded formula string.
-    """
+def _expanded_formula_terms(formula_str, n_bins=4):
+    """Return ``(lhs, [(term, qx_generated_columns), ...])``."""
     import itertools
 
     if "~" in formula_str:
@@ -124,36 +193,86 @@ def expand_formula_str(formula_str):
     else:
         lhs, rhs = "", formula_str.strip()
 
-    # Step 1: split on '+' to get top-level terms, then expand _qx -> _week1.._week4
-    raw_terms = [t.strip() for t in rhs.split("+")]
     qx_expanded = []
-    for term in raw_terms:
-        if "_qx" in term:
-            for i in range(1, 5):
-                qx_expanded.append(term.replace("_qx", f"_week{i}"))
+    for raw_term in (t.strip() for t in rhs.split("+")):
+        qx_columns = [
+            column for column in _parse_formula_cols(raw_term)
+            if "_qx" in column
+        ]
+        if qx_columns:
+            for i in range(1, int(n_bins) + 1):
+                qx_expanded.append((
+                    raw_term.replace("_qx", f"_week{i}"),
+                    {
+                        column.replace("_qx", f"_week{i}")
+                        for column in qx_columns
+                    },
+                ))
         else:
-            qx_expanded.append(term)
+            qx_expanded.append((raw_term, set()))
 
-    # Step 2: expand Wilkinson '*' into main effects + all interactions using ':'
     final_terms = []
-    for term in qx_expanded:
+    for term, qx_generated_columns in qx_expanded:
         if "*" in term:
-            vars_ = [v.strip() for v in term.split("*")]
-            for r in range(1, len(vars_) + 1):
-                for combo in itertools.combinations(vars_, r):
-                    final_terms.append(":".join(combo))
+            variables = [value.strip() for value in term.split("*")]
+            for size in range(1, len(variables) + 1):
+                for combo in itertools.combinations(variables, size):
+                    final_terms.append((
+                        ":".join(combo),
+                        qx_generated_columns.intersection(combo),
+                    ))
         else:
-            final_terms.append(term)
+            final_terms.append((term, qx_generated_columns))
+    return lhs, final_terms
 
-    new_rhs = " + ".join(final_terms)
-    return f"{lhs} ~ {new_rhs}" if lhs else new_rhs
+
+def _join_formula_terms(lhs, terms):
+    rhs = " + ".join(terms)
+    return f"{lhs} ~ {rhs}" if lhs else rhs
+
+
+def expand_formula_str(formula_str, n_bins=4):
+    """
+    Expand formula shortcuts in a formula string.
+    1. Terms containing '_qx' expand to '_week1'..'_weekN' (N = n_bins).
+    2. '*' terms are expanded R/Wilkinson-style: a*b*c -> a + b + c + a:b + a:c + b:c + a:b:c
+    Returns the expanded formula string.
+    """
+    lhs, terms = _expanded_formula_terms(formula_str, n_bins=n_bins)
+    return _join_formula_terms(lhs, [term for term, _ in terms])
+
+
+def resolve_formula_str(formula_str, data, n_bins=4):
+    """Expand a formula and omit only unavailable terms generated by ``_qx``.
+
+    Structural unavailability comes exclusively from connector metadata. An
+    explicitly named ``_weekN`` term is never omitted and remains subject to
+    normal feature validation.
+    """
+    unavailable = set(data.attrs.get("unavailable_rain_predictors", {}))
+    lhs, expanded = _expanded_formula_terms(formula_str, n_bins=n_bins)
+    kept = []
+    dropped = []
+    for term, qx_generated_columns in expanded:
+        if qx_generated_columns.intersection(unavailable):
+            dropped.append(term)
+        else:
+            kept.append(term)
+
+    if not any(_parse_formula_cols(term) for term in kept):
+        raise ValueError(
+            "Formula has no constructible predictor terms after resolving "
+            "connector rainfall horizons."
+        )
+    return _join_formula_terms(lhs, kept), dropped
 
 
 def make_window_suffix(start_year, end_year):
     return f"_{start_year}_{end_year}"
 
 
-def build_formulas_from_spec(spec, cutoff_mode):
+def build_formulas_from_spec(spec, cutoff_mode, data=None,
+                             return_resolution=False, n_bins=None):
     """
     Build dict of formula strings from spec["models"]["formulas"],
     with optional windowed variants.
@@ -162,13 +281,28 @@ def build_formulas_from_spec(spec, cutoff_mode):
     if not formula_cfg:
         raise ValueError("Spec must define models.formulas with named entries containing 'text'.")
 
+    n_bins = _spec_n_bins(spec) if n_bins is None else int(n_bins)
     base_texts = {}
+    resolution = {}
     for nm, v in formula_cfg.items():
         if v.get("enabled", True):
             txt = v.get("text")
             if not txt:
                 raise ValueError(f"Formula '{nm}' is enabled but has no non-empty 'text' in spec.")
-            base_texts[nm] = expand_formula_str(txt)
+            expanded = expand_formula_str(txt, n_bins=n_bins)
+            if data is None:
+                resolved, dropped = expanded, []
+            else:
+                resolved, dropped = resolve_formula_str(
+                    txt, data, n_bins=n_bins
+                )
+            base_texts[nm] = resolved
+            resolution[nm] = {
+                "original_formula": txt,
+                "expanded_formula": expanded,
+                "resolved_formula": resolved,
+                "dropped_terms": dropped,
+            }
 
     formulas = dict(base_texts)
 
@@ -200,12 +334,23 @@ def build_formulas_from_spec(spec, cutoff_mode):
                 window = make_window_suffix(sy, end_year)
                 to_replaced = to_pat.replace("{window}", window)
                 windowed = base_txt.replace(from_pat, to_replaced)
-                formulas[f"{base_name}{window}"] = expand_formula_str(windowed)
+                model_name = f"{base_name}{window}"
+                formulas[model_name] = expand_formula_str(
+                    windowed, n_bins=n_bins
+                )
+                resolution[model_name] = {
+                    "original_formula": windowed,
+                    "expanded_formula": windowed,
+                    "resolved_formula": formulas[model_name],
+                    "dropped_terms": resolution[base_name]["dropped_terms"],
+                }
 
+    if return_resolution:
+        return formulas, resolution
     return formulas
 
 
-def print_formula_summary(spec, cutoff_mode):
+def print_formula_summary(spec, cutoff_mode, formulas=None):
     """
     Print a human-readable summary of all blending models: the yml shorthand,
     the fully expanded formula, and the exact list of predictor columns used.
@@ -213,13 +358,14 @@ def print_formula_summary(spec, cutoff_mode):
     Call this at the start of 1_blend_evaluation.py to make the models
     transparent before any fitting happens.
     """
-    formulas = build_formulas_from_spec(spec, cutoff_mode)
+    if formulas is None:
+        formulas = build_formulas_from_spec(spec, cutoff_mode)
     formula_cfg = (spec.get("models") or {}).get("formulas") or {}
 
     width = 70
     print()
     print("=" * width)
-    print("  BLENDING MODELS — formula expansion summary")
+    print("  BLENDING MODELS — formula resolution summary")
     print("=" * width)
 
     for model_name, expanded in formulas.items():
@@ -238,7 +384,7 @@ def print_formula_summary(spec, cutoff_mode):
             print(f"    {yml_text}")
             print()
 
-        print(f"  Expanded formula:")
+        print(f"  Effective formula:")
         lhs, rhs = expanded.split("~", 1)
         terms = [t.strip() for t in rhs.split("+")]
         lines = []
@@ -267,7 +413,7 @@ def print_formula_summary(spec, cutoff_mode):
         #    groups.setdefault(root, []).append(col)
         #for root, cols in groups.items():
         #    weeks = ", ".join(c.split("_week")[-1] for c in cols)
-        #    scale = "(logit)" if "clim_mr" in root else "(mm)"
+        #    scale = "(logit)" if "clim" in root else "(mm)"
         #    print(f"    {root}_week[{weeks}]  {scale}")
 
 # AFTER
@@ -275,7 +421,7 @@ def print_formula_summary(spec, cutoff_mode):
         all_terms = [t.strip() for t in rhs_exp.split("+")]
         print(f"  Predictor terms used ({len(all_terms)}):")
         for term in all_terms:
-            scale = "(logit)" if "clim_mr" in term else ("(interaction)" if ":" in term else "(mm)")
+            scale = "(logit)" if "clim" in term else ("(interaction)" if ":" in term else "(mm)")
             print(f"    {term}  {scale}")
 
     print()
@@ -289,23 +435,21 @@ def print_formula_summary(spec, cutoff_mode):
 # ---------------------------------------------------------------------------
 
 def make_raw_preds_from_wide(wide_df, forecast_name, variant, holdout_years, spec):
-    """Extract raw model predictions for holdout years."""
+    """Extract raw model predictions for holdout years (any number of week bins)."""
     suf = get_forecast_variant_suffix(spec, variant)
-    cols = forecast_prob_cols(forecast_name, suf)
-    missing = [c for c in cols.values() if c not in wide_df.columns]
-    if missing:
-        warnings.warn(f"Skipping raw for {forecast_name} ({variant}); missing: {', '.join(missing)}")
+    base = f"{forecast_name}_p_onset{suf}"
+    weeks = _present_weeks(wide_df, base)
+    if not weeks:
+        warnings.warn(f"Skipping raw for {forecast_name} ({variant}); no {base}_week* columns found")
         return None
 
     sub = wide_df[wide_df["year"].isin(holdout_years)].copy()
-    sub["cv_week1"] = sub[cols["week1"]]
-    sub["cv_week2"] = sub[cols["week2"]]
-    sub["cv_week3"] = sub[cols["week3"]]
-    sub["cv_week4"] = sub[cols["week4"]]
-    w_sum = sub[["cv_week1", "cv_week2", "cv_week3", "cv_week4"]].sum(axis=1)
-    sub["cv_later"] = np.clip(1.0 - w_sum, 0.0, 1.0)
-    return sub[["outcome", "time", "id", "year",
-                "cv_week1", "cv_week2", "cv_week3", "cv_week4", "cv_later"]]
+    cv_cols = []
+    for w in weeks:
+        sub[f"cv_week{w}"] = sub[f"{base}_week{w}"]
+        cv_cols.append(f"cv_week{w}")
+    sub["cv_later"] = np.clip(1.0 - sub[cv_cols].sum(axis=1), 0.0, 1.0)
+    return sub[["outcome", "time", "id", "year"] + cv_cols + ["cv_later"]]
 
 
 def make_raw_preds_from_wide_logit_window(wide_df, base_col_prefix, holdout_years,
@@ -316,59 +460,53 @@ def make_raw_preds_from_wide_logit_window(wide_df, base_col_prefix, holdout_year
     else:
         window = ""
     prefix = f"{base_col_prefix}{window}"
-    wk_cols = [f"{prefix}_week{i}" for i in range(1, 5)]
-    missing = [c for c in wk_cols if c not in wide_df.columns]
-    if missing:
-        warnings.warn(f"Skipping clim logit raw for prefix={prefix}; missing: {', '.join(missing)}")
+    weeks = _present_weeks(wide_df, prefix)
+    if not weeks:
+        warnings.warn(f"Skipping clim logit raw for prefix={prefix}; no _week* columns found")
         return None
 
     sub = wide_df[wide_df["year"].isin(holdout_years)].copy()
-    sub["p1"] = expit(sub[wk_cols[0]])
-    sub["p2"] = expit(sub[wk_cols[1]])
-    sub["p3"] = expit(sub[wk_cols[2]])
-    sub["p4"] = expit(sub[wk_cols[3]])
-    sub["cv_later"] = np.clip(1.0 - (sub["p1"] + sub["p2"] + sub["p3"] + sub["p4"]), 0.0, 1.0)
-    sub = sub.rename(columns={"p1": "cv_week1", "p2": "cv_week2", "p3": "cv_week3", "p4": "cv_week4"})
-    return sub[["outcome", "time", "id", "year",
-                "cv_week1", "cv_week2", "cv_week3", "cv_week4", "cv_later"]]
+    cv_cols = []
+    for w in weeks:
+        sub[f"cv_week{w}"] = expit(sub[f"{prefix}_week{w}"])
+        cv_cols.append(f"cv_week{w}")
+    sub["cv_later"] = np.clip(1.0 - sub[cv_cols].sum(axis=1), 0.0, 1.0)
+    return sub[["outcome", "time", "id", "year"] + cv_cols + ["cv_later"]]
 
 
 def make_raw_preds_from_wide_logit(wide_df, base_col_prefix, holdout_years,
                                     earlier_col=None, earlier_is_logit=True,
                                     add_cv_earlier=True, renormalize_6=True):
-    """Extract raw clim-logit predictions with optional 'earlier' bin."""
-    wk_cols = [f"{base_col_prefix}_week{i}" for i in range(1, 5)]
-    missing = [c for c in wk_cols if c not in wide_df.columns]
-    if missing:
-        warnings.warn(f"Skipping raw-logit for {base_col_prefix}; missing: {', '.join(missing)}")
+    """Extract raw clim-logit predictions with optional 'earlier' bin (any n bins)."""
+    weeks = _present_weeks(wide_df, base_col_prefix)
+    if not weeks:
+        warnings.warn(f"Skipping raw-logit for {base_col_prefix}; no _week* columns found")
         return None
     if add_cv_earlier and (not earlier_col or earlier_col not in wide_df.columns):
         raise ValueError(f"unc_clim_raw requires earlier_col and it must exist in wide_df.")
 
     sub = wide_df[wide_df["year"].isin(holdout_years)].copy()
-    sub["p1"] = expit(sub[wk_cols[0]])
-    sub["p2"] = expit(sub[wk_cols[1]])
-    sub["p3"] = expit(sub[wk_cols[2]])
-    sub["p4"] = expit(sub[wk_cols[3]])
+    week_cols = []
+    for w in weeks:
+        sub[f"cv_week{w}"] = expit(sub[f"{base_col_prefix}_week{w}"])
+        week_cols.append(f"cv_week{w}")
 
     if add_cv_earlier:
         pE = expit(sub[earlier_col]) if earlier_is_logit else sub[earlier_col].astype(float)
-        sub["pE"] = np.clip(pE, 0.0, 1.0)
+        sub["cv_earlier"] = np.clip(pE, 0.0, 1.0)
     else:
-        sub["pE"] = 0.0
+        sub["cv_earlier"] = 0.0
 
-    sub["pL"] = np.clip(1.0 - (sub["pE"] + sub["p1"] + sub["p2"] + sub["p3"] + sub["p4"]), 0.0, 1.0)
+    sub["cv_later"] = np.clip(1.0 - (sub["cv_earlier"] + sub[week_cols].sum(axis=1)), 0.0, 1.0)
 
     if renormalize_6 and add_cv_earlier:
-        rs6 = sub[["pE", "p1", "p2", "p3", "p4", "pL"]].sum(axis=1)
-        good = rs6.notna() & (rs6 > 0)
-        for c in ["pE", "p1", "p2", "p3", "p4", "pL"]:
-            sub.loc[good, c] = sub.loc[good, c] / rs6[good]
+        allc = ["cv_earlier"] + week_cols + ["cv_later"]
+        rs = sub[allc].sum(axis=1)
+        good = rs.notna() & (rs > 0)
+        for c in allc:
+            sub.loc[good, c] = sub.loc[good, c] / rs[good]
 
-    sub = sub.rename(columns={"p1": "cv_week1", "p2": "cv_week2", "p3": "cv_week3",
-                                "p4": "cv_week4", "pL": "cv_later", "pE": "cv_earlier"})
-    cols = ["outcome", "time", "id", "year",
-            "cv_week1", "cv_week2", "cv_week3", "cv_week4", "cv_later"]
+    cols = ["outcome", "time", "id", "year"] + week_cols + ["cv_later"]
     if add_cv_earlier:
         cols.append("cv_earlier")
     return sub[cols]
@@ -382,23 +520,24 @@ def fit_platt_weights_export(df, prob_cols, training_years,
                               outcome_col="outcome", year_col="year"):
     """Fit one-vs-rest Platt calibration weights on training years.
 
-    IMPORTANT: matches R glm(y ~ p, ...) which uses raw probability as predictor,
-    NOT logit(p). sklearn is used with raw p as the feature.
+    Exported weights are consumed as expit(intercept + slope * logit(p)) by
+    apply_platt_5, matching R's glm(y ~ logit_p, ...) export/application pair.
     """
     df_train = df[df[year_col].isin(training_years)].copy()
     weights_rows = []
 
     for bin_name in prob_cols:
         p_raw = np.clip(df_train[bin_name].values.astype(float), 1e-6, 1 - 1e-6)
-        y = (df_train[outcome_col].values == bin_name).astype(float)
+        outcome = df_train[outcome_col]
+        y = ((outcome == bin_name).astype(float)
+             .where(outcome.notna(), np.nan).to_numpy())
 
         ok = np.isfinite(p_raw) & ~np.isnan(y)
         if ok.sum() < 10 or len(np.unique(y[ok])) < 2:
             weights_rows.append({"bin": bin_name, "intercept": 0.0, "slope": 1.0})
             continue
 
-        # Match R: use raw probability p as the predictor (not logit(p))
-        X = p_raw[ok].reshape(-1, 1)
+        X = logit(p_raw[ok]).reshape(-1, 1)
         clf = LogisticRegression(solver="lbfgs", C=1e9, max_iter=1000, tol=1e-5)
         clf.fit(X, y[ok])
         weights_rows.append({
@@ -434,7 +573,9 @@ def platt_cv_multibin(df, prob_cols, holdout_years, true_holdout_years=(),
         cal_mat = np.full((len(test), len(bins)), np.nan)
         for j, b in enumerate(bins):
             p_tr = np.clip(train[b].values.astype(float), 1e-6, 1 - 1e-6)
-            y_tr = (train[outcome_col].values == b).astype(float)
+            outcome = train[outcome_col]
+            y_tr = ((outcome == b).astype(float)
+                    .where(outcome.notna(), np.nan).to_numpy())
             ok = np.isfinite(p_tr) & ~np.isnan(y_tr)
             if ok.sum() < 10 or len(np.unique(y_tr[ok])) < 2:
                 cal_mat[:, j] = test[b].values.astype(float)
@@ -466,24 +607,23 @@ def platt_cv_multibin(df, prob_cols, holdout_years, true_holdout_years=(),
 def make_calibrated_preds_from_wide(wide_df, forecast_name, variant,
                                     training_years, holdout_years, true_holdout_years,
                                     allowed_cells, spec):
-    """Platt-calibrated predictions via platt_cv_multibin."""
+    """Platt-calibrated predictions via platt_cv_multibin (any number of week bins)."""
     suf = get_forecast_variant_suffix(spec, variant)
-    cols = forecast_prob_cols(forecast_name, suf)
-    missing = [c for c in cols.values() if c not in wide_df.columns]
-    if missing:
-        warnings.warn(f"Skipping calibrated for {forecast_name} ({variant}); missing: {', '.join(missing)}")
+    base = f"{forecast_name}_p_onset{suf}"
+    weeks = _present_weeks(wide_df, base)
+    if not weeks:
+        warnings.warn(f"Skipping calibrated for {forecast_name} ({variant}); no {base}_week* columns found")
         return None
 
     df = wide_df[wide_df["year"].isin(list(training_years) + list(holdout_years))].copy()
-    df["week1"] = df[cols["week1"]]
-    df["week2"] = df[cols["week2"]]
-    df["week3"] = df[cols["week3"]]
-    df["week4"] = df[cols["week4"]]
-    df["later"] = np.maximum(0.0, 1.0 - (df["week1"] + df["week2"] + df["week3"] + df["week4"]))
+    wk_labels = [f"week{w}" for w in weeks]
+    for w in weeks:
+        df[f"week{w}"] = df[f"{base}_week{w}"]
+    df["later"] = np.maximum(0.0, 1.0 - df[wk_labels].sum(axis=1))
 
     return platt_cv_multibin(
         df,
-        prob_cols=["week1", "week2", "week3", "week4", "later"],
+        prob_cols=wk_labels + ["later"],
         holdout_years=holdout_years,
         true_holdout_years=true_holdout_years,
         outcome_col="outcome",
@@ -645,93 +785,253 @@ def _parse_formula_cols(formula_str):
     return [c for c in cols if c and not c.isdigit() and c != "1"]
 
 
-def compute_cv_global(formula_str, data_train, holdout_years,
-                       true_holdout_years=(), data_pred=None, n_jobs=1, save_coefs=False):
+def validate_formula_feature_support(data, formulas):
+    """
+    Validate that every enabled formula feature exists and has finite support.
+
+    Connect-stage rainfall-horizon metadata is used, when available, to turn
+    an all-missing short-horizon predictor into a precise constructibility
+    error before any model fitting starts.
+    """
+    feature_map = {
+        model_name: list(dict.fromkeys(_parse_formula_cols(formula)))
+        for model_name, formula in formulas.items()
+    }
+    unavailable = data.attrs.get("unavailable_rain_predictors", {})
+    problems = []
+
+    for model_name, columns in feature_map.items():
+        missing = [column for column in columns if column not in data.columns]
+        if missing:
+            problems.append(
+                f"Formula '{model_name}' is missing predictor columns: "
+                f"{', '.join(missing)}"
+            )
+
+        for column in columns:
+            if column not in data.columns:
+                continue
+            numeric = pd.to_numeric(data[column], errors="coerce").to_numpy(
+                dtype=float
+            )
+            if np.isfinite(numeric).any():
+                continue
+
+            details = unavailable.get(column)
+            if details:
+                problems.append(
+                    f"Formula '{model_name}': {column} cannot be constructed "
+                    f"under rain_day_max={details['rain_day_max']} "
+                    f"(window={details['window']}, week={details['week']}; "
+                    "no complete start days)."
+                )
+            else:
+                problems.append(
+                    f"Formula '{model_name}': {column} has no finite values "
+                    "and cannot be used for fitting."
+                )
+
+    if problems:
+        raise ValueError(
+            "Formula feature validation failed before model fitting:\n- "
+            + "\n- ".join(problems)
+        )
+    return feature_map
+
+
+def apply_formula_sample_support(data, formulas):
+    """
+    Apply common-complete support using only predictors in enabled formulas.
+
+    Returns the filtered DataFrame and diagnostics. Predictors that exist in
+    the connector output but are unused by all formulas do not affect support.
+    """
+    feature_map = validate_formula_feature_support(data, formulas)
+    required = list(dict.fromkeys(
+        column
+        for columns in feature_map.values()
+        for column in columns
+    ))
+    keep = np.ones(len(data), dtype=bool)
+    excluded_by_column = {}
+    for column in required:
+        numeric = pd.to_numeric(data[column], errors="coerce").to_numpy(
+            dtype=float
+        )
+        finite = np.isfinite(numeric)
+        excluded_by_column[column] = int((~finite).sum())
+        keep &= finite
+
+    filtered = data.loc[keep].copy()
+    diagnostics = {
+        "policy": "common_complete",
+        "required_columns": required,
+        "rows_before": int(len(data)),
+        "rows_after": int(len(filtered)),
+        "rows_excluded": int((~keep).sum()),
+        "nonfinite_by_column": {
+            column: count
+            for column, count in excluded_by_column.items()
+            if count
+        },
+    }
+    filtered.attrs["formula_sample_support"] = diagnostics
+    return filtered, diagnostics
+
+
+_GLOBAL_CV_WORKER_CONTEXT = None
+
+
+def _initialize_global_cv_worker(context):
+    """Install shared global-CV inputs once in each worker process."""
+    global _GLOBAL_CV_WORKER_CONTEXT
+    _GLOBAL_CV_WORKER_CONTEXT = context
+
+
+def _compute_global_cv_fold(test_year, context=None):
+    """Fit and predict one holdout year using explicit or worker context."""
+    if context is None:
+        context = _GLOBAL_CV_WORKER_CONTEXT
+    if context is None:
+        raise RuntimeError("Global CV worker context has not been initialized.")
+
+    data_train = context["data_train"]
+    data_pred = context["data_pred"]
+    training_years = context["training_years"]
+    true_holdout_years = context["true_holdout_years"]
+    required_classes = context["required_classes"]
+    feature_cols = context["feature_cols"]
+    formula_str = context["formula_str"]
+
+    train = data_train[
+        data_train["year"].isin(training_years)
+        & (data_train["year"] != test_year)
+        & (~data_train["year"].isin(true_holdout_years))
+    ]
+    test = data_pred[data_pred["year"] == test_year]
+    if test.empty:
+        raise ValueError(f"Global CV holdout year {test_year} has no test rows.")
+    if train.empty:
+        raise ValueError(
+            f"Global CV holdout year {test_year} has no training rows in "
+            f"training_years={sorted(set(training_years))}."
+        )
+    if required_classes is not None:
+        present_classes = {
+            value for value in train["outcome"].unique()
+            if isinstance(value, str)
+        }
+        missing_classes = [
+            value for value in required_classes if value not in present_classes
+        ]
+        if missing_classes:
+            raise ValueError(
+                f"Global CV holdout year {test_year} training rows are missing "
+                f"outcome classes: {', '.join(missing_classes)}."
+            )
+
+    preds, clf = _fit_predict_multinom(
+        train,
+        test,
+        feature_cols,
+        return_clf=True,
+        formula_str=formula_str,
+    )
+    if preds is None or clf is None:
+        raise ValueError(
+            f"Global CV model fitting failed for holdout year {test_year}."
+        )
+
+    result = pd.concat(
+        [test.reset_index(drop=True), preds.reset_index(drop=True)], axis=1
+    )
+    coef_artifact = None
+    if context["save_coefs"]:
+        rows = []
+        actual_features = clf.feature_names
+        for i, cls in enumerate(clf.classes_):
+            for j, feat in enumerate(actual_features):
+                rows.append({
+                    "test_year": test_year,
+                    "class": cls,
+                    "feature": feat,
+                    "coefficient": float(clf.coef_[i, j]),
+                    "intercept": float(clf.intercept_[i]),
+                })
+        coef_artifact = {
+            "coefs": pd.DataFrame(rows),
+            "scaler": clf.scaler_,
+            "features": actual_features,
+            "formula": formula_str,
+        }
+    return test_year, result, coef_artifact
+
+
+def compute_cv_global(formula_str, data_train, holdout_years, training_years,
+                       true_holdout_years=(), data_pred=None, n_jobs=1, save_coefs=False,
+                       required_classes=None):
     """Leave-one-year-out CV using multinomial logistic, pooling all cells.
 
     IMPORTANT: data_train should be restrict_to_allowed(wide_df, dissemination_cells)
-    and data_pred should be wide_df (all cells). This matches R behavior where
-    training uses only allowed cells but predictions are generated for all cells.
+    and data_pred should be wide_df (all cells). Training is restricted to the
+    spec-declared training_years; predictions are generated for all cells.
     """
 #    print("data_pred  =  ", data_pred)
 #    print("\ntrue_holdout_years  =  ", true_holdout_years)
     if data_pred is None:
         data_pred = data_train
     feature_cols = _parse_formula_cols(formula_str)
+    if (
+        isinstance(n_jobs, bool)
+        or not isinstance(n_jobs, (int, np.integer))
+        or n_jobs < 1
+    ):
+        raise ValueError("n_jobs must be a positive integer.")
 
-    results = []
-#    data_train = data_pred # Bug!!!
-
-    # NEW — one line added before the loop:
-    coefs_by_year = {}
-
-    for test_year in holdout_years:
-        train = data_train[
-            (data_train["year"] != test_year) & (~data_train["year"].isin(true_holdout_years))
+    holdout_years = list(holdout_years)
+    context = {
+        "formula_str": formula_str,
+        "feature_cols": feature_cols,
+        "data_train": data_train,
+        "data_pred": data_pred,
+        "training_years": tuple(training_years),
+        "true_holdout_years": tuple(true_holdout_years),
+        "required_classes": (
+            tuple(required_classes) if required_classes is not None else None
+        ),
+        "save_coefs": bool(save_coefs),
+    }
+    worker_count = min(n_jobs, len(holdout_years))
+    if worker_count > 1:
+        print(
+            f"  Fitting {len(holdout_years)} global CV folds with "
+            f"{worker_count} workers."
+        )
+        with get_context("spawn").Pool(
+            processes=worker_count,
+            initializer=_initialize_global_cv_worker,
+            initargs=(context,),
+        ) as pool:
+            fold_results = list(
+                pool.imap(_compute_global_cv_fold, holdout_years)
+            )
+    else:
+        fold_results = [
+            _compute_global_cv_fold(test_year, context)
+            for test_year in holdout_years
         ]
-        test = data_pred[data_pred["year"] == test_year]
-#        print("XXX train , ", train)
-#        print("XXX test , ", test)
-#        print("XXX feature , ", feature_cols)
-#        import sys
-#        sys.exit()
-        if train.empty or test.empty:
-            continue
-        #preds = _fit_predict_multinom(train, test, feature_cols)
-        #if preds is not None:
-        #    result = pd.concat([test.reset_index(drop=True), preds.reset_index(drop=True)], axis=1)
-        #    results.append(result)
 
-        # NEW — inside loop:
-#        preds, clf = _fit_predict_multinom(train, test, feature_cols,
-#                                           return_clf=True)                     # ← NEW
-        preds, clf = _fit_predict_multinom(train, test, feature_cols, return_clf=True,
-                                   formula_str=formula_str)
-        if preds is not None:
-            result = pd.concat([test.reset_index(drop=True), preds.reset_index(drop=True)], axis=1)
-            results.append(result)
-
-#            if save_coefs and clf is not None:                                  # ← NEW
-#                rows = []                                                       # ← NEW
-#                for i, cls in enumerate(clf.classes_):                         # ← NEW
-#                    for j, feat in enumerate(feature_cols):                    # ← NEW
-#                        rows.append({                                           # ← NEW
-#                            "test_year":   test_year,                          # ← NEW
-#                            "class":       cls,                                 # ← NEW
-#                            "feature":     feat,                               # ← NEW
-#                            "coefficient": float(clf.coef_[i, j]),            # ← NEW
-#                            "intercept":   float(clf.intercept_[i]),           # ← NEW
-#                        })                                                      # ← NEW
-#                coefs_by_year[test_year] = pd.DataFrame(rows)                  # ← NEW
-
-
-            # AFTER
-            if save_coefs and clf is not None:
-                rows = []
-                actual_features = clf.feature_names   # ← use what clf actually saw
-                for i, cls in enumerate(clf.classes_):
-                    for j, feat in enumerate(actual_features):       # ← iterate over actual columns
-                        rows.append({
-                            "test_year":   test_year,
-                            "class":       cls,
-                            "feature":     feat,
-                            "coefficient": float(clf.coef_[i, j]),
-                            "intercept":   float(clf.intercept_[i]),
-                        })
-                #coefs_by_year[test_year] = pd.DataFrame(rows)
-                coefs_by_year[test_year] = {
-                    "coefs":    pd.DataFrame(rows),
-                    "scaler":   clf.scaler_,
-                    "features": actual_features,
-                }
-
-    #return pd.concat(results, ignore_index=True) if results else pd.DataFrame()
-    # NEW — final return:
-    cv_preds = pd.concat(results, ignore_index=True) if results else pd.DataFrame()
-    #if save_coefs:                                                              # ← NEW
-    #    return cv_preds, coefs_by_year                                         # ← NEW
-    #return cv_preds                                                             # ← NEW (was a one-liner)
-    return cv_preds, coefs_by_year                                         # ← NEW
+    if not fold_results:
+        raise ValueError("Global CV produced no fold predictions.")
+    cv_preds = pd.concat(
+        [result[1] for result in fold_results], ignore_index=True
+    )
+    coefs_by_year = {
+        test_year: coef_artifact
+        for test_year, _, coef_artifact in fold_results
+        if coef_artifact is not None
+    }
+    return cv_preds, coefs_by_year
 
 
 def compute_cv_local(formula_str, data, holdout_years):
@@ -860,8 +1160,9 @@ def _fast_auc(y01, score):
 
 
 def compute_fair_brier5(cv_preds, allowed_cells, n_train=30):
-    """Compute fair (finite-sample corrected) Brier score for 5-bin predictions."""
-    bins = ["week1", "week2", "week3", "week4", "later"]
+    """Compute fair (finite-sample corrected) Brier score over the interval bins
+    (week1..weekN + later), inferred from the cv_week* columns present."""
+    bins = [f"week{w}" for w in _cv_weeks(cv_preds)] + ["later"]
     cols = [f"cv_{b}" for b in bins]
     sub = restrict_to_allowed(cv_preds, allowed_cells)
     sub = sub.dropna(subset=["outcome"] + cols)
@@ -878,20 +1179,22 @@ def compute_cell_metrics_fast(df, allowed_cells=None):
     Compute per-cell and pooled Brier/RPS/AUC/pietra from cv_* probability columns.
 
     Matches R compute_cell_metrics_fast:
-    - Brier uses 5 bins: week1..week4, later (NOT including 'earlier')
-    - RPS uses up to 6 bins: earlier + week1..week4 + later (if earlier present)
+    - Brier uses the interval bins week1..weekN + later (NOT 'earlier'),
+      inferred from the cv_week* columns present
+    - RPS prepends 'earlier' when a cv_earlier column is present
     - Pooled AUC uses the fast Wilcoxon rank-sum method
     - Per-bin Brier and AUC are computed for the 'ALL' row
     - Pietra (KS statistic between pos/neg score distributions) is included
     - n (number of observations) is included
     - Returns per-cell rows PLUS an 'ALL' pooled row
     """
-    # Bins for Brier (5-bin, no earlier)
-    bins5 = ["week1", "week2", "week3", "week4", "later"]
+    # Interval bins (week1..weekN + later), inferred from cv_week* columns
+    _wk = [f"week{w}" for w in _cv_weeks(df)]
+    bins5 = _wk + ["later"]
     cv_cols5 = [f"cv_{b}" for b in bins5]
 
-    # Bins for RPS (6-bin if earlier present, else 5)
-    bins_rps_desired = ["earlier", "week1", "week2", "week3", "week4", "later"]
+    # RPS bins: prepend 'earlier' if that column is present
+    bins_rps_desired = (["earlier"] if "cv_earlier" in df.columns else []) + bins5
     present_rps = [b for b in bins_rps_desired if f"cv_{b}" in df.columns]
     cv_cols_rps = [f"cv_{b}" for b in present_rps]
 
@@ -1118,14 +1421,16 @@ def apply_mme_weights(mme_sources, blend_names, opt_w, id_vars, bins5=None):
     blend_names : list of str
     opt_w : np.ndarray of weights (same order as blend_names)
     id_vars : list of str (columns to keep as metadata)
-    bins5 : list of str, defaults to ["week1","week2","week3","week4","later"]
+    bins5 : list of str, defaults to the interval bins inferred from the first
+        source's cv_week* columns (week1..weekN + later).
 
     Returns
     -------
     DataFrame with id_vars + cv_week1..cv_later
     """
     if bins5 is None:
-        bins5 = ["week1", "week2", "week3", "week4", "later"]
+        first = mme_sources[blend_names[0]]
+        bins5 = [f"week{w}" for w in _cv_weeks(first)] + ["later"]
     cols5 = [f"cv_{b}" for b in bins5]
 
     # Join all sources on id_vars
